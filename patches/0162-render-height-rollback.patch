@@ -1,0 +1,133 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -5571,36 +5571,13 @@ void rsx_d3d12_set_render_height(unsigned h)
+ 
+ #define RH_REL(p) do { if (p) { (p)->lpVtbl->Release(p); (p) = NULL; } } while (0)
+ 
+-static void render_height_apply(void)
++/* The display target, its views, the depth buffer and its view, at s_d3d.rw x rh and the scale
++ * already set. 0 on failure, with what was made left for the caller to release. */
++static int rh_build(void)
+ {
+-    const u32 want = (u32)InterlockedExchange(&s_rh_pending, 0) & ~1u;
+-    if (!want || want == s_d3d.rh || !s_d3d.device) return;
+-    const double t0 = perf_now();
+-    { const HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
+-      if (FAILED(rr)) { fprintf(stderr, "[D3D12] render_height %u: the device was removed before (0x%08lX)%c", want, (long)rr, 10); return; } }
+-    wait_for_gpu();
+-    const u32 width = s_d3d.width, height = s_d3d.height;
+-    for (u32 i = 0; i < FRAME_COUNT; i++) RH_REL(s_d3d.render_targets[i]);
+-    RH_REL(s_d3d.depth_buffer);
+-    for (int i = 0; i < MAX_OFF_RTS; i++) {
+-        RH_REL(s_d3d.off_rt[i].res);
+-        RH_REL(s_d3d.off_rt[i].up);
+-        memset(&s_d3d.off_rt[i], 0, sizeof s_d3d.off_rt[i]);
+-    }
+-    for (int i = 0; i < MAX_OFF_DS; i++) {
+-        RH_REL(s_d3d.off_ds[i].res);
+-        memset(&s_d3d.off_ds[i], 0, sizeof s_d3d.off_ds[i]);
+-    }
+-    RH_REL(s_d3d.readback_buf);
+-    RH_REL(s_screen_copy);   /* the lazy copy of the display target, rw x rh */
+-    RH_REL(s_ui.tex); RH_REL(s_ui.heap); RH_REL(s_ui.pso); RH_REL(s_ui.rs);
+-    for (u32 i = 0; i < FRAME_COUNT; i++) RH_REL(s_ui.up[i]);
+-    memset(&s_ui, 0, sizeof s_ui);
+-
+-    s_d3d.rh = want;
+-    s_d3d.rw = (u32)(((u64)width * s_d3d.rh + height / 2) / height) & ~1u;
+-    s_d3d.rs = (s_d3d.rh >= height && s_d3d.rh <= RS_SCENE_H) ? 1.0f : (float)s_d3d.rh / RS_SCENE_H;
+-
++    /* RH_FAIL_TEST=<height>: that height fails to build, to see the way back (diagnostic only). */
++    { const char* ft = getenv("RH_FAIL_TEST"); if (ft && (u32)atoi(ft) == s_d3d.rh && s_d3d.render_targets[0] == NULL) {
++        fprintf(stderr, "[D3D12] RH_FAIL_TEST: %u fails here%c", s_d3d.rh, 10); return 0; } }
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC td = {0};
+     td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+@@ -5615,8 +5592,8 @@ static void render_height_apply(void)
+         s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, &cv,
+         &IID_ID3D12Resource, (void**)&s_d3d.render_targets[0]);
+     if (FAILED(hr)) {
+-        fprintf(stderr, "[D3D12] ERROR: render_height %u: display target failed (0x%08lX)%c", want, (long)hr, 10);
+-        return;
++        fprintf(stderr, "[D3D12] ERROR: render_height %u: display target failed (0x%08lX)%c", s_d3d.rh, (long)hr, 10);
++        return 0;
+     }
+     D3D12_CPU_DESCRIPTOR_HANDLE rtv;
+     s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv);
+@@ -5649,14 +5626,73 @@ static void render_height_apply(void)
+         s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dc,
+         &IID_ID3D12Resource, (void**)&s_d3d.depth_buffer);
+     if (FAILED(hr)) {
+-        fprintf(stderr, "[D3D12] ERROR: render_height %u: depth buffer failed (0x%08lX)%c", want, (long)hr, 10);
+-        return;
++        fprintf(stderr, "[D3D12] ERROR: render_height %u: depth buffer failed (0x%08lX)%c", s_d3d.rh, (long)hr, 10);
++        return 0;
+     }
+     D3D12_DEPTH_STENCIL_VIEW_DESC dv = {0};
+     dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+     D3D12_CPU_DESCRIPTOR_HANDLE dsv;
+     s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv);
+     s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device, s_d3d.depth_buffer, &dv, dsv);
++    return 1;
++}
++
++/* Re:Fine 0162: what the port's menu reads. g_rh_failed is the height that could not be made
++ * (taken once by rsx_d3d12_take_render_height_failure); now_height is the height the
++ * game is drawing at, which after a failure is the one it had before. */
++static volatile LONG s_rh_failed;
++unsigned rsx_d3d12_take_render_height_failure(unsigned* now_height)
++{
++    if (now_height) *now_height = s_d3d.rh;
++    return (unsigned)InterlockedExchange(&s_rh_failed, 0);
++}
++
++static void render_height_apply(void)
++{
++    const u32 want = (u32)InterlockedExchange(&s_rh_pending, 0) & ~1u;
++    if (!want || want == s_d3d.rh || !s_d3d.device) return;
++    const double t0 = perf_now();
++    { const HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
++      if (FAILED(rr)) {
++          fprintf(stderr, "[D3D12] render_height %u: the device was removed before (0x%08lX)%c", want, (long)rr, 10);
++          InterlockedExchange(&s_rh_failed, (LONG)want);
++          return; } }
++    wait_for_gpu();
++    const u32 width = s_d3d.width, height = s_d3d.height;
++    const u32 old_rh = s_d3d.rh, old_rw = s_d3d.rw;
++    const float old_rs = s_d3d.rs;
++    for (u32 i = 0; i < FRAME_COUNT; i++) RH_REL(s_d3d.render_targets[i]);
++    RH_REL(s_d3d.depth_buffer);
++    for (int i = 0; i < MAX_OFF_RTS; i++) {
++        RH_REL(s_d3d.off_rt[i].res);
++        RH_REL(s_d3d.off_rt[i].up);
++        memset(&s_d3d.off_rt[i], 0, sizeof s_d3d.off_rt[i]);
++    }
++    for (int i = 0; i < MAX_OFF_DS; i++) {
++        RH_REL(s_d3d.off_ds[i].res);
++        memset(&s_d3d.off_ds[i], 0, sizeof s_d3d.off_ds[i]);
++    }
++    RH_REL(s_d3d.readback_buf);
++    RH_REL(s_screen_copy);   /* the lazy copy of the display target, rw x rh */
++    RH_REL(s_ui.tex); RH_REL(s_ui.heap); RH_REL(s_ui.pso); RH_REL(s_ui.rs);
++    for (u32 i = 0; i < FRAME_COUNT; i++) RH_REL(s_ui.up[i]);
++    memset(&s_ui, 0, sizeof s_ui);
++
++    s_d3d.rh = want;
++    s_d3d.rw = (u32)(((u64)width * s_d3d.rh + height / 2) / height) & ~1u;
++    s_d3d.rs = (s_d3d.rh >= height && s_d3d.rh <= RS_SCENE_H) ? 1.0f : (float)s_d3d.rh / RS_SCENE_H;
++    if (!rh_build()) {
++        /* Re:Fine 0162: never leave the picture without a target. Back to the height the game had;
++         * the menu is told and puts its row back. */
++        for (u32 i = 0; i < FRAME_COUNT; i++) RH_REL(s_d3d.render_targets[i]);
++        RH_REL(s_d3d.depth_buffer);
++        s_d3d.rh = old_rh; s_d3d.rw = old_rw; s_d3d.rs = old_rs;
++        const int back = rh_build();
++        fprintf(stderr, "[D3D12] ERROR: render_height %u failed; %s %u%c", want,
++                back ? "back to" : "ALSO FAILED going back to", old_rh, 10);
++        InterlockedExchange(&s_rh_failed, (LONG)want);
++        return;
++    }
+     fprintf(stderr, "[D3D12] render_height now %u: display target %ux%u, offscreen scale %.4f (%.1f ms)%c",
+             want, s_d3d.rw, s_d3d.rh, s_d3d.rs, (perf_now() - t0) * 1000.0, 10);
+ }

@@ -1,0 +1,151 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 88872745..0b9a31f2 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -129,6 +129,7 @@ typedef struct {
+     float*               buffer;        /* host audio buffer (float samples) */
+     u32                  buf_size;       /* buffer size in bytes */
+     u64                  read_index;     /* current read position (block index) */
++    int                  tagged;         /* Re:Fine 0130: its blocks carry the consumed mark */
+     u64                  write_index;    /* where the game is writing */
+     /* For address reporting to guest */
+     u64                  port_addr;      /* guest-visible buffer address */
+@@ -459,6 +460,41 @@ static inline float ld_be_f32(const float* p)
+     return f;
+ }
+ 
++/* Re:Fine 0130: a block is marked when it is consumed, so the mixer can tell a block
++ * the title has not reached from one it filled with silence. Same idea as RPCS3's
++ * port tags (cellAudio.cpp, behaviour only): negative zero in a few samples of the
++ * front channels, inaudible, and gone once the title writes the block. */
++#define AUDIO_TAG_BE 0x00000080u      /* -0.0f as big-endian bytes, read as LE */
++#define AUDIO_TAGS 4u
++
++static u32 audio_tag_pos(u32 i, u32 nch)
++{
++    return (i * CELL_AUDIO_BLOCK_SAMPLES / AUDIO_TAGS + CELL_AUDIO_BLOCK_SAMPLES / 8u) * nch;
++}
++
++/* Running ports, and how many have every tag of their next block in place
++ * (untouched) or only some (the title is writing it right now). */
++static int audio_ports_next_block(int* untouched, int* partial)
++{
++    int active = 0;
++    *untouched = *partial = 0;
++    mutex_lock(&s_audio_mutex);
++    for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) {
++        const AudioPortSlot* port = &s_ports[p];
++        if (!port->in_use || !port->running || !port->buffer || !port->tagged) continue;
++        const u32 nch = (u32)port->param.nChannel;
++        const u32 at = (u32)(port->read_index % (u32)port->param.nBlock) * CELL_AUDIO_BLOCK_SAMPLES * nch;
++        const u32* w = (const u32*)(port->buffer + at);
++        u32 left = 0;
++        for (u32 i = 0; i < AUDIO_TAGS; i++) left += w[audio_tag_pos(i, nch)] == AUDIO_TAG_BE;
++        active++;
++        if (left == AUDIO_TAGS) ++*untouched;
++        else if (left) ++*partial;
++    }
++    mutex_unlock(&s_audio_mutex);
++    return active;
++}
++
+ /* Mix one block from all active ports into s_mix_buffer (stereo float) */
+ static void audio_mix_one_block(void)
+ {
+@@ -513,12 +549,18 @@ static void audio_mix_one_block(void)
+             for (; lead < nblock; lead++) {
+                 const float* bp = port->buffer + ((block_idx + lead) % nblock) * bn;
+                 int nz = 0;
+-                for (u32 k = 0; k < bn; k++) if (((const u32*)bp)[k]) { nz = 1; break; }
++                for (u32 k = 0; k < bn; k++) {
++                    const u32 w = ((const u32*)bp)[k];
++                    if (w && w != AUDIO_TAG_BE) { nz = 1; break; }
++                }
+                 if (!nz) break;
+             }
+             const float* prev = port->buffer + ((block_idx + nblock - 1) % nblock) * bn;
+             int late = 0;
+-            for (u32 k = 0; k < bn; k++) if (((const u32*)prev)[k]) { late = 1; break; }
++            for (u32 k = 0; k < bn; k++) {
++                const u32 w = ((const u32*)prev)[k];
++                if (w && w != AUDIO_TAG_BE) { late = 1; break; }
++            }
+             lead_hist[p][lead < 17 ? lead : 17]++;
+             const double dt = last[p] ? (q.QuadPart - last[p]) * 1000.0 / f.QuadPart : 0.0;
+             last[p] = q.QuadPart;
+@@ -584,6 +626,8 @@ static void audio_mix_one_block(void)
+          * preventing stale PCM from replaying when a producer stalls, the
+          * cleared block is an observable consumption signal for producers. */
+         memset(src, 0, CELL_AUDIO_BLOCK_SAMPLES * nch * sizeof(float));
++        for (u32 i = 0; i < AUDIO_TAGS; i++) ((u32*)src)[audio_tag_pos(i, nch)] = AUDIO_TAG_BE;
++        port->tagged = 1;
+ 
+         /* Keep the monotonic counter for tags/timestamps, but publish the
+          * ring slot to the guest. SurMixer multiplies this value by the block
+@@ -658,6 +702,9 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+     if (!timer) fprintf(stderr, "[cellAudio] no high-resolution timer (%lu); using Sleep%c", (unsigned long)GetLastError(), 10);
+     unsigned long long blocks = 0;
+     int q_min = 0x7FFFFFFF, q_max = 0;
++    long long last_mix = 0;
++    int untouched_expected = 0, held = 0;
++    unsigned n_held = 0;
+     while (s_mix_thread_running) {
+         LARGE_INTEGER now; QueryPerformanceCounter(&now);
+         const long long due = q0.QuadPart +
+@@ -686,10 +733,44 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+             /* Device queue under half a block: it is about to play silence (an
+              * audible click/stutter). AUDIO_RATE reports how often. */
+             if (blocks > 64 && queued <= CELL_AUDIO_BLOCK_SAMPLES / 2) g_audio_underruns++;
+-            if (queued < (int)AUDIO_QUEUE_LOW)  q0.QuadPart -= period / 64;
++            /* Re:Fine 0130: the title writes one block ahead, so a writer more than
++             * a period late used to leave silence and lose its block. Hold the mix
++             * for it, as RPCS3 does with buffering on: up to 2 periods when no port
++             * was touched, 4 when one is being written, and never past what the
++             * device queue can cover. A port that stops writing is taken as
++             * skipping, and is not waited for again until it writes. */
++            { int untouched, partial;
++              const int active = audio_ports_next_block(&untouched, &partial);
++              const long long since = now.QuadPart - last_mix;
++              const int can_wait = active && last_mix && queued > 2 * CELL_AUDIO_BLOCK_SAMPLES;
++              int hold = 0;
++              if (untouched > untouched_expected)
++                  hold = can_wait && !((untouched == active && since > 2 * period) || since > 4 * period);
++              else if (partial)
++                  hold = can_wait && since <= 4 * period;
++              if (hold) {
++                  held = 1;
++                  if (timer) {
++                      LARGE_INTEGER t; t.QuadPart = -5000;   /* 500 us */
++                      SetWaitableTimer(timer, &t, 0, NULL, NULL, FALSE);
++                      WaitForSingleObject(timer, 10);
++                  } else {
++                      Sleep(1);
++                  }
++                  continue;
++              }
++              untouched_expected = untouched;
++              /* The next block is a period from this one: the title writes one
++               * block per MIX event. The device queue pays for the wait, and the
++               * lean below refills it. */
++              if (held) { q0.QuadPart += now.QuadPart - due; n_held++; held = 0; }
++            }
++            if (queued < (int)AUDIO_QUEUE_LOW - 2 * CELL_AUDIO_BLOCK_SAMPLES) q0.QuadPart -= period / 8;
++            else if (queued < (int)AUDIO_QUEUE_LOW) q0.QuadPart -= period / 64;
+             if (queued > (int)AUDIO_QUEUE_HIGH) q0.QuadPart += period / 64;
+         }
+ #endif
++        { LARGE_INTEGER m; QueryPerformanceCounter(&m); last_mix = m.QuadPart; }
+         blocks++;
+         /* Mix and submit one block */
+         audio_mix_one_block();
+@@ -722,8 +803,8 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+ #else
+                         0u, 10);
+ #endif
+-                fprintf(stderr, "[audio-queue] device queue frames: min=%d max=%d (target %u)%c",
+-                        q_min, q_max, 1440u, 10);
++                fprintf(stderr, "[audio-queue] device queue frames: min=%d max=%d (target %u), blocks waited for %u%c",
++                        q_min, q_max, 1440u, n_held, 10);
+                 q_min = 0x7FFFFFFF; q_max = 0;
+                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
+ 

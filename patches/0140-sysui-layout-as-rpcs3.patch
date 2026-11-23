@@ -1,0 +1,260 @@
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+index f862298f7463b89c60e0696ab1927a84de67ece0..45081c1de5cd2bd888f57679a36db668c262f8d8 100644
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -1106,6 +1106,7 @@ static void save_entry_fill(SaveEntry* e, const char* dirName, const char* save_
+         snprintf(e->item.title, sizeof e->item.title, "%s", param->title);
+         snprintf(e->item.subtitle, sizeof e->item.subtitle, "%s", param->subTitle);
+         snprintf(e->detail, sizeof e->detail, "%s", param->detail);
++        snprintf(e->item.detail, sizeof e->item.detail, "%s", param->detail);
+         memcpy(e->list_param, param->listParam, sizeof e->list_param);
+         free(param);
+     }
+@@ -1123,7 +1124,14 @@ static void save_entry_fill(SaveEntry* e, const char* dirName, const char* save_
+     }
+     time_t t = (time_t)e->mtime;
+     const struct tm* tm = localtime(&t);
+-    if (tm) strftime(e->item.date, sizeof e->item.date, "%a %b %d %H:%M:%S %Y", tm);
++    /* "Sun Nov 1 08:54:04 2026": the day has no leading zero (ed1). */
++    if (tm) {
++        char mon[16], hms[16], year[8];
++        strftime(mon, sizeof mon, "%a %b", tm);
++        strftime(hms, sizeof hms, "%H:%M:%S", tm);
++        strftime(year, sizeof year, "%Y", tm);
++        snprintf(e->item.date, sizeof e->item.date, "%s %d %s %s", mon, tm->tm_mday, hms, year);
++    }
+ 
+     u64 size = 0;
+ #ifdef _WIN32
+diff --git a/libs/system/sysui.c b/libs/system/sysui.c
+index 2c55a0a8f7737231373d2cab9dfb2c5e96a7881c..b5cfcdb8dbb05e925b74008cbab97688d7eb22d1 100644
+--- a/libs/system/sysui.c
++++ b/libs/system/sysui.c
+@@ -234,8 +234,6 @@ int sysui_msg(uint32_t type, const char* utf8)
+             SleepConditionVariableSRW(&s_cv, &s_lock, INFINITE, 0);
+         r = s_sc.answered ? s_sc.result : CELL_MSGDIALOG_BUTTON_NONE;
+         if (s_sc.kind == KIND_MSG) screen_hide();
+-        printf("[sysui] dialog -> %d\n", r);
+-        fflush(stdout);
+     }
+     ReleaseSRWLockExclusive(&s_lock);
+     return r;
+@@ -424,6 +422,7 @@ static HBITMAP  s_bmp;
+ static uint32_t* s_px;
+ static unsigned s_w, s_h;
+ static long     s_drawn_gen = -1;
++static ULONGLONG s_clock_sec;
+ 
+ /* Sizes are for 720 lines, scaled to the output. */
+ static int S(int v) { return MulDiv(v, (int)s_h, 720); }
+@@ -472,31 +471,18 @@ static void glyph(int is_cross, int cx, int cy, int size)
+     DeleteObject(pen);
+ }
+ 
+-/* One or two "<glyph> word" pairs, centred on x. */
+-static void legend(int cx, int cy, const wchar_t* cross, const wchar_t* circle)
++/* One "<glyph> word" pair; the x after it. */
++static int legend_item(int is_cross, const wchar_t* word, int x, int cy)
+ {
+-    const int gap = S(44);
+-    const int pairs = (cross ? 1 : 0) + (circle ? 1 : 0);
+-    int x = cx - (pairs == 2 ? S(150) : S(70));
+-    if (cross) {
+-        glyph(1, x, cy, 22);
+-        text(cross, x + S(20), cy - S(16), S(120), S(32), 22, FW_NORMAL, RGB(255, 255, 255),
+-             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+-        x += S(120) + gap;
+-    }
+-    if (circle) {
+-        glyph(0, x, cy, 22);
+-        text(circle, x + S(20), cy - S(16), S(120), S(32), 22, FW_NORMAL, RGB(255, 255, 255),
+-             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+-    }
++    glyph(is_cross, x, cy, 20);
++    text(word, x + S(20), cy - S(16), S(120), S(32), 20, FW_NORMAL, RGB(255, 255, 255),
++         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
++    return x + S(135);
+ }
+ 
+-/* Frame lines of a system screen, above and below the content. */
+-static void bands(int top, int bottom)
++static void rule(int x, int y, int w)
+ {
+-    const int mx = S(90), t = S(2) > 1 ? S(2) : 1;
+-    rect(mx, top, s_w - mx * 2, t, RGB(230, 230, 230));
+-    rect(mx, bottom, s_w - mx * 2, t, RGB(230, 230, 230));
++    rect(x, y, w, S(2) > 1 ? S(2) : 1, RGB(235, 235, 235));
+ }
+ 
+ static void draw_msg(void)
+@@ -504,21 +490,20 @@ static void draw_msg(void)
+     const int btn = s_sc.type & 0x30;
+     const int bars = (s_sc.type & CELL_MSGDIALOG_TYPE_PROGRESSBAR_SINGLE) ? 1 :
+                      (s_sc.type & CELL_MSGDIALOG_TYPE_PROGRESSBAR_DOUBLE) ? 2 : 0;
+-    const int top = S(200), bottom = S(500);
+-    bands(top, bottom);
++    /* As RPCS3 shows it (ed1): text centred above one line, buttons under it. */
++    const int line = S(400), bar_room = bars ? S(46) * bars + S(14) : 0;
++    const int area_top = S(150), area = line - area_top - bar_room;
+ 
+-    int y = top + S(24);
+     RECT calc = { 0, 0, (LONG)s_w - S(240), 0 };
+-    { HFONT f = font(26, FW_NORMAL); HGDIOBJ o = SelectObject(s_dc, f);
++    { HFONT f = font(20, FW_NORMAL); HGDIOBJ o = SelectObject(s_dc, f);
+       DrawTextW(s_dc, s_sc.text, -1, &calc, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
+       SelectObject(s_dc, o); DeleteObject(f); }
+-    const int room = bottom - top - S(bars ? 170 : 110);
+-    if (calc.bottom < room) y += (room - calc.bottom) / 2;
+-    text(s_sc.text, S(120), y, s_w - S(240), room, 26, FW_NORMAL, RGB(255, 255, 255),
++    const int y = calc.bottom < area ? area_top + (area - calc.bottom) / 2 : area_top;
++    text(s_sc.text, S(120), y, s_w - S(240), area, 20, FW_NORMAL, RGB(255, 255, 255),
+          DT_CENTER | DT_WORDBREAK);
+ 
+     for (int i = 0; i < bars; i++) {
+-        const int bx = S(240), bw = s_w - S(480), by = bottom - S(120) + i * S(46);
++        const int bx = S(240), bw = s_w - S(480), by = line - bar_room + S(30) + i * S(46);
+         if (s_sc.bar_text[i][0])
+             text(s_sc.bar_text[i], bx, by - S(26), bw, S(24), 18, FW_NORMAL, RGB(220, 220, 220),
+                  DT_LEFT | DT_SINGLELINE);
+@@ -526,9 +511,13 @@ static void draw_msg(void)
+         rect(bx, by, bw * s_sc.bar_percent[i] / 100, S(10), RGB(235, 235, 235));
+     }
+ 
+-    const int cy = bottom - S(38);
+-    if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO) legend(s_w / 2, cy, L"Yes", L"No");
+-    else if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK) legend(s_w / 2, cy, L"OK", NULL);
++    rule(S(42), line, s_w - S(84));
++    const int cy = line + S(36);
++    if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO) {
++        legend_item(0, L"No", legend_item(1, L"Yes", (int)s_w / 2 - S(85), cy), cy);
++    } else if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK) {
++        legend_item(1, L"OK", (int)s_w / 2 - S(30), cy);
++    }
+ }
+ 
+ static void draw_icon(const uint32_t* px, int x, int y, int w, int h)
+@@ -545,40 +534,51 @@ static void draw_icon(const uint32_t* px, int x, int y, int w, int h)
+ }
+ 
+ static void draw_row(int y, int rh, const wchar_t* t1, const wchar_t* t2, const wchar_t* t3,
+-                     const wchar_t* t4, const uint32_t* icon, int selected)
++                     const uint32_t* icon, int selected)
+ {
+-    const int mx = S(90);
+-    if (selected) {
+-        rect(mx, y, s_w - mx * 2, rh, RGB(62, 62, 72));
+-        rect(mx, y, S(4), rh, RGB(120, 170, 255));
+-    }
+-    const int ix = mx + S(14), iy = y + S(6), ih = rh - S(12), iw2 = ih * ICON_W / ICON_H;
+-    if (icon) draw_icon(icon, ix, iy, iw2, ih);
+-    else rect(ix, iy, iw2, ih, RGB(40, 40, 46));
+-    const int tx = ix + iw2 + S(22), tw = s_w - mx - tx - S(14);
+-    text(t1, tx, y + S(8), tw, S(30), 22, FW_SEMIBOLD, RGB(255, 255, 255),
++    const int mx = S(18), w = s_w - mx * 2;
++    if (selected) rect(mx, y, w, rh, RGB(66, 62, 84));
++    const int ih = S(92), iw = ih * ICON_W / ICON_H, ix = mx + S(12), iy = y + (rh - ih) / 2;
++    if (icon) draw_icon(icon, ix, iy, iw, ih);
++    else rect(ix, iy, iw, ih, RGB(40, 40, 46));
++    const int tx = ix + iw + S(20), tw = mx + w - tx - S(12);
++    text(t1, tx, y + S(14), tw, S(30), 19, FW_NORMAL, RGB(255, 255, 255),
+          DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+-    text(t2, tx, y + S(38), tw, S(26), 19, FW_NORMAL, RGB(225, 225, 225),
++    text(t2, tx, y + S(52), tw, S(24), 15, FW_NORMAL, RGB(225, 225, 225),
+          DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+-    text(t3, tx, y + S(66), tw, S(24), 17, FW_NORMAL, RGB(190, 190, 190),
+-         DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
+-    text(t4, tx, y + S(90), tw, S(24), 17, FW_NORMAL, RGB(190, 190, 190),
++    text(t3, tx, y + S(76), tw, S(24), 15, FW_NORMAL, RGB(225, 225, 225),
+          DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
++    rule(mx, y + rh, w);
++}
++
++static void draw_clock(void)
++{
++    SYSTEMTIME t;
++    GetLocalTime(&t);
++    static const wchar_t* const days[] = { L"Sun", L"Mon", L"Tue", L"Wed", L"Thu", L"Fri", L"Sat" };
++    static const wchar_t* const months[] = { L"Jan", L"Feb", L"Mar", L"Apr", L"May", L"Jun",
++                                             L"Jul", L"Aug", L"Sep", L"Oct", L"Nov", L"Dec" };
++    wchar_t s[48];
++    _snwprintf(s, 48, L"%ls %ls %u %02u:%02u:%02u %u", days[t.wDayOfWeek], months[t.wMonth - 1],
++               t.wDay, t.wHour, t.wMinute, t.wSecond, t.wYear);
++    s[47] = 0;
++    text(s, s_w - S(320), S(26), S(300), S(26), 17, FW_NORMAL, RGB(230, 230, 230),
++         DT_RIGHT | DT_SINGLELINE);
+ }
+ 
+ static void draw_list(void)
+ {
+     const SysuiList* l = s_sc.list;
+-    const int top = S(96), bottom = S(626), rh = S(124);
+-    const int fit = (bottom - top - S(8)) / rh;
+-    text(s_sc.header, S(96), S(46), s_w - S(192), S(44), 30, FW_NORMAL, RGB(255, 255, 255),
++    const int top = S(84), rh = S(108), bottom = S(630);
++    const int fit = (bottom - top) / rh;
++    text(s_sc.header, S(18), S(40), s_w - S(36), S(36), 21, FW_NORMAL, RGB(255, 255, 255),
+          DT_LEFT | DT_SINGLELINE);
+-    bands(top, bottom);
++    draw_clock();
+ 
+     if (!s_sc.rows) {
+-        text(L"There is no saved data.", 0, top, s_w, bottom - top, 26, FW_NORMAL,
++        text(L"There is no saved data.", 0, top, s_w, bottom - top, 22, FW_NORMAL,
+              RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+-        legend(s_w / 2, S(668), NULL, L"Back");
++        legend_item(0, L"Back", S(48), S(657));
+         return;
+     }
+ 
+@@ -587,21 +587,22 @@ static void draw_list(void)
+ 
+     const int base = l->has_new && !l->new_at_tail ? 1 : 0;
+     for (int row = s_sc.top; row < s_sc.rows && row < s_sc.top + fit; row++) {
+-        const int y = top + S(8) + (row - s_sc.top) * rh, sel = row == s_sc.cursor;
++        const int y = top + (row - s_sc.top) * rh, sel = row == s_sc.cursor;
+         const int is_new = l->has_new && (l->new_at_tail ? row == l->count : row == 0);
+         if (is_new) {
+             wchar_t nt[128];
+             widen(l->new_title ? l->new_title : "New Saved Data", nt, 128);
+-            draw_row(y, rh - S(4), nt, L"Select to create a new entry", L"", L"", NULL, sel);
++            draw_row(y, rh, nt, L"Select to create a new entry", L"", NULL, sel);
+         } else {
+             const SysuiListItem* it = &l->items[row - base];
+-            wchar_t a[128], b[128], c[64], d[32];
+-            widen(it->title, a, 128); widen(it->subtitle, b, 128);
+-            widen(it->date, c, 64);   widen(it->size, d, 32);
+-            draw_row(y, rh - S(4), a, b, c, d, s_sc.icons[row - base].px, sel);
++            wchar_t a[128], b[128], c[128];
++            char when[100];
++            snprintf(when, sizeof when, "%s   %s", it->date, it->size);
++            widen(it->subtitle, a, 128); widen(when, b, 128); widen(it->detail, c, 128);
++            draw_row(y, rh, a, b, c, s_sc.icons[row - base].px, sel);
+         }
+     }
+-    legend(s_w / 2, S(668), L"Select", L"Back");
++    legend_item(0, L"Back", legend_item(1, L"Enter", S(48), S(657)) + S(40), S(657));
+ }
+ 
+ /* Alpha from brightness: GDI wrote none. */
+@@ -620,6 +621,9 @@ static void finish_alpha(void)
+ 
+ int sysui_draw(unsigned w, unsigned h, const void** pixels)
+ {
++    /* The list shows the time: one redraw a second while it is up. */
++    { const ULONGLONG sec = GetTickCount64() / 1000;
++      if (s_sc.kind == KIND_LIST && sec != s_clock_sec) { s_clock_sec = sec; changed(); } }
+     const long gen = s_gen;
+     if (gen == s_drawn_gen && w == s_w && h == s_h) return 0;
+ 
+diff --git a/libs/system/sysui.h b/libs/system/sysui.h
+index fc63836f9aa55ca43a18e7fcca64a44bba4f7a9d..2c195f8a717f38d1b4f50e3a31bb66734b0159fd 100644
+--- a/libs/system/sysui.h
++++ b/libs/system/sysui.h
+@@ -23,6 +23,7 @@ typedef struct SysuiListItem {
+     char subtitle[128];
+     char date[64];
+     char size[32];
++    char detail[128];
+     char icon_path[1100];      /* ICON0.PNG of this save, "" for none */
+ } SysuiListItem;
+ 

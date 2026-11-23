@@ -1,0 +1,52 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -1111,8 +1111,12 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+         audio_backend_adopt();
+ #endif
+         LARGE_INTEGER now; QueryPerformanceCounter(&now);
++        /* Re:Fine 5c.2, diagnostic: AUDIO_SLOW=<factor> stretches the block clock and takes
++         * the device out of the loop, to tell which clock the title follows. */
++        static double slow = -1.0;
++        if (slow < 0.0) { const char* e = getenv("AUDIO_SLOW"); slow = e ? atof(e) : 0.0; }
+         const long long due = q0.QuadPart +
+-            (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
++            (long long)((slow > 0.0 ? slow : 1.0) * blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+         if (now.QuadPart < due) {
+             const long long us = (due - now.QuadPart) * 1000000 / qf.QuadPart;
+             if (timer) {
+@@ -1127,7 +1131,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+         /* More than 50 ms behind (device just went away, a debugger stop): drop
+          * the backlog instead of mixing it in a burst. */
+         if (now.QuadPart - due > qf.QuadPart / 20) q0.QuadPart += now.QuadPart - due;
+-        const int room = audio_backend_room();
++        const int room = slow > 0.0 ? -1 : audio_backend_room();
+ #if AUDIO_BACKEND_WASAPI
+         {
+             /* Re:Fine 0143: without a device the blocks and the 0130 wait go on, as
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -286,9 +286,12 @@ static char   s_cycle_keys[16];
+ static int    s_key_script = -1;
+ static unsigned long long s_key_t0;
+ 
++/* Re:Fine 5c.3: the letters the PAD_BOT diagnostic (src/main.cpp) is holding right now. */
++volatile char g_pad_bot_keys[12];
++
+ static void pad_keys_parse(void)
+ {
+-    s_key_script = 0;
++    s_key_script = getenv("PAD_BOT") ? 1 : 0;
+     const char* e = getenv("PAD_KEYS");
+     if (e && *e) {
+         s_key_script = 1;
+@@ -315,6 +318,8 @@ static void pad_keys_parse(void)
+ static int pad_key_scripted(char c)
+ {
+     const double now = (double)(GetTickCount64() - s_key_t0) / 1000.0;
++    for (volatile char* k = g_pad_bot_keys; *k; k++)
++        if (*k == c) return 1;
+     for (int i = 0; i < s_key_ev_n; i++)
+         if (now >= s_key_ev[i].from && now < s_key_ev[i].to && strchr(s_key_ev[i].keys, c))
+             return 1;

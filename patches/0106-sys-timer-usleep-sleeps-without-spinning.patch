@@ -1,0 +1,70 @@
+diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
+index 3a022815b40d516282cb3eac968dde3bf74897e7..c4740586b137c13db4fdc831f22cc8dbe4afdf08 100644
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -244,36 +244,39 @@ int64_t sys_timer_usleep(ppu_context* ctx)
+         ppu_log_host_chain("usleep1ms"); } }
+ 
+ #ifdef _WIN32
+-    /* Use high-resolution sleep via waitable timer for better precision */
+-    if (usec >= 1000) {
+-        HANDLE timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+-        if (timer) {
++    /* Re:Fine patches/0106: sleep for real, never spin. One high-resolution
++     * waitable timer per host thread (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++     * Windows 10 1803+), created on the thread's first usleep and kept, so the
++     * hot path makes no Create/Close per call.
++     *
++     * It replaces two paths. For >= 1 ms a plain waitable timer was created and
++     * closed on every call (rounded to the timer tick). For < 1 ms the thread
++     * busy-waited on SwitchToThread + QueryPerformanceCounter to the deadline:
++     * Project DIVA F polls its flip status with sys_timer_usleep(300) (0x5896CC),
++     * ~2 800 calls a second, and its main thread spent 8.5 s of every 10 in
++     * that spin, ~98 % of a core (docs/perf.md, D8). A short sleep may now
++     * overshoot by up to the timer's resolution; the guest only polls, so a
++     * later wake costs at most that per poll.
++     *
++     * The timer handle stays open until the process exits; guest threads are
++     * few and long-lived. */
++    if (usec > 0) {
++        static _Thread_local HANDLE t_timer = NULL;
++        static _Thread_local int    t_timer_tried = 0;
++        if (!t_timer_tried) {
++            t_timer_tried = 1;
++            t_timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002u /* HIGH_RESOLUTION */,
++                                             TIMER_ALL_ACCESS);
++            if (!t_timer) t_timer = CreateWaitableTimerW(NULL, TRUE, NULL);
++        }
++        if (t_timer) {
+             LARGE_INTEGER due;
+             due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */
+-            SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
+-            WaitForSingleObject(timer, INFINITE);
+-            CloseHandle(timer);
++            SetWaitableTimer(t_timer, &due, 0, NULL, NULL, FALSE);
++            WaitForSingleObject(t_timer, INFINITE);
+         } else {
+-            Sleep((DWORD)(usec / 1000));
++            Sleep((DWORD)((usec + 999) / 1000));
+         }
+-    } else if (usec > 0) {
+-        /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
+-         * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
+-         * on accurate microsecond pacing -- a short usleep() spin waiting on
+-         * another thread to make progress otherwise collapses to a single yield
+-         * and busy-spins at full speed (so the wait is effectively a no-op).
+-         * Busy-wait to a precise QPC deadline, yielding inside the spin
+-         * (SwitchToThread) so a sibling host thread the guest may be waiting on
+-         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
+-        ensure_qpc_init();
+-        LARGE_INTEGER qpc_start, qpc_now;
+-        QueryPerformanceCounter(&qpc_start);
+-        const int64_t qpc_deadline = qpc_start.QuadPart +
+-            (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
+-        do {
+-            SwitchToThread();
+-            QueryPerformanceCounter(&qpc_now);
+-        } while (qpc_now.QuadPart < qpc_deadline);
+     }
+ #else
+     if (usec > 0) {

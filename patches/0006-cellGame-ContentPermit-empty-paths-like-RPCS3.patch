@@ -1,0 +1,134 @@
+diff --git a/libs/system/cellGame.c b/libs/system/cellGame.c
+index 5a1d37fa343a7db6d6425f747571996ff0aefaac..4f62e06c8894a6ad05ebfd20f9de2f6963fe0480 100644
+--- a/libs/system/cellGame.c
++++ b/libs/system/cellGame.c
+@@ -99,6 +99,12 @@ static u32  s_game_type = CELL_GAME_GAMETYPE_DISC;
+  * semaphore forever. */
+ static int  s_check_is_disc = 1;
+ static char s_check_dir[64] = "";
++/* What the session found, as RPCS3's content_permission tracks it (exists /
++ * temp): whether the checked content was there, and whether the title called
++ * cellGameCreateGameData for it since the check. With neither, ContentPermit
++ * hands back empty paths and creates nothing (f2nd-recomp patches/0006). */
++static int  s_check_exists = 0;
++static int  s_check_created = 0;
+ 
+ static void ensure_dirs(const char* path)
+ {
+@@ -378,52 +384,48 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
+     s_check_is_disc = (s_game_type == CELL_GAME_GAMETYPE_DISC);
+     strncpy(s_check_dir, s_title_id, sizeof(s_check_dir) - 1);
+     s_check_dir[sizeof(s_check_dir) - 1] = '\0';
++    s_check_exists = 1;      /* the booted content is there by definition */
++    s_check_created = 0;
+     printf("[cellGame] BootCheck: type=%u, titleId='%s'\n", s_game_type, s_title_id);
+     return CELL_OK;
+ }
+ 
+ s32 cellGameContentPermit(char* contentInfoPath, char* usrdirPath)
+ {
+-    printf("[cellGame] ContentPermit() -> %s\n",
+-           s_check_is_disc ? "/dev_bdvd/PS3_GAME" : "game-data dir");
+-
+-    if (!s_check_is_disc) {
+-        /* Ensure directories exist. IMPORTANT: also create them at the SAME host
+-         * location the VFS (ppu_fs.cpp host_path) maps /dev_hdd0/game/<title>/ to,
+-         * i.e. $ppu_vfs_root/game/<title>/. cellGame historically only created
+-         * ./gamedata/dev_hdd0/game/... which cellFs never looks at, so a game that
+-         * polls cellFsStat for its game-data USRDIR (LBP's boot bringup stage) stalls
+-         * forever and exits. Create it where cellFs will actually find it. */
+-        ensure_dirs(s_content_info_path);
+-        ensure_dirs(s_usrdir_path);
+-        {
+-            extern const char* ppu_vfs_root;
+-            char vpath[CELL_GAME_PATH_MAX];
+-            snprintf(vpath, sizeof vpath, "%s/game/%s/USRDIR", ppu_vfs_root, s_check_dir);
+-            ensure_dirs(vpath);
+-        }
+-    }
+-
+-    /* Both paths are GUEST addresses; format into a host temp, copy into the
+-     * guest buffer through vm_base (a raw snprintf to the guest addr faults).
+-     * The paths must match the content the current session checked: the disc
+-     * for BootCheck/DataCheck(DISC), the game-data dir otherwise. */
+-    char tmp[CELL_GAME_PATH_MAX];
++    /* Both paths are GUEST addresses; format into a host buffer, copy into the
++     * guest buffer through vm_base (a raw snprintf to the guest addr faults). */
+     uint32_t cip_ea = (uint32_t)(uintptr_t)contentInfoPath;
+     uint32_t usr_ea = (uint32_t)(uintptr_t)usrdirPath;
+-    if (cip_ea) {
+-        int n = s_check_is_disc
+-              ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME")
+-              : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s", s_check_dir);
+-        memcpy(vm_base + cip_ea, tmp, (size_t)n + 1);
+-    }
+-    if (usr_ea) {
+-        int n = s_check_is_disc
+-              ? snprintf(tmp, sizeof tmp, "/dev_bdvd/PS3_GAME/USRDIR")
+-              : snprintf(tmp, sizeof tmp, "/dev_hdd0/game/%s/USRDIR", s_check_dir);
+-        memcpy(vm_base + usr_ea, tmp, (size_t)n + 1);
++    char cip[CELL_GAME_PATH_MAX];
++    char usr[CELL_GAME_PATH_MAX];
++
++    /* RPCS3 cellGameContentPermit: content that the check did not find and the
++     * title did not create gets two EMPTY paths and CELL_OK, and nothing is
++     * created on disk. This used to create directories here -- under the boot
++     * title id, and under $ppu_vfs_root/game, which with a separate
++     * PS3_HDD0_ROOT is the disc tree -- and to hand back /dev_hdd0 paths that
++     * did not exist. ContentPermit itself never creates a directory in RPCS3:
++     * the only one it makes persistent is cellGameCreateGameData's, and that
++     * call has already created it here (f2nd-recomp patches/0006). */
++    if (!s_check_exists && !s_check_created) {
++        cip[0] = '\0';
++        usr[0] = '\0';
++    } else if (s_check_is_disc) {
++        /* The paths must match the content the current session checked: the
++         * disc for BootCheck/DataCheck(DISC), the game-data dir otherwise. */
++        snprintf(cip, sizeof cip, "/dev_bdvd/PS3_GAME");
++        snprintf(usr, sizeof usr, "/dev_bdvd/PS3_GAME/USRDIR");
++    } else {
++        snprintf(cip, sizeof cip, "/dev_hdd0/game/%s", s_check_dir);
++        snprintf(usr, sizeof usr, "/dev_hdd0/game/%s/USRDIR", s_check_dir);
+     }
++    printf("[cellGame] ContentPermit(dir='%s') -> contentInfoPath='%s' usrdirPath='%s'\n",
++           s_check_dir, cip, usr);
+ 
++    if (cip_ea) memcpy(vm_base + cip_ea, cip, strlen(cip) + 1);
++    if (usr_ea) memcpy(vm_base + usr_ea, usr, strlen(usr) + 1);
++
++    s_check_created = 0;
+     return CELL_OK;
+ }
+ 
+@@ -441,6 +443,8 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
+     s_check_is_disc = (type == CELL_GAME_GAMETYPE_DISC);
+     strncpy(s_check_dir, check_dir, sizeof(s_check_dir) - 1);
+     s_check_dir[sizeof(s_check_dir) - 1] = '\0';
++    s_check_exists = 0;
++    s_check_created = 0;
+ 
+     char path[CELL_GAME_PATH_MAX];
+     snprintf(path, sizeof(path), "%s/%s", content_root(), check_dir);
+@@ -455,10 +459,13 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
+     /* Disc-content check (type 1 = CELL_GAME_GAMETYPE_DISC): the disc is
+      * inherently present (mounted via the VFS root); a NOTFOUND here makes
+      * disc titles bail out of boot. */
+-    if (type == 1)
++    if (type == 1) {
++        s_check_exists = 1;
+         return CELL_OK;
++    }
+ 
+     if (dir_exists(path)) {
++        s_check_exists = 1;
+         return CELL_OK;
+     }
+ 
+@@ -730,6 +737,7 @@ s32 cellGameCreateGameData(CellGameSetInitParams* init, char* tmp_contentInfoPat
+     char usrdir[CELL_GAME_PATH_MAX];
+     snprintf(usrdir, sizeof(usrdir), "%s/USRDIR", path);
+     ensure_dirs(usrdir);
++    s_check_created = 1;     /* the next ContentPermit reports this dir */
+ 
+     /* Host paths are only for host filesystem access. Guest code feeds these
+      * results back to cellFs, which resolves PS3 virtual paths through VFS. */

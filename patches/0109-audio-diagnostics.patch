@@ -1,0 +1,73 @@
+Re:Fine 0109: diagnostico de audio (apagado por defecto). AUDIO_RATE=1 imprime el formato del
+dispositivo; SPU_BLOCK_STATS=1, el tiempo de trabajo del SPU por bloque frente a 5333 us.
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 02b751b2859aa80ae96bbed25fd0733523d6f667..cde5319905dd8bdda0f02107593703920db2e6bb 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -327,6 +327,20 @@ static int audio_backend_init(void)
+     }
+ 
+     s_wasapi_client->lpVtbl->GetBufferSize(s_wasapi_client, &s_wasapi_buf_frames);
++    /* Re:Fine patches/0109: AUDIO_RATE=1 also says what the device runs at. */
++    if (getenv("AUDIO_RATE")) {
++        WAVEFORMATEX* mix = NULL; REFERENCE_TIME def = 0, lat = 0;
++        s_wasapi_client->lpVtbl->GetDevicePeriod(s_wasapi_client, &def, NULL);
++        s_wasapi_client->lpVtbl->GetStreamLatency(s_wasapi_client, &lat);
++        if (SUCCEEDED(s_wasapi_client->lpVtbl->GetMixFormat(s_wasapi_client, &mix)) && mix) {
++            fprintf(stderr, "[audio-dev] device mix: tag=0x%X %u Hz %u ch %u bits; stream: float 48000 Hz 2 ch (%s); "
++                    "buffer %u frames, device period %.2f ms, stream latency %.2f ms%c",
++                    mix->wFormatTag, (unsigned)mix->nSamplesPerSec, mix->nChannels, mix->wBitsPerSample,
++                    mix->nSamplesPerSec == CELL_AUDIO_SAMPLE_RATE ? "no resampling" : "engine resamples",
++                    (unsigned)s_wasapi_buf_frames, def / 10000.0, lat / 10000.0, 10);
++            CoTaskMemFree(mix);
++        }
++    }
+ 
+     hr = s_wasapi_client->lpVtbl->GetService(
+         s_wasapi_client, &IID_IAudioRenderClient, (void**)&s_wasapi_render);
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index f59ea651d5cba56c2db0e9fbe83768f7dcab3d79..2f5b00694249301e0889d962d7521e38bce8baf4 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -233,6 +233,7 @@ void spu_dbg_e60(spu_context* ctx)
+  * The blocking receive waits on the queue's condition variable (100 ms per
+  * round so the SPU's state is re-checked), never spinning. */
+ #include "../syscalls/sys_event.h"
++static LARGE_INTEGER s_bs_last;   /* Re:Fine patches/0109: SPU_BLOCK_STATS */
+ static int spu_service_thread_syscall(spu_context* ctx)
+ {
+     extern uint32_t spu_thread_bound_queue(uint32_t, uint32_t);
+@@ -256,8 +257,32 @@ static int spu_service_thread_syscall(spu_context* ctx)
+     }
+     sys_event_t ev;
+     int r;
++    /* Re:Fine patches/0109: SPU_BLOCK_STATS=1 reports, every 5 s, the time the SPU
++     * worked between one receive and the next wait: one mixer block for synth2,
++     * whose budget is 5333 us (256 samples at 48 kHz). */
++    static int s_bs = -1;
++    if (s_bs < 0) s_bs = getenv("SPU_BLOCK_STATS") ? 1 : 0;
++    if (s_bs) {
++        static LARGE_INTEGER qf, t0;
++        static unsigned hist[128], n, over; static unsigned long long sum, mx;
++        LARGE_INTEGER now; QueryPerformanceCounter(&now);
++        if (!qf.QuadPart) { QueryPerformanceFrequency(&qf); t0 = now; }
++        if (s_bs_last.QuadPart) {
++            const unsigned long long us = (unsigned long long)(now.QuadPart - s_bs_last.QuadPart) * 1000000ull / (unsigned long long)qf.QuadPart;
++            sum += us; n++; if (us > mx) mx = us; if (us > 5333) over++;
++            hist[us / 100 > 127 ? 127 : us / 100]++;
++        }
++        if (now.QuadPart - t0.QuadPart >= qf.QuadPart * 5 && n) {
++            unsigned c = 0, p = 0, p99 = 0;
++            for (; p < 128; p++) { c += hist[p]; if (c >= n - n / 100) { p99 = p; break; } }
++            fprintf(stderr, "[spu-block] tid=0x%X %u blocks, busy us: mean=%llu p99<%u max=%llu, over 5333 us: %u (%.2f%%)%c",
++                    ctx->spu_id, n, sum / n, (p99 + 1) * 100, mx, over, 100.0 * over / n, 10);
++            memset(hist, 0, sizeof hist); n = over = 0; sum = mx = 0; t0 = now;
++        }
++    }
+     if (code == 0x111) r = sys_event_queue_receive_host(q, &ev, 0);
+     else while ((r = sys_event_queue_receive_host(q, &ev, 100)) == 0) {}
++    if (s_bs) QueryPerformanceCounter(&s_bs_last);
+     if (r == 1) {
+         ctx->rcv_evt[0] = 0;
+         ctx->rcv_evt[1] = (uint32_t)ev.data1;

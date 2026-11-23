@@ -1,0 +1,12 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -169,7 +169,7 @@
+      * Serve it from a real dev_flash tree instead ($PS3_DEV_FLASH, else RPCS3's). */
+     if (strncmp(guest, "/dev_flash/", 11) == 0) {
+         const char* fw = getenv("PS3_DEV_FLASH");
+-        if (!fw || !*fw) fw = "D:/recomp/tools/rpcs3/dev_flash";
++        if (!fw || !*fw) fw = "dev_flash"; /* relative to the working directory; the game did not ask for firmware in tests (docs/instalador.md) */
+         snprintf(out, cap, "%s/%s", fw, guest + 11);
+         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+         return;

@@ -1,0 +1,29 @@
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 15d4ef60e108266ced91eec62cbaf057d1a7795f..0d6c86b846949ea9c12acdc232136af7bd38e394 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -740,8 +740,8 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
+             return;
+         }
+-        static int logged = 0;
+-        if (logged < 40) { fprintf(stderr, "[hle] unresolved NID 0x%08X\n", nid); logged++; }
++        /* Reported by ps3_hle_unresolved() at the end of this branch, once per
++         * distinct NID and without the old 40-line cap (f2nd-recomp patches/0005). */
+         /* cellSaveData call-shape capture: dump r3-r10 + resolve r7/r8 as OPD
+          * callbacks (statCallback/fileCallback) to learn the cellSaveDataAutoLoad2
+          * protocol so it can be implemented. */
+@@ -788,7 +788,12 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+               ctx->gpr[3] = 0x80010002u; /* generic failure (net unavailable) */
+               return;
+           } } }
+-        ctx->gpr[3] = 0;   /* CELL_OK-ish so the game keeps going */
++        /* This branch used to end in an unconditional r3 = 0 ("CELL_OK-ish so the
++         * game keeps going"), and ps3_hle_unresolved() -- the only reader of
++         * PS3_HLE_UNRESOLVED -- was never called: the documented fail mode did
++         * nothing and every unresolved import faked success silently.
++         * (f2nd-recomp patches/0005) */
++        ps3_hle_unresolved(nid, ctx);
+         return;
+     }
+     g_last_hle_name = e->name;

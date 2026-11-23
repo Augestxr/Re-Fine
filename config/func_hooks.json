@@ -1,0 +1,5 @@
+{
+  "hooks": [
+    { "addr": "0x00012D2C", "note": "value of one 2D (AET) key curve at a time: src/aet_time.cpp keeps what the original only sees every 33 ms" }
+  ]
+}

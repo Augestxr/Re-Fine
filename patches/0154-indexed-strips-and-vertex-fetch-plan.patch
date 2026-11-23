@@ -1,0 +1,244 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2200,6 +2200,8 @@ static void shader_dump(const char* kind, u32 id, const char* hlsl)
+     if (f) { fwrite(hlsl, 1, strlen(hlsl), f); fclose(f); }
+ }
+ 
++extern int g_frame_prof_on;
++extern unsigned long long g_fp_parts[6];
+ static int vp_get_vs(const rsx_state* st)
+ {
+     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+@@ -2223,7 +2225,10 @@ static int vp_get_vs(const rsx_state* st)
+     { extern u32 rsx_vp_program_size_instrs(const u8*, u32);
+       const u32 instrs = rsx_vp_program_size_instrs(vuc, vlen);
+       if (instrs) vlen = instrs * 16u; }
+-    u32 hash = vp_hash_ucode(vuc, vlen);
++    u32 hash;
++    { unsigned long long _t = g_frame_prof_on ? __rdtsc() : 0;
++      hash = vp_hash_ucode(vuc, vlen);
++      if (g_frame_prof_on) g_fp_parts[5] += __rdtsc() - _t; }
+     for (int i = 0; i < s_d3d.vp_vs_n; i++)
+         if (s_d3d.vp_vs[i].hash == hash) return i;
+ 
+@@ -4070,7 +4075,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+ /* Re:Fine 6d.4, diagnostic only: where the drain goes under FRAME_PROF, in TSC ticks:
+  * 0 draw callbacks, 1 vp_record_cb, 2 its memcpy of the constants, 3 dr_capture_texs. */
+ extern int g_frame_prof_on;
+-unsigned long long g_fp_parts[4];
++unsigned long long g_fp_parts[6];
+ #define FP_PART_BEGIN unsigned long long _fpp = g_frame_prof_on ? __rdtsc() : 0
+ #define FP_PART_END(i) do { if (g_frame_prof_on) g_fp_parts[i] += __rdtsc() - _fpp; } while (0)
+ 
+@@ -7438,9 +7443,97 @@ static void vs_arrays(const rsx_state* st, u32 prim, u32 count)
+     vs_attrs(st);
+ }
+ 
++/* Re:Fine 6d.4: the fetch of one draw, worked out once. 16 calls of rsx_fetch_attrib per
++ * vertex, each resolving its address, took ~5 ms of a 6 ms drain in a song, and they
++ * wrote float by float into the write-combined upload heap. Here the disabled attributes
++ * are one block copied whole, an enabled one is base + index * stride while it stays in
++ * its 1 MB IO page, and the vertex reaches the heap in one memcpy. Same bytes as
++ * rsx_fetch_attrib: VTX_PLAN_CHECK=1 compares every vertex, VTX_PLAN_OFF=1 goes back. */
++#include "rsx_vertex_formats.h"   /* here: its names clash with dxgiformat.h */
++typedef struct { const u8* base; u32 off, stride, room; u8 idx, type, n, local, slow; } FetchAttr;
++static struct { int valid, n; FetchAttr a[16]; VPSlot def[16]; } s_fetch;
++
++static void fetch_plan_build(const rsx_state* st)
++{
++    extern uint8_t* vm_base;
++    extern u32 cellGcmResolveLocated(int, u32);
++    memcpy(s_fetch.def, st->vertex_data4f, sizeof s_fetch.def);
++    s_fetch.n = 0;
++    for (int i = 0; i < 16; i++) {
++        const rsx_vertex_attrib* a = &st->vertex_attribs[i];
++        if (!a->enabled || a->stride == 0 || !vm_base) continue;
++        FetchAttr* f = &s_fetch.a[s_fetch.n++];
++        const u32 n = a->size ? a->size : 4;
++        f->idx = (u8)i; f->type = (u8)a->type; f->n = (u8)(n > 4 ? 4 : n);
++        f->stride = a->stride;
++        f->off = a->offset & 0x7FFFFFFFu;
++        f->local = (a->offset & 0x80000000u) ? 0 : 1;
++        f->room = 0x100000u - (f->off & 0xFFFFFu);
++        f->base = vm_base + cellGcmResolveLocated(f->local, f->off);
++        f->slow = !rsx_vertex_freq_plain(a->frequency, (st->frequency_divider_op >> i) & 1u) ||
++                  a->type < 1 || a->type > 7;
++    }
++    s_fetch.valid = 1;
++}
++
++static inline float fetch_bef(const u8* p)
++{
++    u32 w; memcpy(&w, p, 4);
++    w = _byteswap_ulong(w);
++    float f; memcpy(&f, &w, 4); return f;
++}
++
++static inline void fetch_attr(const rsx_state* state, const FetchAttr* f, u32 vi, float* out)
++{
++    extern uint8_t* vm_base;
++    extern u32 cellGcmResolveLocated(int, u32);
++    if (f->slow) { rsx_fetch_attrib(state, f->idx, vi, out); return; }
++    const u64 d = (u64)vi * f->stride;
++    const u8* p = d + 16 <= f->room ? f->base + d
++                                    : vm_base + cellGcmResolveLocated(f->local, f->off + (u32)d);
++    const u32 n = f->n;
++    switch (f->type) {
++    case 2: for (u32 k = 0; k < n; k++) out[k] = fetch_bef(p + k * 4); break;
++    case 3: for (u32 k = 0; k < n; k++) out[k] = rsx_rd_half_be(p + k * 2); break;
++    case 4: for (u32 k = 0; k < n; k++) out[k] = p[k] / 255.0f; break;
++    case 1: for (u32 k = 0; k < n; k++) {
++                s16 s = (s16)((p[k*2] << 8) | p[k*2+1]);
++                out[k] = (float)s / 32767.0f;
++            }
++            break;
++    case 5: for (u32 k = 0; k < n; k++) out[k] = (float)(s16)((p[k*2] << 8) | p[k*2+1]); break;
++    case 6: {
++        const u32 w = _byteswap_ulong(*(const u32*)p);
++        s32 x = (s32)(w & 0x7FF);         if (x & 0x400) x -= 0x800;
++        s32 y = (s32)((w >> 11) & 0x7FF); if (y & 0x400) y -= 0x800;
++        s32 z = (s32)((w >> 22) & 0x3FF); if (z & 0x200) z -= 0x400;
++        out[0] = (float)x / 1023.0f; out[1] = (float)y / 1023.0f; out[2] = (float)z / 511.0f; out[3] = 1.0f;
++        break; }
++    case 7: for (u32 k = 0; k < n; k++) out[k] = (float)p[k]; break;
++    }
++}
++
+ static void read_vp_vertex(const rsx_state* state, u32 vi, VPSlot* out16)
+ {
+     if (s_vs_on > 0) s_vs.conv++;
++    static int plan = -1, check;
++    if (plan < 0) { plan = !getenv("VTX_PLAN_OFF") && !getenv("VTX_POS"); check = getenv("VTX_PLAN_CHECK") != NULL; }
++    if (plan) {
++        if (!s_fetch.valid) fetch_plan_build(state);
++        VPSlot l[16];
++        memcpy(l, s_fetch.def, sizeof l);
++        for (int k = 0; k < s_fetch.n; k++) fetch_attr(state, &s_fetch.a[k], vi, l[s_fetch.a[k].idx].v);
++        memcpy(out16, l, sizeof l);
++        if (check) {
++            static unsigned long long n, bad;
++            VPSlot o[16];
++            for (int i = 0; i < 16; i++) rsx_fetch_attrib(state, i, vi, o[i].v);
++            n++;
++            if (memcmp(o, l, sizeof l)) bad++;
++            if (!(n & 0xFFFFF)) fprintf(stderr, "[vtx-plan-check] %llu vertices, %llu mismatches\n", n, bad);
++        }
++        return;
++    }
+     for (int i = 0; i < 16; i++) {
+         rsx_fetch_attrib(state, i, vi, out16[i].v);
+         if (i == 0) {
+@@ -8152,6 +8245,75 @@ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count,
+     return o;
+ }
+ 
++/* Re:Fine 6d.4: the same strip through the indexed run of upload_tris_vp_ix, same
++ * triangles in the same order. The expansion wrote 131000 vertices of 256 bytes per
++ * frame in a song, 33 MB into the upload heap, for 37000 distinct ones: ~4 ms of the
++ * drain. The 256-index batches of one strip (0119) join one record. *ok = 0 means "use
++ * the expansion", with nothing published; a batch can be valid and hold no triangle. */
++static u32 upload_strip_vp_ix(const rsx_state* state, u32 first, u32 count, int fan, int cont, int* ok)
++{
++    extern uint8_t* vm_base;
++    *ok = 0;
++    if (!state || !vm_base || !s_d3d.vp_vb_mapped || !s_d3d.vp_ib_mapped) return 0;
++    if (!state->vertex_attribs[0].enabled || !count) return 0;
++    if (s_d3d.vp_ib_offset + count * 3 > VP_MAX_INDICES) return 0;
++    if (!s_ix_stamp) {
++        s_ix_stamp = (u32*)calloc(1u << 20, sizeof(u32));
++        s_ix_slot  = (u32*)malloc((1u << 20) * sizeof(u32));
++        if (!s_ix_stamp || !s_ix_slot) return 0;
++    }
++    if (!cont) {
++        if (++s_ix_gen == 0) { memset(s_ix_stamp, 0, (1u << 20) * sizeof(u32)); s_ix_gen = 1; }
++        s_ix_vbase  = s_d3d.vp_vb_offset / VP_VERT_STRIDE;
++        s_ix_nverts = 0;
++    }
++    const struct { u32 epoch, next, n, odd, v[2]; int valid; } saved = { s_strip.epoch, s_strip.next, s_strip.n, s_strip.odd,
++                                                                         { s_strip.v[0], s_strip.v[1] }, s_strip.valid };
++    if (!s_strip.valid || s_strip.epoch != state->begin_epoch || s_strip.next != first) {
++        s_strip.n = 0; s_strip.odd = 0;
++    }
++    s_strip.valid = 1; s_strip.epoch = state->begin_epoch; s_strip.next = first + count;
++    const int sixteen = (((state->index_array_dma >> 4) & 0xF) == 1);
++    const int restart = state->restart_index_enable && (!sixteen || state->restart_index <= 0xFFFFu);
++    VPSlot* vb = (VPSlot*)((u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE);
++    u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)s_d3d.vp_parity * VP_MAX_INDICES + s_d3d.vp_ib_offset;
++    u32 n = s_ix_nverts, o = 0;
++    for (u32 k = 0; k < count; k++) {
++        const u32 ix = read_guest_index(state, first + k);
++        if (restart && ix == state->restart_index) { s_strip.n = 0; s_strip.odd = 0; continue; }
++        if (ix >= (1u << 20) || s_ix_vbase + n + 3 > MAX_VERTICES) {
++            /* As in upload_tris_vp_ix: abandon the run, the expansion takes the draw. */
++            s_strip.epoch = saved.epoch; s_strip.next = saved.next; s_strip.n = saved.n;
++            s_strip.odd = saved.odd; s_strip.valid = saved.valid;
++            s_strip.v[0] = saved.v[0]; s_strip.v[1] = saved.v[1];
++            s_ix_run_valid = 0;
++            if (++s_ix_gen == 0) { memset(s_ix_stamp, 0, (1u << 20) * sizeof(u32)); s_ix_gen = 1; }
++            return 0;
++        }
++        if (s_strip.n < 2) { s_strip.v[s_strip.n++] = ix; continue; }
++        u32 tri[3] = { s_strip.v[0], s_strip.v[1], ix };
++        if (!fan && s_strip.odd) { tri[1] = ix; tri[2] = s_strip.v[1]; }
++        for (int t = 0; t < 3; t++) {
++            const u32 g = tri[t];
++            if (s_ix_stamp[g] != s_ix_gen) {
++                s_ix_stamp[g] = s_ix_gen;
++                s_ix_slot[g] = n;
++                read_vp_vertex(state, g, &vb[(u64)(s_ix_vbase + n) * 16]);
++                n++;
++            }
++            ib[o++] = s_ix_slot[g];
++        }
++        if (!fan) { s_strip.v[0] = s_strip.v[1]; s_strip.odd ^= 1u; }
++        s_strip.v[1] = ix;
++    }
++    s_d3d.vp_vb_offset += (n - s_ix_nverts) * VP_VERT_STRIDE;
++    s_ix_nverts = n;
++    s_d3d.vp_ib_offset += o;
++    s_ix_run_valid = 1;
++    *ok = 1;
++    return o;
++}
++
+ static void d3d12_draw_arrays(void* ud, u32 primitive, u32 first, u32 count)
+ {
+     /* RSX_LIVE_FEED_DBG=1: pair with the [feed] method counts so "the FIFO
+@@ -8410,6 +8572,10 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
+         ix_cont = ix_can_continue(first);
+         emitted = upload_tris_vp_ix(s_d3d.current_rsx_state, first, count, ix_cont);
+         ix_used = emitted != 0;
++    } else if ((primitive == RSX_PRIMITIVE_TRIANGLE_STRIP || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) && ix_on()) {
++        ix_cont = ix_can_continue(first);
++        emitted = upload_strip_vp_ix(s_d3d.current_rsx_state, first, count,
++                                     primitive == RSX_PRIMITIVE_TRIANGLE_FAN, ix_cont, &ix_used);
+     }
+     if (ix_used) { /* the indexed run took it */ }
+     else if (primitive == RSX_PRIMITIVE_QUADS)        emitted = upload_quads_vp_indexed(s_d3d.current_rsx_state, first, count);
+@@ -8498,7 +8664,7 @@ static void d3d12_draw_indexed(void* ud, u32 primitive, u32 first, u32 count)
+                 vp_record_cb(s_d3d.draw_count, dr->vs_idx, dr);
+         s_d3d.draw_count++;
+         /* Anchor for merging the next batch of this indexed stream. */
+-        s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES);
++        s_d3d.merge_prev_draw = (primitive == RSX_PRIMITIVE_TRIANGLES) || ix_used;
+         s_d3d.merge_first_end = first + count;
+     }
+ }
+@@ -8737,13 +8903,16 @@ static void d3d12_set_depth_stencil(void* ud, const rsx_state* state)
+ static void d3d12_draw_arrays_prof(void* ud, u32 primitive, u32 first, u32 count)
+ {
+     FP_PART_BEGIN;
++    s_fetch.valid = 0;
+     d3d12_draw_arrays(ud, primitive, first, count);
+     FP_PART_END(0);
++    FP_PART_END(4);
+ }
+ 
+ static void d3d12_draw_indexed_prof(void* ud, u32 primitive, u32 first, u32 count)
+ {
+     FP_PART_BEGIN;
++    s_fetch.valid = 0;
+     d3d12_draw_indexed(ud, primitive, first, count);
+     FP_PART_END(0);
+ }

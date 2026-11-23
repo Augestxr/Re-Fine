@@ -1,0 +1,85 @@
+{{TITLE}}
+
+Port para PC de Hatsune Miku: Project DIVA F (PS3). No incluye el juego: necesitas tu
+propia copia de BLUS31319 (USA), versión 01.00, sin actualizaciones. Windows 10 u 11 de 64
+bits y una tarjeta gráfica con Vulkan o DirectX 12. Usa Vulkan y, si no arranca, DirectX 12
+(lo dice refine.out.log / refine.err.log: "[renderer] ...").
+
+
+PREPARAR EL JUEGO (una vez)
+1. Extrae tu disco o ISO a una carpeta, por ejemplo C:\Juegos\DivaF. Dentro debe quedar
+   PS3_GAME.
+2. El EBOOT.BIN del disco está cifrado. Abre RPCS3 con su firmware instalado, usa
+   Utilidades > Descifrar binarios de PS3 (Utilities > Decrypt PS3 Binaries), elige
+   PS3_GAME\USRDIR\EBOOT.BIN y deja el EBOOT.elf resultante en esa misma carpeta USRDIR.
+3. Abre Re:Fine. La primera vez te pide la carpeta: elige la que contiene PS3_GAME.
+   La ruta queda en %LOCALAPPDATA%\ReFine\ruta_juego.txt. Si mueves el juego, borra ese
+   archivo y te la volverá a pedir.
+
+
+ACCESO DEL MENÚ INICIO
+Re:Fine arranca a 60 fps con el juego a su velocidad normal. Para otros valores (30, 120,
+144, 180, 240) cambia fps_target en refine.ini (abajo). F1 abre el menú del port.
+
+Se juega con una ventanita de consola minimizada en la barra de tareas. No la cierres.
+Para salir, usa la X de la ventana del juego.
+
+
+TECLADO
+W A S D        triángulo, cuadrado, equis, círculo
+I J K L        cruceta arriba, izquierda, abajo, derecha (para las notas dobles)
+Q E / U O      estrellas (stick izquierdo / derecho)
+Flechas        moverse por los menús
+Enter          confirmar
+Retroceso      volver
+Espacio o Esc  START (título y pausa)
+Tab            SELECT
+1 2            L1 R1
+
+MANDO
+Cualquier mando que reconozca Windows (DualShock, DualSense, Xbox, Switch Pro). Los botones
+van por posición, como en la PS3: el de abajo es equis, y así con los demás.
+
+
+AJUSTES
+Edita %LOCALAPPDATA%\ReFine\refine.ini con el Bloc de notas, con el juego cerrado:
+fps_target = 60       30 (como el original), 60, 120, 144, 180 o 240.
+stick_rearm_ms = 34   ms que el stick debe estar en el centro antes de contar otra
+                      estrella por encima de 30 fps. Súbelo si aún cuenta doble.
+render_height = 720   altura de la imagen, de 360 a 2160. Sube el detalle y gasta más
+                      tarjeta gráfica.
+
+
+DÓNDE ESTÁ TODO
+%LOCALAPPDATA%\ReFine contiene:
+hdd0       tus partidas
+logs       los registros de la última corrida y de la anterior
+refine.ini  los ajustes
+También guarda la caché de shaders. Para abrir esa carpeta, pega la ruta en el
+Explorador.
+
+Si algo falla: cierra el juego, entra en la carpeta logs y manda al autor refine.out.log y
+refine.err.log, con lo que estabas haciendo. Si ya volviste a abrir el juego, el fallo
+está en los refine.anterior.*.log.
+
+
+PROBLEMAS CONOCIDOS ({{VER}})
+- El pelo se ve algo más rígido a fps altos.
+- Alguna animación 2D del HUD va más rápida de lo normal durante una canción.
+- A veces una estrella doble cuenta dos veces.
+- La integración con Discord no está activada.
+- Si algo falla, manda los logs al autor (ver arriba).
+
+KNOWN ISSUES ({{VER}})
+- Hair looks a bit stiffer at high fps.
+- Some HUD 2D animations run faster than normal during a song.
+- A double star is sometimes counted twice.
+- Discord integration is not enabled.
+- If something breaks, send the logs to the author (see above).
+
+DESINSTALAR
+Configuración > Aplicaciones (Agregar o quitar programas) > Re:Fine. Te preguntará si
+borrar también las partidas y los ajustes. Por defecto se conservan.
+
+Las licencias de lo que va incluido (FFmpeg, SDL3, ps3recomp y demás) están en la carpeta
+licenses, junto al programa.

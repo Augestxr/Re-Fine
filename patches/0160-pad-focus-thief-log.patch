@@ -1,0 +1,22 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1160,7 +1160,17 @@ static void pad_poll_sdl3(void)
+     const int focused = s_sdl3_nofocus || pad_host_window_focused();
+     { static int was = -1;
+       if (focused != was) { was = focused;
+-          fprintf(stderr, "[cellPad] pads %s%c", focused ? "count (window in front)" : "ignored (window behind)", 10); } }
++          /* Re:Fine 0160: which window took the front (another process's, by its exe and class). */
++          char who[160] = "";
++          if (!focused) {
++              HWND fg = GetForegroundWindow(); DWORD pid = 0, n = MAX_PATH; char cls[64] = "", exe[MAX_PATH] = "?";
++              if (fg) { GetWindowThreadProcessId(fg, &pid); GetClassNameA(fg, cls, sizeof cls); }
++              HANDLE ph = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
++              if (ph) { QueryFullProcessImageNameA(ph, 0, exe, &n); CloseHandle(ph); }
++              const char* b = strrchr(exe, 92);
++              snprintf(who, sizeof who, ": front is pid %lu %s class '%s'", (unsigned long)pid, b ? b + 1 : exe, cls);
++          }
++          fprintf(stderr, "[cellPad] pads %s%s%c", focused ? "count (window in front)" : "ignored (window behind)", who, 10); } }
+     if (focused) return;
+     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+         const int on = s_host_state[p].connected;

@@ -1,0 +1,191 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 02d86888..b4b1f038 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -3248,6 +3248,111 @@ static u32 tex_csum(const u8* base, u32 nbytes)
+     return h;
+ }
+ 
++/* Re:Fine 0128: a guest texture is read when the draw is recorded, as the RSX reads
++ * it when it reaches the draw. Uploads wait for the flip, ~25 ms later, and by
++ * then Project DIVA F is overwriting its movie texture with the next picture:
++ * nothing in the command stream orders the two (docs/STATUS.md, 4c.5). So the
++ * first draw of a batch to bind a texture takes its checksum, and if the bytes
++ * changed since the last batch that bound it, takes a copy, which the upload
++ * reads instead of guest memory. Static textures cost the checksum the upload
++ * no longer does. Not covered: cube maps, a texture's first batch (nothing to
++ * compare with), and a second version written between two draws of one batch,
++ * since a slot holds one version per batch. TEX_SNAP=0 turns it off. */
++#define TEX_REC_N 1024u
++#define TEX_REC_PROBE 8u
++typedef struct {
++    u32 key, w, h, fmt;
++    u32 nbytes;
++    u32 csum;        /* of the bytes at record time */
++    u32 stamp;       /* the batch that last bound it */
++    u32 snap_stamp;  /* the batch `snap` was taken for */
++    u8* snap;
++    u32 cap;
++} TexRec;
++static TexRec s_tex_rec[TEX_REC_N];
++static u32 s_tex_rec_batch = 1;   /* batch being recorded */
++static u32 s_tex_rec_render;      /* batch render_frame is uploading */
++static u32 s_tex_snap_n;
++static u64 s_tex_snap_bytes;
++static double s_tex_snap_ms;
++
++static int tex_snap_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("TEX_SNAP");
++                  on = (e && atoi(e) == 0) ? 0 : !getenv("TEX_OFF_BIAS") && !getenv("TEX_REMAP"); }
++    return on;
++}
++
++static TexRec* tex_rec_find(u32 key, u32 w, u32 h, u32 fmt, TexRec** victim)
++{
++    const u32 home = ((key >> 7) * 2654435761u) >> 22;
++    TexRec* old = NULL;
++    for (u32 i = 0; i < TEX_REC_PROBE; i++) {
++        TexRec* e = &s_tex_rec[(home + i) & (TEX_REC_N - 1u)];
++        if (e->key == key && e->w == w && e->h == h && e->fmt == fmt) return e;
++        if (!old || e->stamp < old->stamp) old = e;
++    }
++    if (victim) *victim = old;
++    return NULL;
++}
++
++static void tex_rec_capture(u32 key, u32 w, u32 h, u32 fmt)
++{
++    extern uint8_t* vm_base;
++    TexRec* v = NULL;
++    TexRec* e = tex_rec_find(key, w, h, fmt, &v);
++    if (e && e->stamp == s_tex_rec_batch) return;
++    if (!e) {
++        rsx_tex_layout tl;
++        rsx_texture_layout(fmt, w, h, &tl);
++        u8* snap = v->snap; const u32 cap = v->cap;
++        memset(v, 0, sizeof *v);
++        v->snap = snap; v->cap = cap;
++        v->key = key; v->w = w; v->h = h; v->fmt = fmt;
++        v->nbytes = tl.compressed ? tl.row_bytes * tl.rows : w * h * tl.bytes_per_texel;
++        v->csum = tex_csum(vm_base + key, v->nbytes);
++        v->stamp = s_tex_rec_batch;
++        return;
++    }
++    const u32 cs = tex_csum(vm_base + key, e->nbytes);
++    if (cs != e->csum) {
++        if (e->cap < e->nbytes) {
++            free(e->snap);
++            e->snap = (u8*)malloc(e->nbytes);
++            e->cap = e->snap ? e->nbytes : 0;
++        }
++        if (e->snap) {
++            static int stats = -1;
++            if (stats < 0) stats = getenv("TEX_SNAP_STATS") ? 1 : 0;
++            LARGE_INTEGER t0, t1, f;
++            if (stats) QueryPerformanceCounter(&t0);
++            memcpy(e->snap, vm_base + key, e->nbytes);
++            e->snap_stamp = s_tex_rec_batch;
++            if (stats) {
++                QueryPerformanceCounter(&t1); QueryPerformanceFrequency(&f);
++                s_tex_snap_ms += (t1.QuadPart - t0.QuadPart) * 1000.0 / f.QuadPart;
++                s_tex_snap_bytes += e->nbytes;
++                if (!(++s_tex_snap_n % 300u))
++                    fprintf(stderr, "[TEXSNAP] copies=%u MB=%.1f ms=%.1f last=0x%08X %ux%u%c",
++                            s_tex_snap_n, s_tex_snap_bytes / 1048576.0, s_tex_snap_ms,
++                            key, w, h, 10);
++            }
++        }
++    }
++    e->csum = cs;
++    e->stamp = s_tex_rec_batch;
++}
++
++/* What this batch recorded for a texture, or NULL: the upload then reads guest
++ * memory, as before. */
++static const TexRec* tex_rec_for_upload(u32 key, u32 w, u32 h, u32 fmt, int cube)
++{
++    if (cube || !tex_snap_on()) return NULL;
++    const TexRec* e = tex_rec_find(key, w, h, fmt, NULL);
++    return (e && e->stamp == s_tex_rec_render) ? e : NULL;
++}
++
+ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips)
+ {
+     /* TEX_BUDGET=<n>: cap texture uploads per frame. Off by default -- it was
+@@ -3303,6 +3408,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+     /* (portable helper tex_csum() -- see above; a statement-expression macro
+      * here was a GCC/Clang extension MSVC rejects.) */
+     #define TEX_CSUM(base, nbytes) tex_csum((base), (nbytes))
++    const TexRec* rec = tex_rec_for_upload(key_off, w, h, fmt, cube);
+     int slot = -1, freeslot = -1;
+     for (int i = 0; i < VP_TEX_SLOTS; i++) {
+         VPTexSlot* c = &s_d3d.vp_tex[i];
+@@ -3318,7 +3424,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+              * changed. Most of this scene's textures are static, and converting
+              * every one of them every frame was ~70% of the frame's CPU time. */
+             u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
+-            u32 cs = TEX_CSUM(vm_base + c->off, nb);
++            u32 cs = rec ? rec->csum : TEX_CSUM(vm_base + c->off, nb);
+             if (cs == c->csum) { c->used = 1; return i; }
+             slot = i; break;                      /* stale: fall through and redo */
+         }
+@@ -3548,6 +3654,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+     }
+     const u32 _nfaces     = cube ? 6u : 1u;
+     const u32 _off0 = off; u8* const _map0 = (u8*)mapped;
++    const u8* const tex_src = (rec && rec->snap_stamp == rec->stamp) ? rec->snap : NULL;
+     for (u32 _f = 0; _f < _nfaces; _f++) {
+     off    = _off0 + _f * _face_bytes;
+     if (cube && getenv("CUBEDBG")) { u32 _s=0; const u8* _p = vm_base + off;
+@@ -3565,13 +3672,14 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+         static u8* tmp;
+         if (!tmp) tmp = (u8*)malloc((size_t)pitch * h);
+         tex_race_event(TR_UP_SRC, 0, 0, NULL, 0);
+-        rsx_texture_decode(tmp, pitch, vm_base + off, w, h, &tl, rsx_texture_argb_is_rgba());
++        rsx_texture_decode(tmp, pitch, tex_src ? tex_src : vm_base + off, w, h, &tl,
++                           rsx_texture_argb_is_rgba());
+         tex_race_event(TR_UP_SRC, 1, 0, NULL, 0);
+         memcpy(mapped, tmp, (size_t)pitch * h);
+         tex_race_sig(tmp, pitch, sig);
+         tex_race_event(TR_UP, (u32)slot, (u32)s_d3d.frame_count, sig, TR_NSIG);
+     } else
+-    rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
++    rsx_texture_decode(mapped, pitch, tex_src ? tex_src : vm_base + off, w, h, &tl,
+                        rsx_texture_argb_is_rgba());
+ 
+     /* The diagnostics below only apply to the linear 8-bit case (Bink video
+@@ -3871,7 +3979,7 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+     t->off = off; t->key = key_off; t->w = w; t->h = h; t->fmt = fmt;
+     t->cube = cube; t->used = 1;
+     { u32 nb = dxt ? (blkrow * blkrows) : (w * h * bpp);
+-      t->csum = TEX_CSUM(vm_base + off, nb); }
++      t->csum = rec ? rec->csum : TEX_CSUM(vm_base + off, nb); }
+     #undef TEX_CSUM
+     return slot;
+ }
+@@ -3894,6 +4002,15 @@ static void dr_capture_texs(D3D12DrawRecord* dr)
+     dr->tex_mask = s_d3d.cur_tex_mask;
+     dr->fp_units = 0xFFFFu;
+     dr->tex_use = 0;
++    if (tex_snap_on()) {
++        for (u32 u = 0; u < RSX_FP_TEX_UNITS; u++) {
++            if (!(dr->tex_mask & (1u << u))) continue;
++            const u32 bf = dr->tex[u].fmt & 0x9Fu;
++            if (dr->tex[u].off && dr->tex[u].w && dr->tex[u].h && !dr->tex[u].cube &&
++                (bf == 0x81 || bf == 0x85 || bf == 0x8B || (bf >= 0x86 && bf <= 0x88)))
++                tex_rec_capture(dr->tex[u].off, dr->tex[u].w, dr->tex[u].h, dr->tex[u].fmt);
++        }
++    }
+ }
+ 
+ /* Snapshot the VP constant bank + viewport epilogue for one draw into its
+@@ -5204,6 +5321,7 @@ static void render_frame(void)
+      * (tex_slot 1000+idx) -- no guest-memory upload. */
+     double _pre0 = perf_on() ? perf_now() : 0.0;
+     for (int _i = 0; _i < VP_TEX_SLOTS; _i++) s_d3d.vp_tex[_i].used = 0;
++    s_tex_rec_render = s_tex_rec_batch++;
+     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+         D3D12DrawRecord* dr = &s_d3d.draws[_d];
+         if (!dr->is_vp || dr->is_clear) continue;

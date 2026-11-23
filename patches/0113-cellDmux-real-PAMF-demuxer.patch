@@ -1,0 +1,2105 @@
+diff --git a/libs/codec/cellDmux.c b/libs/codec/cellDmux.c
+index b0553858..aff5f58a 100644
+--- a/libs/codec/cellDmux.c
++++ b/libs/codec/cellDmux.c
+@@ -1,290 +1,1095 @@
+ /*
+  * ps3recomp - cellDmux HLE implementation
+  *
+- * Stub demuxer that accepts PAMF data and reports AU-found callbacks.
+- * Without real MPEG-TS parsing, this provides the API surface games
+- * expect while the video pipeline is built out.
++ * A PAMF demuxer: MPEG-PS packs of 0x800 bytes, one PES per pack, carrying M2V
++ * video and ATRAC3plus audio. One host thread per demuxer (dmux_pamf) walks the
++ * section the title set with cellDmuxSetStream, cuts access units into the
++ * title's ES memory and calls the title's callbacks.
++ *
++ * Reimplemented from the observed behaviour of the library and the format, not
++ * copied: RPCS3 (GPL-2.0, 1f59f0f2) was read as a description of what the title
++ * sees; none of its code is here. Only M2V and ATRAC3plus are implemented; any
++ * other ES is refused with CELL_DMUX_ERROR_FATAL.
++ *
++ * Threads. The title's threads only touch the queues under the demuxer's lock.
++ * The cursor of the AU being cut belongs to dmux_pamf alone. Callbacks run with
++ * no lock held, so they may call back in here. When an AU does not fit,
++ * dmux_pamf sleeps on a condition variable until ReleaseAu, a reset or a close.
+  */
+ 
+ #include "cellDmux.h"
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+-#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
++#include "../../runtime/ppu/ppu_memory.h"   /* vm_read/vm_write: guest EA, big-endian */
++#include "../guest_struct.h"                /* GUEST_EA */
++#include "ps3emu/guest_call.h"
++
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++#include <windows.h>
+ 
+ /* ---------------------------------------------------------------------------
+- * Internal state
++ * Guest layouts
+  * -----------------------------------------------------------------------*/
+ 
+-typedef struct {
+-    int in_use;
+-    CellDmuxCbMsg cbFunc;
+-    void* cbArg;
+-    u32 streamType;
+-    /* Stream data tracking for demux processing */
+-    u32 streamAddr;
+-    u32 streamSize;
+-    u64 userData;
+-    u32 auSeqNo;        /* running AU sequence counter */
+-} DmuxSlot;
++/* demuxerResource: memAddr +0, memSize +4. demuxerCb, esCb: cbFunc +0, cbArg +4.
++ * esFilterId: major +0, minor +4, supplementalInfo1 +8 (u32 each).
++ *
++ * CellDmuxAuInfo, 0x28 bytes. */
++#define AU_ADDR        0x00
++#define AU_SIZE        0x04
++#define AU_MAX_SIZE    0x08
++#define AU_IS_RAP      0x0C   /* one byte */
++#define AU_USER_DATA   0x10
++#define AU_PTS         0x18
++#define AU_DTS         0x20
++#define DMUX_AU_INFO_SIZE 0x28u
+ 
+-typedef struct {
+-    int in_use;
+-    u32 dmuxId;
+-    CellDmuxEsFilterId filterId;
+-    CellDmuxCbEsMsg esCbFunc;
+-    void* esCbArg;
+-    CellDmuxAuInfo currentAu;
+-    int hasAu;
+-} DmuxEsSlot;
++/* CellDmuxMsg and CellDmuxEsMsg: msgType +0, supplementalInfo +8. The demuxer's
++ * own guest memory holds one of each: only dmux_pamf sends them, one at a time. */
++#define MSG_TYPE       0x00
++#define MSG_INFO       0x08
++#define DMUX_MSG_OFF   0x10u
++#define DMUX_ES_MSG_OFF 0x20u
+ 
+-static DmuxSlot s_dmux[CELL_DMUX_MAX_HANDLES];
+-static DmuxEsSlot s_es[CELL_DMUX_MAX_ES];
++#define DMUX_MEM_SIZE       0x1000u
++#define DMUX_VER_UPPER      0x260000u
++#define DMUX_VER_LOWER      0x280000u
++
++/* ES memory: a 0x100 header (unused, the handle points at it), the AU queue, the
++ * AU ring. The extra queue slot is for the AU a flush produces, so that a flush
++ * never has to wait. */
++#define DMUX_ES_HEADER      0x100u
++#ifndef DMUX_AU_QUEUE_MAX           /* the test forces it small */
++#define DMUX_AU_QUEUE_MAX   0x40u
++#endif
++#define DMUX_AU_SLOTS       (DMUX_AU_QUEUE_MAX + 1u)
++#define DMUX_RING_GUARD     0x10u
++
++#define DMUX_M2V_MP_ML      1u
++#define DMUX_TS_INVALID     0xFFFFFFFFFFFFFFFFull
++
++/* MPEG-PS */
++#define PACK_SIZE           0x800u
++#define PACK_START          0x000001BAu
++#define PROG_END            0x000001B9u
++#define SYSTEM_HEADER       0x000001BBu
++#define PRIVATE_STREAM_2    0x000001BFu
++#define PES_SID_PRIVATE_1   0xBDu
++#define M2V_PICTURE         0x00u
++#define M2V_SEQUENCE        0xB3u
++#define M2V_SEQUENCE_END    0xB7u
++#define AT3P_SYNC_HI        0x0Fu
++#define AT3P_SYNC_LO        0xD0u
++#define AUDIO_PES_HEADER    4u
+ 
+ /* ---------------------------------------------------------------------------
+- * Demuxer lifecycle
++ * Host state
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
+-                  CellDmuxCbMsg cbFunc, void* cbArg, CellDmuxHandle* handle)
++typedef enum { AU_NONE, AU_SEQUENCE, AU_STARTED } AuState;
++
++typedef struct DmuxSlot DmuxSlot;
++
++typedef struct {
++    LONG enabled;
++    u32  handle;            /* guest EA */
++    DmuxSlot* dmux;
++    u32  cb_func, cb_arg;
++    u32  major, minor;
++    int  is_video;
++    u32  au_max;
++    u32  info_ea;           /* CellDmuxAuInfo[DMUX_AU_SLOTS] */
++    u32  ring_ea, ring_size;
++
++    /* Under the demuxer's lock. An AU goes found -> popped -> released in FIFO
++     * order: [oldest, head) are popped, [head, tail) wait for GetAu. */
++    u32  au_sizes[DMUX_AU_SLOTS];
++    u32  oldest, head, tail;
++    u32  unreleased;        /* found and not released */
++    u32  ready;             /* found and not popped */
++    u32  ring_front;        /* start of the oldest unreleased AU */
++    u32  ring_wrap;         /* end of the data before the ring wrapped; 0: not wrapped */
++    u32  ring_wp;           /* written by dmux_pamf, read by ring_room */
++    int  flushing;
++    int  flush_req;
++
++    /* dmux_pamf only. [au_start, ring_wp) is the AU being cut, contiguous. */
++    AuState au_state;
++    u32  au_start, au_scan;
++    u32  au_parsed;         /* ATRAC3plus: size from the frame header; 0: invalid */
++    u32  chunk_start;       /* where the PES payload being scanned begins */
++    int  au_late;           /* see au_found */
++    u64  au_pts, au_dts;
++    int  au_rap;
++    u64  next_pts, next_dts;
++    int  next_rap;
++} DmuxEs;
++
++struct DmuxSlot {
++    LONG in_use;
++    u32  handle;            /* guest EA */
++    u32  cb_func, cb_arg;
++    SRWLOCK lock;
++    CONDITION_VARIABLE wake;   /* dmux_pamf sleeps here */
++    CONDITION_VARIABLE idle;   /* the title waits here for dmux_pamf */
++    HANDLE thread;
++    DWORD  thread_id;
++    int  stop;
++    int  running;           /* a section is set and DEMUX_DONE has not been sent */
++    int  reset_req;
++    int  discard_req;
++    u32  stream_ea, stream_left;
++    u64  user_data;
++    DmuxEs* active_es;      /* the ES dmux_pamf is working on */
++    DmuxEs es[CELL_DMUX_MAX_ES];
++};
++
++static DmuxSlot s_dmux[CELL_DMUX_MAX_HANDLES];
++
++/* DMUX_TRACE=1: totals at close. DMUX_TRACE=2: also one line per AU. */
++static int s_trace = -1;
++static LONG s_n_sections, s_n_au_video, s_n_au_audio, s_n_get, s_n_release, s_n_flush,
++            s_n_queue_waits, s_n_ring_waits;
++
++static int dmux_trace(void)
+ {
+-    (void)res;
++    if (s_trace < 0) {
++        const char* e = getenv("DMUX_TRACE");
++        s_trace = e ? atoi(e) : 0;
++    }
++    return s_trace;
++}
+ 
+-    printf("[cellDmux] Open(streamType=%u)\n",
+-           type ? vm_read32(GUEST_EA(type)) : 0);   /* streamType */
++static u32 be16_at(const u8* p) { return ((u32)p[0] << 8) | p[1]; }
++static u32 be32_at(const u8* p) { return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
++static u32 align16(u32 v) { return (v + 0xFu) & ~0xFu; }
+ 
+-    if (!type || !handle)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++static DmuxSlot* find_dmux(u32 handle)
++{
++    if (!handle)
++        return NULL;
++    for (int i = 0; i < CELL_DMUX_MAX_HANDLES; i++)
++        if (s_dmux[i].in_use && s_dmux[i].handle == handle)
++            return &s_dmux[i];
++    return NULL;
++}
+ 
++static DmuxEs* find_es(u32 handle)
++{
++    if (!handle)
++        return NULL;
+     for (int i = 0; i < CELL_DMUX_MAX_HANDLES; i++) {
+-        if (!s_dmux[i].in_use) {
+-            s_dmux[i].in_use = 1;
+-            s_dmux[i].cbFunc = cbFunc;
+-            s_dmux[i].cbArg = cbArg;
+-            s_dmux[i].streamType = vm_read32(GUEST_EA(type));
+-            s_dmux[i].streamAddr = 0;
+-            s_dmux[i].streamSize = 0;
+-            s_dmux[i].userData = 0;
+-            s_dmux[i].auSeqNo = 0;
+-            vm_write32((u32)(uintptr_t)handle, (u32)i);
+-            printf("[cellDmux] Open -> handle=%u\n", i);
+-            return CELL_OK;
+-        }
++        if (!s_dmux[i].in_use)
++            continue;
++        for (int j = 0; j < CELL_DMUX_MAX_ES; j++)
++            if (s_dmux[i].es[j].enabled && s_dmux[i].es[j].handle == handle)
++                return &s_dmux[i].es[j];
+     }
+-    return (s32)CELL_DMUX_ERROR_BUSY;
++    return NULL;
+ }
+ 
+-s32 cellDmuxClose(CellDmuxHandle handle)
++/* ---------------------------------------------------------------------------
++ * Attribute queries
++ * -----------------------------------------------------------------------*/
++
++static u32 es_ring_size(u32 major, u32 minor, u32 specific_ea)
++{
++    if ((major & 0xF0u) == 0xE0u)
++        return specific_ea && vm_read32(specific_ea) > DMUX_M2V_MP_ML ? 0x255000u : 0x70000u;
++    if ((major & 0xFFu) == PES_SID_PRIVATE_1 && (minor & 0xF0u) == 0x00u)
++        return 0x6400u;
++    return 0;
++}
++
++static u32 es_mem_size(u32 ring)
+ {
+-    printf("[cellDmux] Close(handle=%u)\n", handle);
++    /* The 0x20 pays for aligning the handle and the ring to 0x10. */
++    return DMUX_ES_HEADER + DMUX_AU_SLOTS * DMUX_AU_INFO_SIZE + ring + 0x20u;
++}
+ 
+-    if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
++s32 cellDmuxQueryAttr(const void* demuxerType, void* demuxerAttr)
++{
++    const u32 type = GUEST_EA(demuxerType), attr = GUEST_EA(demuxerAttr);
++    if (!type || !attr || vm_read32(type) != CELL_DMUX_STREAM_TYPE_PAMF)
+         return (s32)CELL_DMUX_ERROR_ARG;
++    vm_write32(attr + 0, DMUX_MEM_SIZE);
++    vm_write32(attr + 4, DMUX_VER_UPPER);
++    vm_write32(attr + 8, DMUX_VER_LOWER);
++    return CELL_OK;
++}
+ 
+-    /* Close associated ES handles */
+-    for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (s_es[i].in_use && s_es[i].dmuxId == handle)
+-            s_es[i].in_use = 0;
++s32 cellDmuxQueryEsAttr(const void* demuxerType, const void* esFilterId,
++                        const void* esSpecificInfo, void* esAttr)
++{
++    const u32 type = GUEST_EA(demuxerType), id = GUEST_EA(esFilterId), attr = GUEST_EA(esAttr);
++    if (!type || !id || !attr || vm_read32(type) != CELL_DMUX_STREAM_TYPE_PAMF)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    const u32 ring = es_ring_size(vm_read32(id), vm_read32(id + 4), GUEST_EA(esSpecificInfo));
++    if (!ring || vm_read32(id + 8)) {   /* supplementalInfo1: AVC */
++        fprintf(stderr, "[cellDmux] QueryEsAttr: unsupported ES %02X/%02X/%u -> FATAL\n",
++                vm_read32(id), vm_read32(id + 4), vm_read32(id + 8));
++        return (s32)CELL_DMUX_ERROR_FATAL;
+     }
+-
+-    s_dmux[handle].in_use = 0;
++    vm_write32(attr, es_mem_size(ring));
+     return CELL_OK;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * ES management
++ * AU ring (dmux_pamf side)
++ *
++ * The ring keeps each AU contiguous. Not wrapped, the data is [front, wp) and
++ * the free space runs to the end of the ring. Wrapped, the data is
++ * [front, wrap) + [0, wp) and the free space is what is left before front.
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId,
+-                      const CellDmuxEsResource* esRes,
+-                      CellDmuxCbEsMsg esCbFunc, void* esCbArg,
+-                      CellDmuxEsHandle* esHandle)
++/* dmux_pamf has to give up what it is doing. Under the lock. */
++static int must_abort(const DmuxSlot* d, const DmuxEs* es)
+ {
+-    (void)esRes;
++    return d->stop || d->reset_req || d->discard_req || !es->enabled;
++}
+ 
+-    printf("[cellDmux] EnableEs(dmux=%u, major=%u, minor=%u)\n",
+-           handle,
+-           esFilterId ? vm_read32(GUEST_EA(esFilterId)
+-                        + (u32)offsetof(CellDmuxEsFilterId, filterIdMajor)) : 0,
+-           esFilterId ? vm_read32(GUEST_EA(esFilterId)
+-                        + (u32)offsetof(CellDmuxEsFilterId, filterIdMinor)) : 0);
++/* Can `len` bytes go at ring_wp? Under the lock. */
++static int ring_room(const DmuxEs* es, u32 len)
++{
++    if (!es->ring_wrap)
++        return 1;   /* running off the end is an oversized AU: see es_append */
++    return es->ring_front >= es->ring_wp + len + DMUX_RING_GUARD;
++}
+ 
+-    if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
+-    if (!esFilterId || !esHandle)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++static void discard_au(DmuxEs* es)
++{
++    es->ring_wp = es->au_start;
++    es->au_scan = es->au_start;
++    es->au_state = AU_NONE;
++    es->au_parsed = 0;
++    es->au_late = 0;
++}
+ 
+-    for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (!s_es[i].in_use) {
+-            s_es[i].in_use = 1;
+-            s_es[i].dmuxId = handle;
+-            guest_struct_load(&s_es[i].filterId, GUEST_EA(esFilterId),
+-                              (u32)sizeof(s_es[i].filterId));
+-            s_es[i].esCbFunc = esCbFunc;
+-            s_es[i].esCbArg = esCbArg;
+-            s_es[i].hasAu = 0;
+-            memset(&s_es[i].currentAu, 0, sizeof(CellDmuxAuInfo));
+-            vm_write32((u32)(uintptr_t)esHandle, (u32)i);
+-            return CELL_OK;
++/* Forget the first `n` bytes of the data being cut: they belong to no AU. */
++static void drop_prefix(DmuxEs* es, u32 n)
++{
++    if (!n)
++        return;
++    u8* base = vm_ptr8(es->ring_ea);
++    memmove(base + es->au_start, base + es->au_start + n, es->ring_wp - es->au_start - n);
++    es->ring_wp -= n;
++    es->au_scan = es->au_scan > es->au_start + n ? es->au_scan - n : es->au_start;
++    es->chunk_start = es->chunk_start > es->au_start + n ? es->chunk_start - n : es->au_start;
++}
++
++/* au_start is where the next AU begins, and the bytes up to ring_wp are already
++ * its first bytes. If au_max contiguous bytes do not fit from there, those bytes
++ * move to the start of the ring. */
++static int prepare_next_au(DmuxSlot* d, DmuxEs* es)
++{
++    const u32 end = es->au_start;
++    const u32 carry = es->ring_wp - end;
++    if (es->ring_size - end >= es->au_max)
++        return 1;
++
++    AcquireSRWLockExclusive(&d->lock);
++    for (;;) {
++        if (must_abort(d, es)) {
++            ReleaseSRWLockExclusive(&d->lock);
++            return 0;
+         }
++        if (!es->ring_wrap && es->ring_front >= carry + DMUX_RING_GUARD)
++            break;
++        InterlockedIncrement(&s_n_ring_waits);
++        SleepConditionVariableSRW(&d->wake, &d->lock, INFINITE, 0);
+     }
+-    return (s32)CELL_DMUX_ERROR_BUSY;
++    es->ring_wrap = end;
++    if (es->ring_front == end) {   /* nothing outstanding before the wrap */
++        es->ring_front = 0;
++        es->ring_wrap = 0;
++    }
++    ReleaseSRWLockExclusive(&d->lock);
++
++    u8* base = vm_ptr8(es->ring_ea);
++    memmove(base, base + end, carry);
++    es->chunk_start = es->chunk_start > end ? es->chunk_start - end : 0;
++    es->au_start = 0;
++    es->au_scan = 0;
++    es->ring_wp = carry;
++    return 1;
+ }
+ 
+-s32 cellDmuxDisableEs(CellDmuxEsHandle esHandle)
++/* ---------------------------------------------------------------------------
++ * Callbacks
++ * -----------------------------------------------------------------------*/
++
++static void notify_dmux(DmuxSlot* d, u32 type, u64 info)
+ {
+-    printf("[cellDmux] DisableEs(es=%u)\n", esHandle);
++    const u32 msg = d->handle + DMUX_MSG_OFF;
++    vm_write32(msg + MSG_TYPE, type);
++    vm_write64(msg + MSG_INFO, info);
++    ps3_invoke_guest(d->cb_func, d->handle, msg, d->cb_arg, 0, 0, 0, 0, 0);
++}
+ 
+-    if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++static void notify_es(DmuxSlot* d, DmuxEs* es, u32 type, u64 info)
++{
++    const u32 msg = d->handle + DMUX_ES_MSG_OFF;
++    vm_write32(msg + MSG_TYPE, type);
++    vm_write64(msg + MSG_INFO, info);
++    ps3_invoke_guest(es->cb_func, d->handle, es->handle, msg, es->cb_arg, 0, 0, 0, 0);
++}
+ 
+-    s_es[esHandle].in_use = 0;
+-    return CELL_OK;
++static void fatal(DmuxSlot* d, const char* why)
++{
++    fprintf(stderr, "[cellDmux] fatal: %s (section left 0x%X)\n", why, d->stream_left);
++    notify_dmux(d, CELL_DMUX_MSG_TYPE_FATAL_ERR, (u32)CELL_DMUX_ERROR_FATAL);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * Data feeding
++ * Cutting AUs
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddr, u32 streamSize,
+-                       b8 discontinuity, u64 userData)
++static void au_begin(DmuxEs* es)
+ {
+-    printf("[cellDmux] SetStream(handle=%u, addr=0x%X, size=%u, discont=%d)\n",
+-           handle, streamAddr, streamSize, discontinuity);
++    es->au_pts = es->next_pts;
++    es->au_dts = es->next_dts;
++    es->au_rap = es->next_rap;
++    es->next_pts = es->next_dts = DMUX_TS_INVALID;
++    es->next_rap = 0;
++}
+ 
+-    if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
+-        return (s32)CELL_DMUX_ERROR_ARG;
++/* An AU starts at au_start. Its timestamps are the PES's that is being scanned,
++ * unless its first bytes came at the very end of the previous PES (the search
++ * keeps the last 3 bytes back). Then it only gets them if it is still open when
++ * this PES ends; one that also ends here has none, and they wait for the next AU.
++ * That is what the library does: the audio of adv.pam has one such AU, number 695. */
++static void au_found(DmuxEs* es)
++{
++    if (es->au_start < es->chunk_start) {
++        es->au_late = 1;
++        es->au_pts = es->au_dts = DMUX_TS_INVALID;
++        es->au_rap = 0;
++    } else {
++        au_begin(es);
++    }
++}
+ 
+-    DmuxSlot* dmux = &s_dmux[handle];
++/* The AU [au_start, end) is complete: queue it and tell the title. Returns 0 if
++ * dmux_pamf has to give up. */
++static int au_complete(DmuxSlot* d, DmuxEs* es, u32 end)
++{
++    const u32 size = end - es->au_start;
++
++    AcquireSRWLockExclusive(&d->lock);
++    while (es->unreleased >= DMUX_AU_SLOTS - 1u + (u32)(es->flushing != 0)) {
++        if (must_abort(d, es)) {
++            ReleaseSRWLockExclusive(&d->lock);
++            return 0;
++        }
++        InterlockedIncrement(&s_n_queue_waits);
++        SleepConditionVariableSRW(&d->wake, &d->lock, INFINITE, 0);
++    }
++    const u32 slot = es->tail;
++    const u32 info = es->info_ea + slot * DMUX_AU_INFO_SIZE;
++    vm_write32(info + AU_ADDR, es->ring_ea + es->au_start);
++    vm_write32(info + AU_SIZE, size);
++    vm_write32(info + AU_MAX_SIZE, 0);
++    vm_write32(info + AU_IS_RAP, es->au_rap ? 0x01000000u : 0);
++    vm_write64(info + AU_USER_DATA, d->user_data);
++    vm_write64(info + AU_PTS, es->au_pts);
++    vm_write64(info + AU_DTS, es->au_dts);
++    es->au_sizes[slot] = size;
++    es->tail = (slot + 1u) % DMUX_AU_SLOTS;
++    es->unreleased++;
++    es->ready++;
++    const u64 user_data = d->user_data;
++    ReleaseSRWLockExclusive(&d->lock);
++
++    InterlockedIncrement(es->is_video ? &s_n_au_video : &s_n_au_audio);
++    if (dmux_trace() >= 2)
++        fprintf(stderr, "[dmux] au %s addr=0x%08X size=0x%X pts=0x%llX dts=0x%llX rap=%d\n",
++                es->is_video ? "v" : "a", es->ring_ea + es->au_start, size,
++                (unsigned long long)es->au_pts, (unsigned long long)es->au_dts, es->au_rap);
++
++    notify_es(d, es, CELL_DMUX_ES_MSG_TYPE_AU_FOUND, user_data);
++
++    es->au_start = end;
++    es->au_scan = end;
++    es->au_state = AU_NONE;
++    es->au_parsed = 0;
++    es->au_late = 0;
++    return prepare_next_au(d, es);
++}
+ 
+-    /* Track the stream data */
+-    dmux->streamAddr = streamAddr;
+-    dmux->streamSize = streamSize;
+-    dmux->userData = userData;
++/* Video: an AU runs from a picture start, or the sequence header that leads to
++ * it, to the next start of any of those. A sequence end closes the AU and stays
++ * in it. Every start code the search looks at has its four bytes in the ring. */
++static int scan_m2v(DmuxSlot* d, DmuxEs* es)
++{
++    const u8* base = vm_ptr8(es->ring_ea);
++    for (;;) {
++        const u32 limit = es->ring_wp;   /* one past the last readable byte */
++        if (limit < es->au_scan + 4u)
++            break;
++
++        /* The 0x01 of 00 00 01 xx, by memchr: this loop sees every byte. */
++        const u8* p = base + es->au_scan + 2;
++        const u8* last = base + limit - 1;
++        u32 code_at = 0;
++        int found = 0;
++        while (p < last && (p = (const u8*)memchr(p, 0x01, (size_t)(last - p))) != NULL) {
++            if (p[-1] == 0 && p[-2] == 0 &&
++                (p[1] == M2V_PICTURE || p[1] == M2V_SEQUENCE || p[1] == M2V_SEQUENCE_END)) {
++                code_at = (u32)(p - base) - 2u;
++                found = 1;
++                break;
++            }
++            p++;
++        }
++        if (!found) {
++            es->au_scan = limit - 3u;
++            if (es->au_state == AU_NONE)
++                drop_prefix(es, es->au_scan - es->au_start);
++            break;
++        }
+ 
+-    if (discontinuity) {
+-        /* On discontinuity, reset AU sequence and clear pending AUs */
+-        dmux->auSeqNo = 0;
+-        for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-            if (s_es[i].in_use && s_es[i].dmuxId == handle)
+-                s_es[i].hasAu = 0;
++        const u8 code = base[code_at + 3];
++        if (es->au_state == AU_STARTED) {
++            if (!au_complete(d, es, code_at + (code == M2V_SEQUENCE_END ? 4u : 0u)))
++                return 0;
++            continue;
++        }
++        if (es->au_state == AU_NONE) {
++            drop_prefix(es, code_at - es->au_start);
++            code_at = es->au_start;
++            au_found(es);
+         }
++        es->au_state = code == M2V_PICTURE ? AU_STARTED : AU_SEQUENCE;
++        es->au_scan = code_at + 4u;
+     }
++    return 1;
++}
+ 
+-    /*
+-     * Synthesize one AU per enabled ES from the entire stream buffer.
+-     * Real demux would parse PES/MPEG-TS headers; here we present the
+-     * whole input as a single Access Unit per elementary stream, which
+-     * is sufficient for games that simply shuttle data through the
+-     * demux -> vdec/adec pipeline.
+-     */
++/* ATRAC3plus: a frame is the sync word, a size field and the payload. A frame
++ * ends where its size says, and the next sync word has to be right there. */
++static u32 at3p_frame_size(const u8* p)
++{
++    const u32 h = be16_at(p) & 0x3FFu;
++    return h < 0x200u ? (h + 1u) * 8u + 8u : 0;
++}
++
++static int scan_at3p(DmuxSlot* d, DmuxEs* es)
++{
++    const u8* base = vm_ptr8(es->ring_ea);
++    for (;;) {
++        const u32 wp = es->ring_wp;
++        if (es->au_state != AU_NONE && es->au_parsed) {
++            const u32 next = es->au_start + es->au_parsed;
++            if (es->au_scan < next)
++                es->au_scan = next;
++        }
++        u32 at = es->au_scan;
++        while (at + 4u <= wp && !(base[at] == AT3P_SYNC_HI && base[at + 1] == AT3P_SYNC_LO))
++            at++;
++        es->au_scan = at;
++        if (at + 4u > wp) {
++            if (es->au_state == AU_NONE)
++                drop_prefix(es, es->au_scan - es->au_start);
++            return 1;
++        }
++
++        if (es->au_state == AU_NONE) {
++            drop_prefix(es, at - es->au_start);
++            au_found(es);
++            es->au_state = AU_STARTED;
++            es->au_parsed = at3p_frame_size(base + es->au_start + 2);
++            es->au_scan = es->au_start + 3u;
++            continue;
++        }
++
++        if (at - es->au_start == es->au_parsed) {
++            if (!au_complete(d, es, at))
++                return 0;
++            continue;
++        }
++
++        /* The frame does not end where it said: it is not a frame. Drop it and
++         * look again one byte on. */
++        es->au_state = AU_NONE;
++        es->au_parsed = 0;
++        drop_prefix(es, 1);
++        es->au_scan = es->au_start;
++    }
++}
++
++/* Append a PES payload to the AU being cut, and cut. */
++static int es_append(DmuxSlot* d, DmuxEs* es, const u8* data, u32 len)
++{
++    AcquireSRWLockExclusive(&d->lock);
++    while (!ring_room(es, len)) {
++        if (must_abort(d, es)) {
++            ReleaseSRWLockExclusive(&d->lock);
++            return 0;
++        }
++        InterlockedIncrement(&s_n_ring_waits);
++        SleepConditionVariableSRW(&d->wake, &d->lock, INFINITE, 0);
++    }
++    const int oversized = !es->ring_wrap && es->ring_wp + len > es->ring_size;
++    ReleaseSRWLockExclusive(&d->lock);
++    if (oversized) {
++        fatal(d, "access unit larger than the maximum for its stream");
++        return -1;
++    }
++
++    memcpy(vm_ptr8(es->ring_ea) + es->ring_wp, data, len);
++    es->chunk_start = es->ring_wp;
++    es->ring_wp += len;
++    const int ret = es->is_video ? scan_m2v(d, es) : scan_at3p(d, es);
++    if (ret > 0 && es->au_late) {
++        es->au_late = 0;
++        au_begin(es);
++    }
++    return ret;
++}
++
++/* ---------------------------------------------------------------------------
++ * Packs
++ * -----------------------------------------------------------------------*/
++
++static u64 pes_timestamp(const u8* p)
++{
++    /* Bit 32 is lost and the rest sign-extended from s32, as the library does. */
++    const u32 v = ((u32)(p[0] >> 1) << 30) | ((be16_at(p + 1) >> 1) << 15) | (be16_at(p + 3) >> 1);
++    return (u64)(s64)(s32)v;
++}
++
++static DmuxEs* es_for_stream(DmuxSlot* d, u32 sid, u32 sub)
++{
+     for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (!s_es[i].in_use || s_es[i].dmuxId != handle)
++        DmuxEs* es = &d->es[i];
++        if (!es->enabled || (es->major & 0xFFu) != sid)
+             continue;
++        if (sid != PES_SID_PRIVATE_1 || (es->minor & 0xFFu) == sub)
++            return es;
++    }
++    return NULL;
++}
++
++/* One pack. Returns 1 to go on, 0 when dmux_pamf has to give up the pack,
++ * -1 when the stream is broken (already reported). */
++static int process_pack(DmuxSlot* d, const u8* pack, u32 size)
++{
++    const u32 code = be32_at(pack);
++    if (code == PROG_END) {
++        notify_dmux(d, CELL_DMUX_MSG_TYPE_PROG_END_CODE, d->user_data);
++        return 1;
++    }
++    if (code != PACK_START)
++        return 1;
+ 
+-        DmuxEsSlot* es = &s_es[i];
++    u32 off = 0xEu + (pack[0xD] & 7u);
++    if (off + 9u > size || (be32_at(pack + off) >> 8) != 1u) {
++        fatal(d, "bad pack header");
++        return -1;
++    }
++
++    if (be32_at(pack + off) == SYSTEM_HEADER) {
++        off += be16_at(pack + off + 4) + 6u;
++        if (off + 9u > size || (be32_at(pack + off) >> 8) != 1u) {
++            fatal(d, "bad system header");
++            return -1;
++        }
++        if (be32_at(pack + off) == PRIVATE_STREAM_2) {
++            /* It names a video stream: its next AU is a random access point. */
++            const u32 len = be16_at(pack + off + 4) + 6u;
++            if (off + len + 9u > size) {
++                fatal(d, "bad private stream 2");
++                return -1;
++            }
++            DmuxEs* v = es_for_stream(d, 0xE0u | (be16_at(pack + off + 6) & 0xFu), 0);
++            if (v)
++                v->next_rap = 1;
++            off += len;
++        }
++    }
+ 
+-        /* Fill in AU info — treat entire stream as one AU */
+-        es->currentAu.auAddr = streamAddr;
+-        es->currentAu.auSize = streamSize;
+-        es->currentAu.pts    = (u64)dmux->auSeqNo * 3003; /* ~29.97 fps tick */
+-        es->currentAu.dts    = es->currentAu.pts;
+-        es->currentAu.userData = userData;
+-        es->currentAu.isRap  = (dmux->auSeqNo == 0) ? 1 : 0;
+-        es->currentAu.reserved = 0;
+-        es->hasAu = 1;
++    const u8* pes = pack + off;
++    if ((be32_at(pes) >> 8) != 1u) {
++        fatal(d, "bad PES start code");
++        return -1;
++    }
++    const u32 pes_len = be16_at(pes + 4) + 6u;
++    const u32 hdr_len = pes[8] + 9u;
++    if (off + pes_len > size || pes_len <= hdr_len) {
++        fatal(d, "bad PES length");
++        return -1;
++    }
++    const u8* data = pes + hdr_len;
++    u32 data_len = pes_len - hdr_len;
++    const u32 sid = pes[3];
++    const int video = (sid & 0xF0u) == 0xE0u;
++    const u32 sub = data[0] & 0xF0u;
++    if (!video && !(sid == PES_SID_PRIVATE_1 && (sub == 0x00u || sub == 0x20u || sub == 0x30u || sub == 0x40u))) {
++        fatal(d, "unknown stream type");
++        return -1;
++    }
+ 
+-        printf("[cellDmux] ES %d: AU_FOUND (addr=0x%X, size=%u, pts=%llu)\n",
+-               i, streamAddr, streamSize, (unsigned long long)es->currentAu.pts);
++    AcquireSRWLockExclusive(&d->lock);
++    DmuxEs* es = es_for_stream(d, sid, data[0]);
++    d->active_es = es;
++    ReleaseSRWLockExclusive(&d->lock);
+ 
+-        /* Fire AU_FOUND callback */
+-        if (es->esCbFunc)
+-            es->esCbFunc(handle, (u32)i,
+-                         CELL_DMUX_ES_MSG_TYPE_AU_FOUND,
+-                         0, es->esCbArg);
++    int ret = 1;
++    if (es) {
++        if (pes[7] & 0x80u)
++            es->next_pts = pes_timestamp(pes + 9);
++        if (pes[7] & 0x40u)
++            es->next_dts = pes_timestamp(pes + 14);
++        if (video || data_len >= AUDIO_PES_HEADER) {
++            if (!video) {
++                data += AUDIO_PES_HEADER;
++                data_len -= AUDIO_PES_HEADER;
++            }
++            ret = es_append(d, es, data, data_len);
++        } else {
++            fatal(d, "bad stream header");
++            ret = -1;
++        }
+     }
+ 
+-    dmux->auSeqNo++;
++    AcquireSRWLockExclusive(&d->lock);
++    d->active_es = NULL;
++    WakeAllConditionVariable(&d->idle);
++    ReleaseSRWLockExclusive(&d->lock);
++    return ret;
++}
++
++/* ---------------------------------------------------------------------------
++ * dmux_pamf
++ * -----------------------------------------------------------------------*/
++
++static void es_flush(DmuxSlot* d, DmuxEs* es)
++{
++    AcquireSRWLockExclusive(&d->lock);
++    d->active_es = es;
++    es->flush_req--;
++    ReleaseSRWLockExclusive(&d->lock);
++
++    int ok = 1;
++    if (es->au_state != AU_NONE && es->ring_wp > es->au_start)
++        ok = au_complete(d, es, es->ring_wp);
++    else
++        discard_au(es);
++    es->next_pts = es->next_dts = DMUX_TS_INVALID;
++    es->next_rap = 0;
++
++    InterlockedIncrement(&s_n_flush);
++    AcquireSRWLockExclusive(&d->lock);
++    es->flushing = 0;
++    const u64 user_data = d->user_data;
++    ReleaseSRWLockExclusive(&d->lock);
++    if (ok)
++        notify_es(d, es, CELL_DMUX_ES_MSG_TYPE_FLUSH_DONE, user_data);
++
++    AcquireSRWLockExclusive(&d->lock);
++    d->active_es = NULL;
++    WakeAllConditionVariable(&d->idle);
++    ReleaseSRWLockExclusive(&d->lock);
++}
++
++static void section_done(DmuxSlot* d)
++{
++    /* Stopped before the callback: the title sends the next section from it. */
++    AcquireSRWLockExclusive(&d->lock);
++    d->stream_left = 0;
++    d->running = 0;
++    d->reset_req = 0;
++    const u64 user_data = d->user_data;
++    WakeAllConditionVariable(&d->idle);
++    ReleaseSRWLockExclusive(&d->lock);
++    InterlockedIncrement(&s_n_sections);
++    notify_dmux(d, CELL_DMUX_MSG_TYPE_DEMUX_DONE, user_data);
++}
++
++static DWORD WINAPI dmux_thread(LPVOID arg)
++{
++    DmuxSlot* d = (DmuxSlot*)arg;
++    SetThreadDescription(GetCurrentThread(), L"dmux_pamf");
+ 
+-    /* Signal demux completion after all ES callbacks have fired */
+-    if (dmux->cbFunc)
+-        dmux->cbFunc(handle, CELL_DMUX_MSG_TYPE_DEMUX_DONE,
+-                     0, dmux->cbArg);
++    AcquireSRWLockExclusive(&d->lock);
++    for (;;) {
++        DmuxEs* flush = NULL;
++        for (int i = 0; i < CELL_DMUX_MAX_ES && !flush; i++)
++            if (d->es[i].enabled && d->es[i].flush_req > 0)
++                flush = &d->es[i];
+ 
++        if (d->stop)
++            break;
++        if (!d->running && !flush) {
++            SleepConditionVariableSRW(&d->wake, &d->lock, INFINITE, 0);
++            continue;
++        }
++
++        if (d->reset_req || d->discard_req) {
++            for (int i = 0; i < CELL_DMUX_MAX_ES; i++)
++                if (d->es[i].enabled)
++                    discard_au(&d->es[i]);
++            d->discard_req = 0;
++            if (d->reset_req) {
++                ReleaseSRWLockExclusive(&d->lock);
++                section_done(d);
++                AcquireSRWLockExclusive(&d->lock);
++                continue;
++            }
++        }
++
++        if (flush) {
++            ReleaseSRWLockExclusive(&d->lock);
++            es_flush(d, flush);
++            AcquireSRWLockExclusive(&d->lock);
++            continue;
++        }
++
++        if (d->stream_left < 0xEu) {
++            ReleaseSRWLockExclusive(&d->lock);
++            section_done(d);
++            AcquireSRWLockExclusive(&d->lock);
++            continue;
++        }
++
++        const u32 size = d->stream_left < PACK_SIZE ? d->stream_left : PACK_SIZE;
++        const u32 ea = d->stream_ea;
++        ReleaseSRWLockExclusive(&d->lock);
++        const int ret = process_pack(d, vm_ptr8(ea), size);
++        AcquireSRWLockExclusive(&d->lock);
++        if (ret > 0) {
++            d->stream_ea = ea + size;
++            d->stream_left -= size;
++        } else if (ret < 0) {
++            d->stream_left = 0;
++        }
++        /* ret == 0: the flags that made it give up are seen at the top. */
++    }
++    ReleaseSRWLockExclusive(&d->lock);
++
++    if (dmux_trace()) {
++        FILETIME created, exited, kernel, user;
++        GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user);
++        const u64 t100ns = ((u64)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime)
++                         + ((u64)user.dwHighDateTime << 32 | user.dwLowDateTime);
++        fprintf(stderr, "[dmux] thread cpu: %llu ms\n", (unsigned long long)(t100ns / 10000u));
++    }
++    return 0;
++}
++
++/* ---------------------------------------------------------------------------
++ * Demuxer lifecycle
++ * -----------------------------------------------------------------------*/
++
++s32 cellDmuxOpen(const void* demuxerType, const void* demuxerResource,
++                 const void* demuxerCb, void* demuxerHandle)
++{
++    const u32 type = GUEST_EA(demuxerType), res = GUEST_EA(demuxerResource);
++    const u32 cb = GUEST_EA(demuxerCb), out = GUEST_EA(demuxerHandle);
++    if (!type || !res || !cb || !out || vm_read32(type) != CELL_DMUX_STREAM_TYPE_PAMF)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    const u32 mem = vm_read32(res + 0), mem_size = vm_read32(res + 4), cb_func = vm_read32(cb + 0);
++    if (!mem || mem_size < DMUX_MEM_SIZE || !cb_func)
++        return (s32)CELL_DMUX_ERROR_ARG;
++
++    for (int i = 0; i < CELL_DMUX_MAX_HANDLES; i++) {
++        DmuxSlot* d = &s_dmux[i];
++        if (InterlockedCompareExchange(&d->in_use, 2, 0) != 0)
++            continue;
++        memset((u8*)d + sizeof(d->in_use), 0, sizeof(*d) - sizeof(d->in_use));
++        InitializeSRWLock(&d->lock);
++        InitializeConditionVariable(&d->wake);
++        InitializeConditionVariable(&d->idle);
++        d->handle = align16(mem);
++        d->cb_func = cb_func;
++        d->cb_arg = vm_read32(cb + 4);
++        d->thread = CreateThread(NULL, 1u << 20, dmux_thread, d, 0, &d->thread_id);
++        if (!d->thread) {
++            d->in_use = 0;
++            return (s32)CELL_DMUX_ERROR_FATAL;
++        }
++        d->in_use = 1;
++        vm_write32(out, d->handle);
++        if (dmux_trace())
++            fprintf(stderr, "[dmux] open: handle=0x%08X cb=0x%08X arg=0x%08X\n", d->handle, cb_func, d->cb_arg);
++        return CELL_OK;
++    }
++    return (s32)CELL_DMUX_ERROR_BUSY;
++}
++
++s32 cellDmuxClose(CellDmuxHandle handle)
++{
++    DmuxSlot* d = find_dmux(handle);
++    if (!d)
++        return (s32)CELL_DMUX_ERROR_ARG;
++
++    AcquireSRWLockExclusive(&d->lock);
++    d->stop = 1;
++    for (int i = 0; i < CELL_DMUX_MAX_ES; i++)
++        d->es[i].enabled = 0;
++    WakeAllConditionVariable(&d->wake);
++    ReleaseSRWLockExclusive(&d->lock);
++
++    if (GetCurrentThreadId() != d->thread_id)
++        WaitForSingleObject(d->thread, INFINITE);
++    CloseHandle(d->thread);
++    d->in_use = 0;
++
++    if (dmux_trace())
++        fprintf(stderr, "[dmux] close: sections=%ld au_v=%ld au_a=%ld get=%ld release=%ld "
++                        "flush=%ld queue_waits=%ld ring_waits=%ld\n",
++                s_n_sections, s_n_au_video, s_n_au_audio, s_n_get, s_n_release, s_n_flush,
++                s_n_queue_waits, s_n_ring_waits);
+     return CELL_OK;
+ }
+ 
+-s32 cellDmuxResetStream(CellDmuxHandle handle)
++/* ---------------------------------------------------------------------------
++ * ES management
++ * -----------------------------------------------------------------------*/
++
++s32 cellDmuxEnableEs(CellDmuxHandle handle, const void* esFilterId, const void* esResourceInfo,
++                     const void* esCb, const void* esSpecificInfo, void* esHandle)
+ {
+-    printf("[cellDmux] ResetStream(handle=%u)\n", handle);
++    const u32 id = GUEST_EA(esFilterId), res = GUEST_EA(esResourceInfo);
++    const u32 cb = GUEST_EA(esCb), out = GUEST_EA(esHandle);
++    DmuxSlot* d = find_dmux(handle);
++    if (!d || !id || !res || !cb || !out)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    const u32 mem = vm_read32(res + 0), mem_size = vm_read32(res + 4);
++    const u32 cb_func = vm_read32(cb + 0), cb_arg = vm_read32(cb + 4);
++    if (!mem || !cb_func)
++        return (s32)CELL_DMUX_ERROR_ARG;
+ 
+-    if (handle >= CELL_DMUX_MAX_HANDLES || !s_dmux[handle].in_use)
++    const u32 major = vm_read32(id), minor = vm_read32(id + 4);
++    const u32 ring = es_ring_size(major, minor, GUEST_EA(esSpecificInfo));
++    if (!ring || vm_read32(id + 8)) {
++        fprintf(stderr, "[cellDmux] EnableEs: unsupported ES %02X/%02X/%u -> FATAL\n",
++                major, minor, vm_read32(id + 8));
++        return (s32)CELL_DMUX_ERROR_FATAL;
++    }
++    if (es_mem_size(ring) > mem_size)
+         return (s32)CELL_DMUX_ERROR_ARG;
+ 
+-    /* Clear pending AUs from all ES handles and reset stream tracking */
++    const int video = (major & 0xF0u) == 0xE0u;
++    const u32 es_ea = align16(mem);
++    const u32 info = es_ea + DMUX_ES_HEADER;
++
++    AcquireSRWLockExclusive(&d->lock);
++    DmuxEs* es = NULL;
+     for (int i = 0; i < CELL_DMUX_MAX_ES; i++) {
+-        if (s_es[i].in_use && s_es[i].dmuxId == handle)
+-            s_es[i].hasAu = 0;
++        DmuxEs* e = &d->es[i];
++        if (e->enabled && e->major == major && (video || e->minor == minor)) {
++            ReleaseSRWLockExclusive(&d->lock);
++            return (s32)CELL_DMUX_ERROR_ARG;
++        }
++        if (!e->enabled && !es)
++            es = e;
++    }
++    if (!es) {
++        ReleaseSRWLockExclusive(&d->lock);
++        return (s32)CELL_DMUX_ERROR_ARG;
++    }
++    memset(es, 0, sizeof(*es));
++    es->dmux = d;
++    es->handle = es_ea;
++    es->cb_func = cb_func;
++    es->cb_arg = cb_arg;
++    es->major = major;
++    es->minor = minor;
++    es->is_video = video;
++    es->au_max = video ? (ring == 0x255000u ? 0x12A800u : 0x38000u) : 0x1008u;
++    es->info_ea = info;
++    es->ring_ea = align16(info + DMUX_AU_SLOTS * DMUX_AU_INFO_SIZE);
++    es->ring_size = ring;
++    es->next_pts = es->next_dts = DMUX_TS_INVALID;
++    for (u32 i = 0; i < DMUX_AU_SLOTS * DMUX_AU_INFO_SIZE; i += 4)
++        vm_write32(info + i, 0);
++    es->enabled = 1;
++    ReleaseSRWLockExclusive(&d->lock);
++
++    vm_write32(out, es_ea);
++    if (dmux_trace())
++        fprintf(stderr, "[dmux] enable: es=0x%08X %02X/%02X cb=0x%08X arg=0x%08X ring=0x%08X+0x%X\n",
++                es_ea, major, minor, cb_func, cb_arg, es->ring_ea, ring);
++    return CELL_OK;
++}
++
++s32 cellDmuxDisableEs(CellDmuxEsHandle esHandle)
++{
++    DmuxEs* es = find_es(esHandle);
++    if (!es)
++        return (s32)CELL_DMUX_ERROR_ARG;
++    DmuxSlot* d = es->dmux;
++
++    /* After this the title may reuse the ES memory: dmux_pamf must be out of it. */
++    AcquireSRWLockExclusive(&d->lock);
++    es->enabled = 0;
++    es->flush_req = 0;
++    WakeAllConditionVariable(&d->wake);
++    if (GetCurrentThreadId() != d->thread_id)
++        while (d->active_es == es)
++            SleepConditionVariableSRW(&d->idle, &d->lock, INFINITE, 0);
++    ReleaseSRWLockExclusive(&d->lock);
++    return CELL_OK;
++}
++
++/* ---------------------------------------------------------------------------
++ * Data feeding
++ * -----------------------------------------------------------------------*/
++
++s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddress, u32 streamSize,
++                      u32 discontinuity, u64 userData)
++{
++    DmuxSlot* d = find_dmux(handle);
++    if (!d || !streamSize || streamSize == 0xFFFFFFFFu)
++        return (s32)CELL_DMUX_ERROR_ARG;
++
++    AcquireSRWLockExclusive(&d->lock);
++    if (d->running) {
++        ReleaseSRWLockExclusive(&d->lock);
++        return (s32)CELL_DMUX_ERROR_BUSY;
+     }
+-    s_dmux[handle].streamAddr = 0;
+-    s_dmux[handle].streamSize = 0;
+-    s_dmux[handle].auSeqNo = 0;
++    d->stream_ea = streamAddress;
++    d->stream_left = streamSize;
++    d->user_data = userData;
++    d->discard_req = (discontinuity & 0xFFu) != 0;
++    d->running = 1;
++    WakeAllConditionVariable(&d->wake);
++    ReleaseSRWLockExclusive(&d->lock);
++    return CELL_OK;
++}
++
++s32 cellDmuxResetStream(CellDmuxHandle handle)
++{
++    DmuxSlot* d = find_dmux(handle);
++    if (!d)
++        return (s32)CELL_DMUX_ERROR_ARG;
+ 
++    AcquireSRWLockExclusive(&d->lock);
++    if (!d->running) {
++        ReleaseSRWLockExclusive(&d->lock);
++        return (s32)CELL_DMUX_ERROR_SEQ;
++    }
++    d->reset_req = 1;
++    WakeAllConditionVariable(&d->wake);
++    ReleaseSRWLockExclusive(&d->lock);
+     return CELL_OK;
+ }
+ 
+ s32 cellDmuxResetStreamAndWaitDone(CellDmuxHandle handle)
+ {
+-    return cellDmuxResetStream(handle);
++    DmuxSlot* d = find_dmux(handle);
++    if (!d)
++        return (s32)CELL_DMUX_ERROR_ARG;
++
++    AcquireSRWLockExclusive(&d->lock);
++    if (d->running)
++        d->reset_req = 1;
++    WakeAllConditionVariable(&d->wake);
++    if (GetCurrentThreadId() != d->thread_id)
++        while (d->running)
++            SleepConditionVariableSRW(&d->idle, &d->lock, INFINITE, 0);
++    ReleaseSRWLockExclusive(&d->lock);
++    return CELL_OK;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+  * AU retrieval
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum)
++static s32 pop_au(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo, int peek)
+ {
+-    if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
++    const u32 info_out = GUEST_EA(auInfo), specific_out = GUEST_EA(auSpecificInfo);
++    DmuxEs* es = find_es(esHandle);
++    if (!es)
+         return (s32)CELL_DMUX_ERROR_ARG;
++    DmuxSlot* d = es->dmux;
+ 
+-    if (!s_es[esHandle].hasAu)
++    AcquireSRWLockExclusive(&d->lock);
++    if (!es->ready) {
++        ReleaseSRWLockExclusive(&d->lock);
+         return (s32)CELL_DMUX_ERROR_EMPTY;
++    }
++    if (info_out)
++        vm_write32(info_out, es->info_ea + es->head * DMUX_AU_INFO_SIZE);
++    if (specific_out)   /* neither M2V nor ATRAC3plus has any: size 0 */
++        vm_write32(specific_out, es->info_ea + DMUX_AU_SLOTS * DMUX_AU_INFO_SIZE);
++    if (!peek) {
++        es->head = (es->head + 1u) % DMUX_AU_SLOTS;
++        es->ready--;
++    }
++    ReleaseSRWLockExclusive(&d->lock);
++    InterlockedIncrement(&s_n_get);
++    return CELL_OK;
++}
+ 
+-    if (auInfo)
+-        *auInfo = &s_es[esHandle].currentAu;
+-    if (auInfoNum)
+-        vm_write32((u32)(uintptr_t)auInfoNum, (u32)1);
++s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo)
++{
++    return pop_au(esHandle, auInfo, auSpecificInfo, 0);
++}
+ 
+-    return CELL_OK;
++s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo)
++{
++    return pop_au(esHandle, auInfo, auSpecificInfo, 1);
++}
++
++s32 cellDmuxGetAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, void* auSpecificInfo)
++{
++    return pop_au(esHandle, auInfoEx, auSpecificInfo, 0);
+ }
+ 
+-s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum)
++s32 cellDmuxPeekAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, void* auSpecificInfo)
+ {
+-    return cellDmuxGetAu(esHandle, auInfo, auInfoNum);
++    return pop_au(esHandle, auInfoEx, auSpecificInfo, 1);
+ }
+ 
+ s32 cellDmuxReleaseAu(CellDmuxEsHandle esHandle)
+ {
+-    if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
++    DmuxEs* es = find_es(esHandle);
++    if (!es)
+         return (s32)CELL_DMUX_ERROR_ARG;
++    DmuxSlot* d = es->dmux;
+ 
+-    s_es[esHandle].hasAu = 0;
++    AcquireSRWLockExclusive(&d->lock);
++    if (!es->unreleased) {
++        ReleaseSRWLockExclusive(&d->lock);
++        return (s32)CELL_DMUX_ERROR_SEQ;
++    }
++    es->ring_front += es->au_sizes[es->oldest];
++    es->oldest = (es->oldest + 1u) % DMUX_AU_SLOTS;
++    es->unreleased--;
++    if (es->unreleased < es->ready) {   /* it had not been popped */
++        es->head = (es->head + 1u) % DMUX_AU_SLOTS;
++        es->ready--;
++    }
++    if (es->ring_wrap && es->ring_front == es->ring_wrap) {
++        es->ring_front = 0;
++        es->ring_wrap = 0;
++    }
++    WakeAllConditionVariable(&d->wake);
++    ReleaseSRWLockExclusive(&d->lock);
++    InterlockedIncrement(&s_n_release);
+     return CELL_OK;
+ }
+ 
+ s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle)
+ {
+-    printf("[cellDmux] FlushEs(es=%u)\n", esHandle);
+-
+-    if (esHandle >= CELL_DMUX_MAX_ES || !s_es[esHandle].in_use)
++    DmuxEs* es = find_es(esHandle);
++    if (!es)
+         return (s32)CELL_DMUX_ERROR_ARG;
++    DmuxSlot* d = es->dmux;
+ 
+-    s_es[esHandle].hasAu = 0;
+-
+-    if (s_es[esHandle].esCbFunc)
+-        s_es[esHandle].esCbFunc(s_es[esHandle].dmuxId, esHandle,
+-                                 CELL_DMUX_ES_MSG_TYPE_FLUSH_DONE,
+-                                 0, s_es[esHandle].esCbArg);
+-
++    AcquireSRWLockExclusive(&d->lock);
++    if (d->running) {
++        ReleaseSRWLockExclusive(&d->lock);
++        return (s32)CELL_DMUX_ERROR_SEQ;
++    }
++    es->flushing = 1;
++    es->flush_req++;
++    WakeAllConditionVariable(&d->wake);
++    ReleaseSRWLockExclusive(&d->lock);
+     return CELL_OK;
+ }
+diff --git a/libs/codec/cellDmux.h b/libs/codec/cellDmux.h
+index 8f1ecf39..600b0e55 100644
+--- a/libs/codec/cellDmux.h
++++ b/libs/codec/cellDmux.h
+@@ -3,6 +3,10 @@
+  *
+  * AV stream demultiplexer. Splits multiplexed PAMF streams into
+  * individual elementary streams (ES) for feeding to cellVdec/cellAdec.
++ *
++ * The API speaks guest addresses: handles are guest EAs, and the guest structs
++ * are read and written by offset through vm_read and vm_write (big-endian in
++ * guest memory). The layouts are in cellDmux.c.
+  */
+ 
+ #ifndef PS3RECOMP_CELL_DMUX_H
+@@ -31,13 +35,14 @@ extern "C" {
+ #define CELL_DMUX_MAX_ES               16
+ 
+ /* Demux types */
+-#define CELL_DMUX_TYPE_PAMF            0
++#define CELL_DMUX_STREAM_TYPE_PAMF     1
+ 
+-/* ES message types (delivered via callback) */
++/* Demuxer message types (delivered via callback) */
+ #define CELL_DMUX_MSG_TYPE_DEMUX_DONE      0
+ #define CELL_DMUX_MSG_TYPE_FATAL_ERR       1
+ #define CELL_DMUX_MSG_TYPE_PROG_END_CODE   2
+ 
++/* ES message types (delivered via callback) */
+ #define CELL_DMUX_ES_MSG_TYPE_AU_FOUND     0
+ #define CELL_DMUX_ES_MSG_TYPE_FLUSH_DONE   1
+ 
+@@ -48,83 +53,37 @@ extern "C" {
+ typedef u32 CellDmuxHandle;
+ typedef u32 CellDmuxEsHandle;
+ 
+-typedef struct CellDmuxType {
+-    u32 streamType;
+-    u32 reserved[3];
+-} CellDmuxType;
+-
+-typedef struct CellDmuxResource {
+-    u32 memAddr;
+-    u32 memSize;
+-    u32 ppuThreadPrio;
+-    u32 ppuThreadStackSize;
+-    u32 spuThreadPrio;
+-    u32 numOfSpus;
+-} CellDmuxResource;
+-
+-typedef struct CellDmuxEsFilterId {
+-    u8 filterIdMajor;
+-    u8 filterIdMinor;
+-    u8 supplementalInfo1;
+-    u8 supplementalInfo2;
+-} CellDmuxEsFilterId;
+-
+-typedef struct CellDmuxEsResource {
+-    u32 memAddr;
+-    u32 memSize;
+-} CellDmuxEsResource;
+-
+-typedef struct CellDmuxAuInfo {
+-    u32 auAddr;
+-    u32 auSize;
+-    u64 pts;
+-    u64 dts;
+-    u64 userData;
+-    u32 isRap;       /* random access point */
+-    u32 reserved;
+-} CellDmuxAuInfo;
+-
+-typedef struct CellDmuxAuInfoEx {
+-    u32 auAddr;
+-    u32 auSize;
+-    u64 pts;
+-    u64 dts;
+-    u64 userData;
+-    u32 isRap;
+-    u32 reserved;
+-    u32 auSpecificInfo;
+-} CellDmuxAuInfoEx;
+-
+-/* Callback types */
+-typedef u32 (*CellDmuxCbMsg)(u32 handle, u32 msgType, u32 msgData, void* cbArg);
+-typedef u32 (*CellDmuxCbEsMsg)(u32 handle, u32 esHandle, u32 msgType,
+-                                 u32 msgData, void* cbArg);
+-
+ /* ---------------------------------------------------------------------------
+  * Functions
+  * -----------------------------------------------------------------------*/
+ 
++/* Attribute queries */
++s32 cellDmuxQueryAttr(const void* demuxerType, void* demuxerAttr);
++s32 cellDmuxQueryEsAttr(const void* demuxerType, const void* esFilterId,
++                        const void* esSpecificInfo, void* esAttr);
++
+ /* Demuxer lifecycle */
+-s32 cellDmuxOpen(const CellDmuxType* type, const CellDmuxResource* res,
+-                  CellDmuxCbMsg cbFunc, void* cbArg, CellDmuxHandle* handle);
+-s32 cellDmuxClose(CellDmuxHandle handle);
++s32 cellDmuxOpen(const void* demuxerType, const void* demuxerResource,
++                 const void* demuxerCb, void* demuxerHandle);
++s32 cellDmuxClose(CellDmuxHandle demuxerHandle);
+ 
+ /* ES management */
+-s32 cellDmuxEnableEs(CellDmuxHandle handle, const CellDmuxEsFilterId* esFilterId,
+-                      const CellDmuxEsResource* esRes,
+-                      CellDmuxCbEsMsg esCbFunc, void* esCbArg,
+-                      CellDmuxEsHandle* esHandle);
++s32 cellDmuxEnableEs(CellDmuxHandle demuxerHandle, const void* esFilterId,
++                     const void* esResourceInfo, const void* esCb,
++                     const void* esSpecificInfo, void* esHandle);
+ s32 cellDmuxDisableEs(CellDmuxEsHandle esHandle);
+ 
+ /* Data feeding */
+-s32 cellDmuxSetStream(CellDmuxHandle handle, u32 streamAddr, u32 streamSize,
+-                       b8 discontinuity, u64 userData);
+-s32 cellDmuxResetStream(CellDmuxHandle handle);
+-s32 cellDmuxResetStreamAndWaitDone(CellDmuxHandle handle);
++s32 cellDmuxSetStream(CellDmuxHandle demuxerHandle, u32 streamAddress, u32 streamSize,
++                      u32 discontinuity, u64 userData);
++s32 cellDmuxResetStream(CellDmuxHandle demuxerHandle);
++s32 cellDmuxResetStreamAndWaitDone(CellDmuxHandle demuxerHandle);
+ 
+ /* AU retrieval */
+-s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum);
+-s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, CellDmuxAuInfo** auInfo, u32* auInfoNum);
++s32 cellDmuxGetAu(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo);
++s32 cellDmuxPeekAu(CellDmuxEsHandle esHandle, void* auInfo, void* auSpecificInfo);
++s32 cellDmuxGetAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, void* auSpecificInfo);
++s32 cellDmuxPeekAuEx(CellDmuxEsHandle esHandle, void* auInfoEx, void* auSpecificInfo);
+ s32 cellDmuxReleaseAu(CellDmuxEsHandle esHandle);
+ s32 cellDmuxFlushEs(CellDmuxEsHandle esHandle);
+ 
+diff --git a/libs/codec/tests/test_cellDmux.c b/libs/codec/tests/test_cellDmux.c
+new file mode 100644
+index 00000000..68c21a7b
+--- /dev/null
++++ b/libs/codec/tests/test_cellDmux.c
+@@ -0,0 +1,690 @@
++/*
++ * ps3recomp -- cellDmux against synthetic MPEG-PS packs
++ *
++ * Builds packs in the on-disc layout in a fake guest memory and drives the guest
++ * API from the main thread while dmux_pamf calls back: a start code split between
++ * packs, an AU split between PES packets, ATRAC3plus framing, a queue forced to
++ * two AUs with a slow consumer (no AU lost, in order, DEMUX_DONE after the last),
++ * the ring wrapping with AUs staying contiguous, flush, reset, discontinuity and
++ * closing with dmux_pamf asleep on a full queue.
++ *
++ * With a file argument it instead demuxes that .pam in 0x80000-byte sections, as
++ * F does, and prints what it finds (no game data ships with the repo). A second
++ * argument names a file to get one "size pts" line per audio AU.
++ *
++ * Build (from the repo root; no runtime lib needed):
++ *   clang-cl /O2 -w /Iinclude libs/codec/tests/test_cellDmux.c
++ *   test_cellDmux.exe [file.pam [audio.txt]]
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++uint8_t* vm_base;
++#ifndef DMUX_AU_QUEUE_MAX
++#define DMUX_AU_QUEUE_MAX 2u
++#endif
++#include "../cellDmux.c"
++
++/* The guest-memory accessors' hooks into the PPU/SPU runtime; inert here. */
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
++void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++
++#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
++#define CHECK_RC(e, want) do { s32 _r = (s32)(e); if (_r != (s32)(want)) { \
++    printf("FAIL %s:%d: %s = 0x%08X, want 0x%08X\n", __FILE__, __LINE__, #e, (u32)_r, (u32)(want)); \
++    exit(1); } } while (0)
++
++enum {
++    MEM = 64u << 20,
++    G_TYPE = 0x1000, G_RES = 0x1010, G_CB = 0x1030, G_OUT = 0x1040, G_ID = 0x1050, G_SPEC = 0x1070,
++    G_ESRES = 0x1080, G_ESCB = 0x1090, G_ATTR = 0x10A0, G_AUP = 0x10B0, G_SPP = 0x10B8,
++    G_DMUXMEM = 0x2000,
++    G_VIDEO = 0x10000, G_AUDIO = 0x800000,
++    G_STREAM = 0x1000000,
++    OPD_DMUX = 0x100, OPD_V = 0x110, OPD_A = 0x120,
++};
++
++#define GP(ea) ((void*)(uintptr_t)(ea))
++
++/* ---------------------------------------------------------------------------
++ * Events from dmux_pamf
++ * -----------------------------------------------------------------------*/
++
++enum { EV_DONE, EV_FATAL, EV_PROGEND, EV_AU_V, EV_AU_A, EV_FLUSH_V, EV_FLUSH_A };
++
++static volatile LONG ev_n;
++static u8 ev_log[1 << 20];
++static volatile LONG ev_count[8];
++static u64 last_user_data;
++
++static void caller(uint32_t opd, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
++                   uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
++{
++    int ev;
++    if (opd == OPD_DMUX) {
++        const u32 t = vm_read32((u32)a1);
++        last_user_data = vm_read64((u32)a1 + 8);
++        CHECK(a2 == 0xD0D0);
++        ev = t == CELL_DMUX_MSG_TYPE_DEMUX_DONE ? EV_DONE
++           : t == CELL_DMUX_MSG_TYPE_FATAL_ERR ? EV_FATAL : EV_PROGEND;
++    } else {
++        const u32 t = vm_read32((u32)a2);
++        CHECK(a3 == (opd == OPD_V ? 0xAAAAu : 0xBBBBu));
++        ev = t == CELL_DMUX_ES_MSG_TYPE_AU_FOUND ? (opd == OPD_V ? EV_AU_V : EV_AU_A)
++                                                 : (opd == OPD_V ? EV_FLUSH_V : EV_FLUSH_A);
++    }
++    ev_log[ev_n] = (u8)ev;
++    InterlockedIncrement(&ev_count[ev]);
++    InterlockedIncrement(&ev_n);
++}
++
++static void reset_events(void)
++{
++    ev_n = 0;
++    memset((void*)ev_count, 0, sizeof ev_count);
++}
++
++#define WAIT_FOR(cond) do { DWORD _t = GetTickCount(); while (!(cond)) { \
++    if (GetTickCount() - _t > 10000) { printf("TIMEOUT %s:%d: %s\n", __FILE__, __LINE__, #cond); exit(1); } \
++    Sleep(1); } } while (0)
++
++/* ---------------------------------------------------------------------------
++ * Building streams
++ * -----------------------------------------------------------------------*/
++
++static u32 s_wp;   /* write position in G_STREAM */
++
++static void put_ts(u8* p, u32 flag, u32 ts)
++{
++    p[0] = (u8)(flag << 4 | ((ts >> 30) & 3u) << 1 | 1u);
++    p[1] = (u8)(ts >> 22);
++    p[2] = (u8)((ts >> 14) | 1u);
++    p[3] = (u8)(ts >> 7);
++    p[4] = (u8)((ts << 1) | 1u);
++}
++
++/* One pack of 0x800 bytes with one PES. pts < 0: no PTS. `sub` < 0: video. */
++static void emit_pes(int sub, const u8* data, u32 len, int64_t pts, int rap)
++{
++    u8* p = vm_base + G_STREAM + s_wp;
++    memset(p, 0xFF, PACK_SIZE);
++    p[0] = 0; p[1] = 0; p[2] = 1; p[3] = 0xBA;
++    p[0xD] = 0xF8;
++    u32 off = 0xE;
++    if (rap) {
++        static const u8 sys[6 + 6] = { 0,0,1,0xBB, 0,6, 1,2,3,4,5,6 };
++        memcpy(p + off, sys, sizeof sys);
++        off += sizeof sys;
++        static const u8 ps2[6 + 2] = { 0,0,1,0xBF, 0,2, 0xE0,0x00 };
++        memcpy(p + off, ps2, sizeof ps2);
++        off += sizeof ps2;
++    }
++    const u32 hdr = pts >= 0 ? 5u : 0u;
++    const u32 extra = sub >= 0 ? AUDIO_PES_HEADER : 0u;
++    CHECK(off + 9u + hdr + extra + len <= PACK_SIZE);
++    u8* pes = p + off;
++    pes[0] = 0; pes[1] = 0; pes[2] = 1; pes[3] = sub >= 0 ? 0xBD : 0xE0;
++    const u32 pes_len = 3u + hdr + extra + len;
++    pes[4] = (u8)(pes_len >> 8); pes[5] = (u8)pes_len;
++    pes[6] = 0x81; pes[7] = pts >= 0 ? 0x80 : 0; pes[8] = (u8)hdr;
++    if (pts >= 0)
++        put_ts(pes + 9, 2, (u32)pts);
++    u8* d = pes + 9 + hdr;
++    if (sub >= 0) {
++        d[0] = (u8)sub; d[1] = 0; d[2] = 0; d[3] = 0;
++        d += AUDIO_PES_HEADER;
++    }
++    memcpy(d, data, len);
++    s_wp += PACK_SIZE;
++}
++
++/* Payload bytes that hold no start code and no ATRAC3plus sync word. */
++static void fill(u8* p, u32 n, u32 seed)
++{
++    for (u32 i = 0; i < n; i++)
++        p[i] = (u8)(0x80u | ((i + seed * 7u) & 0x3Fu));
++}
++
++/* Video bytes -> packs, `chunk` bytes per pack, PTS on the first of each. */
++static void emit_video(const u8* data, u32 len, u32 chunk, int64_t pts)
++{
++    for (u32 i = 0; i < len; i += chunk) {
++        emit_pes(-1, data + i, len - i < chunk ? len - i : chunk, i == 0 ? pts : -1, 0);
++        pts = -1;
++    }
++}
++
++/* A picture: start code + `body` bytes. */
++static u32 make_pic(u8* out, u32 body, u32 seed)
++{
++    out[0] = 0; out[1] = 0; out[2] = 1; out[3] = 0;
++    fill(out + 4, body, seed);
++    return 4 + body;
++}
++
++static u32 make_at3p(u8* out, u32 size, u32 seed)
++{
++    const u32 h = (size - 8) / 8 - 1;
++    out[0] = AT3P_SYNC_HI; out[1] = AT3P_SYNC_LO;
++    out[2] = (u8)(h >> 8); out[3] = (u8)h;
++    fill(out + 4, size - 4, seed);
++    return size;
++}
++
++/* ---------------------------------------------------------------------------
++ * Driving the API
++ * -----------------------------------------------------------------------*/
++
++static u32 h_dmux, h_v, h_a;
++
++static void open_dmux(int profile)
++{
++    vm_write32(G_TYPE, CELL_DMUX_STREAM_TYPE_PAMF);
++    CHECK_RC(cellDmuxQueryAttr(GP(G_TYPE), GP(G_ATTR)), CELL_OK);
++    CHECK(vm_read32(G_ATTR + 4) == 0x260000u && vm_read32(G_ATTR + 8) == 0x280000u);
++    vm_write32(G_RES, G_DMUXMEM);
++    vm_write32(G_RES + 4, vm_read32(G_ATTR));
++    vm_write32(G_CB, OPD_DMUX);
++    vm_write32(G_CB + 4, 0xD0D0);
++    CHECK_RC(cellDmuxOpen(GP(G_TYPE), GP(G_RES), GP(G_CB), GP(G_OUT)), CELL_OK);
++    h_dmux = vm_read32(G_OUT);
++    CHECK(h_dmux);
++
++    vm_write32(G_ID, 0xE0); vm_write32(G_ID + 4, 0); vm_write32(G_ID + 8, 0); vm_write32(G_ID + 12, 0);
++    vm_write32(G_SPEC, (u32)profile);
++    CHECK_RC(cellDmuxQueryEsAttr(GP(G_TYPE), GP(G_ID), GP(G_SPEC), GP(G_ATTR)), CELL_OK);
++    CHECK(vm_read32(G_ATTR) >= (profile > 1 ? 0x255000u : 0x70000u) + (DMUX_AU_QUEUE_MAX + 1) * 0x28);
++    vm_write32(G_ESRES, G_VIDEO);
++    vm_write32(G_ESRES + 4, vm_read32(G_ATTR));
++    vm_write32(G_ESCB, OPD_V);
++    vm_write32(G_ESCB + 4, 0xAAAA);
++    CHECK_RC(cellDmuxEnableEs(h_dmux, GP(G_ID), GP(G_ESRES), GP(G_ESCB), GP(G_SPEC), GP(G_OUT)), CELL_OK);
++    h_v = vm_read32(G_OUT);
++
++    /* The same ES twice is refused. */
++    CHECK_RC(cellDmuxEnableEs(h_dmux, GP(G_ID), GP(G_ESRES), GP(G_ESCB), GP(G_SPEC), GP(G_OUT)),
++             CELL_DMUX_ERROR_ARG);
++
++    vm_write32(G_ID, 0xBD);
++    CHECK_RC(cellDmuxQueryEsAttr(GP(G_TYPE), GP(G_ID), 0, GP(G_ATTR)), CELL_OK);
++    CHECK(vm_read32(G_ATTR) >= 0x6400u);
++    vm_write32(G_ESRES, G_AUDIO);
++    vm_write32(G_ESRES + 4, vm_read32(G_ATTR));
++    vm_write32(G_ESCB, OPD_A);
++    vm_write32(G_ESCB + 4, 0xBBBB);
++    CHECK_RC(cellDmuxEnableEs(h_dmux, GP(G_ID), GP(G_ESRES), GP(G_ESCB), 0, GP(G_OUT)), CELL_OK);
++    h_a = vm_read32(G_OUT);
++
++    reset_events();
++    s_wp = 0;
++}
++
++static void close_dmux(void)
++{
++    CHECK_RC(cellDmuxDisableEs(h_a), CELL_OK);
++    CHECK_RC(cellDmuxDisableEs(h_v), CELL_OK);
++    CHECK_RC(cellDmuxDisableEs(h_v), CELL_DMUX_ERROR_ARG);
++    CHECK_RC(cellDmuxClose(h_dmux), CELL_OK);
++    CHECK_RC(cellDmuxClose(h_dmux), CELL_DMUX_ERROR_ARG);
++}
++
++static void feed(int discontinuity, u64 user)
++{
++    CHECK_RC(cellDmuxSetStream(h_dmux, G_STREAM, s_wp, (u32)discontinuity, user), CELL_OK);
++}
++
++typedef struct { u32 addr, size, rap; u64 pts, dts, user; } Au;
++
++/* cellDmuxGetAuEx, read back through what the title reads. */
++static s32 get_au(u32 es, Au* au)
++{
++    const s32 r = cellDmuxGetAuEx(es, GP(G_AUP), GP(G_SPP));
++    if (r != CELL_OK)
++        return r;
++    const u32 i = vm_read32(G_AUP);
++    CHECK(vm_read32(G_SPP) != 0);
++    au->addr = vm_read32(i + 0x00);
++    au->size = vm_read32(i + 0x04);
++    CHECK(vm_read32(i + 0x08) == 0);       /* auMaxSize */
++    au->rap  = vm_read8(i + 0x0C);
++    au->user = vm_read64(i + 0x10);
++    au->pts  = vm_read64(i + 0x18);
++    au->dts  = vm_read64(i + 0x20);
++    return r;
++}
++
++static void expect_au(u32 es, const u8* want, u32 size, u64 pts, int rap)
++{
++    Au au;
++    WAIT_FOR(get_au(es, &au) == CELL_OK);
++    CHECK(au.size == size);
++    CHECK(au.pts == pts);
++    CHECK((int)au.rap == rap);
++    CHECK(memcmp(vm_base + au.addr, want, size) == 0);
++    CHECK_RC(cellDmuxReleaseAu(es), CELL_OK);
++}
++
++/* ---------------------------------------------------------------------------
++ * The cases
++ * -----------------------------------------------------------------------*/
++
++static u8 a1[0x4000], a2[0x4000], a3[0x4000], joined[0x20000];
++
++/* AU split between PES packets, and the delimiter split between packs in every
++ * possible place. PTS goes with the PES where the AU is discovered. */
++static void test_split(void)
++{
++    for (u32 cut = 1; cut <= 3; cut++) {
++        open_dmux(3);
++        const u32 s1 = make_pic(a1, 0x900, 1), s2 = make_pic(a2, 0x900, 2), s3 = make_pic(a3, 0x10, 3);
++        memcpy(joined, a1, s1);
++        memcpy(joined + s1, a2, s2);
++        memcpy(joined + s1 + s2, a3, s3);
++
++        /* First pack ends `cut` bytes into the start code of the second picture. */
++        emit_pes(-1, joined, 0x7C0, 0x1000, 1);
++        emit_pes(-1, joined + 0x7C0, s1 + cut - 0x7C0, -1, 0);
++        emit_pes(-1, joined + s1 + cut, 0x7C0, 0x2000, 0);
++        emit_pes(-1, joined + s1 + cut + 0x7C0, s2 + s3 - cut - 0x7C0, 0x3000, 0);
++        CHECK(s_wp == 4 * PACK_SIZE);
++        feed(1, 0x77);
++        WAIT_FOR(ev_count[EV_DONE] == 1);
++        CHECK(last_user_data == 0x77);
++        CHECK(ev_count[EV_AU_V] == 2);
++
++        /* The second picture's start was discovered in the third pack. */
++        expect_au(h_v, a1, s1, 0x1000, 1);
++        expect_au(h_v, a2, s2, 0x2000, 0);
++        Au au;
++        CHECK_RC(get_au(h_v, &au), CELL_DMUX_ERROR_EMPTY);
++        CHECK_RC(cellDmuxReleaseAu(h_v), CELL_DMUX_ERROR_SEQ);
++
++        /* The last picture has no delimiter behind it: flush hands it over. */
++        CHECK_RC(cellDmuxFlushEs(h_v), CELL_OK);
++        WAIT_FOR(ev_count[EV_FLUSH_V] == 1);
++        CHECK(ev_count[EV_AU_V] == 3);
++        expect_au(h_v, a3, s3, 0x3000, 0);
++        /* A second flush has nothing to hand over but is still answered. */
++        CHECK_RC(cellDmuxFlushEs(h_v), CELL_OK);
++        WAIT_FOR(ev_count[EV_FLUSH_V] == 2);
++        CHECK(ev_count[EV_AU_V] == 3);
++        close_dmux();
++    }
++}
++
++/* A sequence header stays with the picture after it; a sequence end stays with
++ * the picture before it. */
++static void test_sequence(void)
++{
++    open_dmux(3);
++    u32 n = 0;
++    const u8 seq[8] = { 0,0,1,0xB3, 0x50,0x02,0xD0,0x13 };
++    memcpy(joined, seq, 8); n = 8;
++    n += make_pic(joined + n, 0x20, 1);
++    const u32 first = n;
++    n += make_pic(joined + n, 0x30, 2);
++    const u8 end[4] = { 0,0,1,0xB7 };
++    memcpy(joined + n, end, 4); n += 4;
++    const u32 second = n - first;
++    emit_pes(-1, joined, n, 0x5000, 0);
++    /* Something after the end, or the last 3 bytes never get searched. */
++    const u8 tail[8] = { 0x80,0x81,0x82,0x83,0x84,0x85,0x86,0x87 };
++    emit_pes(-1, tail, 8, -1, 0);
++    feed(1, 1);
++    WAIT_FOR(ev_count[EV_DONE] == 1);
++    CHECK(ev_count[EV_AU_V] == 2);
++    expect_au(h_v, joined, first, 0x5000, 0);
++    expect_au(h_v, joined + first, second, DMUX_TS_INVALID, 0);
++    close_dmux();
++}
++
++static void test_audio(void)
++{
++    open_dmux(3);
++    enum { N = 40, SZ = 0x2B8 };
++    static u8 s[N * SZ];
++    u32 n = 0;
++    for (u32 i = 0; i < N; i++)
++        n += make_at3p(s + n, SZ, i);
++    /* Frames cross the PES boundaries. Each PES has a PTS. */
++    u32 chunk = 0x7D0 - 0x40;
++    for (u32 i = 0, k = 0; i < n; i += chunk, k++)
++        emit_pes(0, s + i, n - i < chunk ? n - i : chunk, 0x14DDE + k * 0x1000, 0);
++    feed(1, 2);
++    WAIT_FOR(ev_count[EV_DONE] == 1 || ev_count[EV_AU_A] >= (LONG)DMUX_AU_QUEUE_MAX);
++    for (u32 i = 0; i + 1 < N; i++) {
++        Au au;
++        WAIT_FOR(get_au(h_a, &au) == CELL_OK);
++        CHECK(au.size == SZ);
++        CHECK(memcmp(vm_base + au.addr, s + i * SZ, SZ) == 0);
++        if (i == 0)
++            CHECK(au.pts == 0x14DDE);
++        CHECK_RC(cellDmuxReleaseAu(h_a), CELL_OK);
++    }
++    WAIT_FOR(ev_count[EV_DONE] == 1);
++    CHECK_RC(cellDmuxFlushEs(h_a), CELL_OK);
++    WAIT_FOR(ev_count[EV_FLUSH_A] == 1);
++    Au au;
++    WAIT_FOR(get_au(h_a, &au) == CELL_OK);
++    CHECK(au.size == SZ);
++    CHECK(memcmp(vm_base + au.addr, s + (N - 1) * SZ, SZ) == 0);
++    CHECK_RC(cellDmuxReleaseAu(h_a), CELL_OK);
++
++    /* A frame whose size is wrong is not a frame: it is dropped and the search
++     * goes on. */
++    s_wp = 0;
++    reset_events();
++    u32 m = 0;
++    for (u32 i = 0; i < 12; i++)
++        m += make_at3p(s + m, 0x40, i);
++    s[2] = 0; s[3] = 0x20;               /* says 0x110, and at 0x110 there is no sync */
++    emit_pes(0, s, m, 0x100, 0);
++    const u8 tail[8] = { 0x80,0x81,0x82,0x83,0x84,0x85,0x86,0x87 };
++    emit_pes(0, tail, 8, -1, 0);
++    feed(0, 3);
++    u32 cut = 0;
++    while (ev_count[EV_DONE] < 1 || get_au(h_a, &au) == CELL_OK) {
++        if (get_au(h_a, &au) != CELL_OK)
++            continue;
++        CHECK(au.size == 0x40);
++        cut++;
++        CHECK_RC(cellDmuxReleaseAu(h_a), CELL_OK);
++    }
++    CHECK(ev_count[EV_FATAL] == 0);
++    CHECK(cut >= 9);                     /* every frame but the bad one and the open one */
++    close_dmux();
++}
++
++/* The queue holds DMUX_AU_QUEUE_MAX AUs. dmux_pamf has to sleep; nothing is lost
++ * and DEMUX_DONE comes after the last AU. */
++static void test_queue_full(void)
++{
++    enum { N = 25 };
++    open_dmux(3);
++    static u32 size[N];
++    static u32 at[N];
++    u32 n = 0;
++    for (u32 i = 0; i < N; i++) {
++        at[i] = n;
++        size[i] = make_pic(joined + n, 0x100 + i * 3, i);
++        n += size[i];
++    }
++    n += make_pic(joined + n, 0x10, 99);   /* closes the last one */
++    emit_video(joined, n, 0x7C0, 0x9000);
++    const u32 section = s_wp;
++    feed(1, 4);
++
++    WAIT_FOR(ev_count[EV_AU_V] == (LONG)DMUX_AU_QUEUE_MAX);
++    Sleep(50);
++    CHECK(ev_count[EV_AU_V] == (LONG)DMUX_AU_QUEUE_MAX);   /* asleep, not dropping */
++    CHECK(ev_count[EV_DONE] == 0);
++    CHECK_RC(cellDmuxSetStream(h_dmux, G_STREAM, section, 0, 5), CELL_DMUX_ERROR_BUSY);
++    CHECK_RC(cellDmuxFlushEs(h_v), CELL_DMUX_ERROR_SEQ);
++
++    for (u32 i = 0; i < N; i++) {
++        if (i == 7)
++            Sleep(20);
++        Au au;
++        WAIT_FOR(get_au(h_v, &au) == CELL_OK);
++        CHECK(au.size == size[i]);
++        CHECK(memcmp(vm_base + au.addr, joined + at[i], au.size) == 0);
++        CHECK_RC(cellDmuxReleaseAu(h_v), CELL_OK);
++    }
++    WAIT_FOR(ev_count[EV_DONE] == 1);
++    CHECK(ev_n == N + 1);
++    CHECK(ev_log[N] == EV_DONE);           /* after the last AU */
++    close_dmux();
++}
++
++/* Peek does not take the AU; release can take one that was not popped. */
++static void test_peek(void)
++{
++    open_dmux(3);
++    const u32 s1 = make_pic(a1, 0x20, 1), s2 = make_pic(a2, 0x20, 2);
++    u32 n = s1;
++    memcpy(joined, a1, s1);
++    memcpy(joined + n, a2, s2); n += s2;
++    n += make_pic(joined + n, 0x20, 3);
++    emit_pes(-1, joined, n, 0x10, 0);
++    feed(1, 6);
++    WAIT_FOR(ev_count[EV_DONE] == 1);
++    CHECK_RC(cellDmuxPeekAuEx(h_v, GP(G_AUP), GP(G_SPP)), CELL_OK);
++    const u32 i1 = vm_read32(G_AUP);
++    CHECK_RC(cellDmuxPeekAu(h_v, GP(G_AUP), GP(G_SPP)), CELL_OK);
++    CHECK(vm_read32(G_AUP) == i1);
++    CHECK_RC(cellDmuxReleaseAu(h_v), CELL_OK);   /* never popped */
++    CHECK_RC(cellDmuxGetAu(h_v, GP(G_AUP), GP(G_SPP)), CELL_OK);
++    CHECK(vm_read32(G_AUP) != i1);
++    CHECK_RC(cellDmuxReleaseAu(h_v), CELL_OK);
++    close_dmux();
++}
++
++/* Many AUs through the 0x70000 ring of a Main Profile @ Main Level stream: the
++ * ring wraps, every AU stays contiguous and keeps its bytes. */
++static void test_wrap(void)
++{
++    enum { N = 24, BODY = 0x8000 };
++    open_dmux(1);
++    static u8 big[(N + 1) * (BODY + 4)];
++    u32 n = 0;
++    for (u32 i = 0; i <= N; i++)
++        n += make_pic(big + n, BODY, i * 13 + 1);
++    u32 sections = 0, wraps = 0, last_addr = 0;
++    u32 done = 0, sent = 0;
++    while (done < N) {
++        if (sent < n && ev_count[EV_DONE] == (LONG)sections) {
++            const u32 chunk = n - sent < 0x7F00 ? n - sent : 0x7F00;
++            s_wp = 0;
++            emit_video(big + sent, chunk, 0x7C0, -1);
++            sent += chunk;
++            feed(sections == 0, sections);
++            sections++;
++        }
++        Au au;
++        if (get_au(h_v, &au) == CELL_OK) {
++            CHECK(au.size == BODY + 4);
++            CHECK(au.addr + au.size <= G_VIDEO + 0x71000u);
++            CHECK(memcmp(vm_base + au.addr, big + done * (BODY + 4), au.size) == 0);
++            wraps += au.addr < last_addr;
++            last_addr = au.addr;
++            done++;
++            CHECK_RC(cellDmuxReleaseAu(h_v), CELL_OK);
++        }
++    }
++    CHECK(wraps >= 2);
++    close_dmux();
++}
++
++/* An AU cut short by a discontinuity is gone; a reset wakes dmux_pamf from a
++ * full queue and still ends in DEMUX_DONE. */
++static void test_discontinuity_and_reset(void)
++{
++    open_dmux(3);
++    u32 n = make_pic(joined, 0x100, 1);
++    emit_pes(-1, joined, n, 0x10, 0);
++    feed(1, 7);
++    WAIT_FOR(ev_count[EV_DONE] == 1);
++    CHECK(ev_count[EV_AU_V] == 0);
++
++    s_wp = 0;
++    const u32 s1 = make_pic(a1, 0x40, 2);
++    n = s1;
++    memcpy(joined, a1, s1);
++    n += make_pic(joined + n, 0x40, 3);
++    emit_pes(-1, joined, n, 0x20, 0);
++    feed(1, 8);
++    WAIT_FOR(ev_count[EV_DONE] == 2);
++    CHECK(ev_count[EV_AU_V] == 1);
++    expect_au(h_v, a1, s1, 0x20, 0);
++    close_dmux();
++
++    enum { N = 12 };
++    open_dmux(3);
++    n = 0;
++    for (u32 i = 0; i <= N; i++)
++        n += make_pic(joined + n, 0x80, i);
++    emit_video(joined, n, 0x7C0, 0x30);
++    CHECK_RC(cellDmuxResetStream(h_dmux), CELL_DMUX_ERROR_SEQ);
++    feed(1, 9);
++    WAIT_FOR(ev_count[EV_AU_V] == (LONG)DMUX_AU_QUEUE_MAX);
++    Sleep(20);
++    CHECK_RC(cellDmuxResetStream(h_dmux), CELL_OK);
++    WAIT_FOR(ev_count[EV_DONE] == 1);
++    CHECK_RC(cellDmuxResetStreamAndWaitDone(h_dmux), CELL_OK);
++    close_dmux();
++}
++
++/* Closing with dmux_pamf asleep on a full queue must not hang. */
++static void test_close_while_full(void)
++{
++    enum { N = 12 };
++    open_dmux(3);
++    u32 n = 0;
++    for (u32 i = 0; i <= N; i++)
++        n += make_pic(joined + n, 0x80, i);
++    emit_video(joined, n, 0x7C0, 0x30);
++    feed(1, 10);
++    WAIT_FOR(ev_count[EV_AU_V] == (LONG)DMUX_AU_QUEUE_MAX);
++    Sleep(20);
++    CHECK_RC(cellDmuxDisableEs(h_v), CELL_OK);
++    CHECK_RC(cellDmuxClose(h_dmux), CELL_OK);
++}
++
++static void test_args(void)
++{
++    vm_write32(G_TYPE, 0);
++    CHECK_RC(cellDmuxQueryAttr(GP(G_TYPE), GP(G_ATTR)), CELL_DMUX_ERROR_ARG);
++    CHECK_RC(cellDmuxQueryAttr(0, GP(G_ATTR)), CELL_DMUX_ERROR_ARG);
++    vm_write32(G_TYPE, CELL_DMUX_STREAM_TYPE_PAMF);
++    vm_write32(G_ID, 0xBD); vm_write32(G_ID + 4, 0x40);
++    CHECK_RC(cellDmuxQueryEsAttr(GP(G_TYPE), GP(G_ID), 0, GP(G_ATTR)), CELL_DMUX_ERROR_FATAL);
++    CHECK_RC(cellDmuxSetStream(0x1234, G_STREAM, 0x800, 0, 0), CELL_DMUX_ERROR_ARG);
++    CHECK_RC(cellDmuxGetAuEx(0x1234, GP(G_AUP), GP(G_SPP)), CELL_DMUX_ERROR_ARG);
++    CHECK_RC(cellDmuxReleaseAu(0x1234), CELL_DMUX_ERROR_ARG);
++    CHECK_RC(cellDmuxFlushEs(0x1234), CELL_DMUX_ERROR_ARG);
++    open_dmux(3);
++    CHECK_RC(cellDmuxSetStream(h_dmux, G_STREAM, 0, 0, 0), CELL_DMUX_ERROR_ARG);
++    CHECK_RC(cellDmuxSetStream(h_dmux, G_STREAM, 0xFFFFFFFFu, 0, 0), CELL_DMUX_ERROR_ARG);
++    /* A broken stream is reported, not walked over. */
++    u8* p = vm_base + G_STREAM;
++    memset(p, 0, PACK_SIZE);
++    p[2] = 1; p[3] = 0xBA;
++    s_wp = PACK_SIZE;
++    feed(1, 11);
++    WAIT_FOR(ev_count[EV_FATAL] == 1 && ev_count[EV_DONE] == 1);
++    /* The program end code gets its message. */
++    p[3] = 0xB9;
++    reset_events();
++    feed(0, 12);
++    WAIT_FOR(ev_count[EV_DONE] == 1);
++    CHECK(ev_count[EV_PROGEND] == 1);
++    close_dmux();
++}
++
++/* ---------------------------------------------------------------------------
++ * A real file
++ * -----------------------------------------------------------------------*/
++
++enum { SECTION = 0x80000 };
++
++static int run_file(const char* path, const char* audio_path)
++{
++    FILE* f = fopen(path, "rb");
++    if (!f) {
++        printf("cannot open %s\n", path);
++        return 1;
++    }
++    FILE* out = audio_path ? fopen(audio_path, "w") : NULL;
++    u8 hdr[0x800];
++    fread(hdr, 1, sizeof hdr, f);
++    open_dmux(3);
++
++    u32 vn = 0, an = 0, sections = 0, inv_a = 0, rap = 0, maxv = 0;
++    u32 first_a_size = 0;
++    u64 first_a_pts = 0, first_v_pts = 0, last_v_pts = 0;
++    int eof = 0;
++    LONG done = 0;
++    for (;;) {
++        Au au;
++        int got = 0;
++        while (get_au(h_v, &au) == CELL_OK) {
++            if (!vn) first_v_pts = au.pts;
++            if (au.pts != DMUX_TS_INVALID) last_v_pts = au.pts;
++            if (au.size > maxv) maxv = au.size;
++            rap += au.rap;
++            vn++; got = 1;
++            CHECK_RC(cellDmuxReleaseAu(h_v), CELL_OK);
++        }
++        while (get_au(h_a, &au) == CELL_OK) {
++            if (!an) { first_a_size = au.size; first_a_pts = au.pts; }
++            if (au.pts == DMUX_TS_INVALID) inv_a++;
++            if (out) fprintf(out, "%x %llx\n", au.size, (unsigned long long)au.pts);
++            an++; got = 1;
++            CHECK_RC(cellDmuxReleaseAu(h_a), CELL_OK);
++        }
++        if (eof == 2 && ev_count[EV_FLUSH_V] == 1 && ev_count[EV_FLUSH_A] == 1 && !got)
++            break;
++        if (eof == 0 && ev_count[EV_DONE] == done) {
++            const size_t n = fread(vm_base + G_STREAM, 1, SECTION, f);
++            if (!n) {
++                eof = 1;
++            } else {
++                done++;
++                sections++;
++                CHECK_RC(cellDmuxSetStream(h_dmux, G_STREAM, (u32)n, sections == 1, sections), CELL_OK);
++            }
++        }
++        if (eof == 1) {
++            CHECK_RC(cellDmuxFlushEs(h_v), CELL_OK);
++            CHECK_RC(cellDmuxFlushEs(h_a), CELL_OK);
++            eof = 2;
++        }
++        if (!got)
++            Sleep(0);
++    }
++    CHECK(ev_count[EV_FATAL] == 0);
++    printf("%s: sections %u (DEMUX_DONE %ld), AU video %u, AU audio %u\n", path, sections,
++           (long)ev_count[EV_DONE], vn, an);
++    printf("  first audio AU: size 0x%X pts 0x%llx; audio AUs without pts: %u\n", first_a_size,
++           (unsigned long long)first_a_pts, inv_a);
++    printf("  video pts 0x%llx..0x%llx, largest AU 0x%X, random access points %u\n",
++           (unsigned long long)first_v_pts, (unsigned long long)last_v_pts, maxv, rap);
++    printf("  queue waits %ld, ring waits %ld\n", s_n_queue_waits, s_n_ring_waits);
++    close_dmux();
++    fclose(f);
++    if (out) fclose(out);
++    return 0;
++}
++
++int main(int argc, char** argv)
++{
++    vm_base = (uint8_t*)calloc(1, MEM);
++    CHECK(vm_base);
++    g_ps3_guest_caller = caller;
++    if (argc > 1)
++        return run_file(argv[1], argc > 2 ? argv[2] : NULL);
++
++    test_args();
++    test_split();
++    test_sequence();
++    test_audio();
++    test_queue_full();
++    test_peek();
++    test_wrap();
++    test_discontinuity_and_reset();
++    test_close_while_full();
++    printf("test_cellDmux: ok (queue %u)\n", (unsigned)DMUX_AU_QUEUE_MAX);
++    return 0;
++}
++
++ps3_guest_caller_fn g_ps3_guest_caller;

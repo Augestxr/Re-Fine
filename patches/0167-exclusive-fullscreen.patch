@@ -1,0 +1,53 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -5445,6 +5445,27 @@ static void present_blit(u32 fi)
+     cl->lpVtbl->ResourceBarrier(cl, 2, b);
+ }
+ 
++/* Re:Fine 0167: exclusive fullscreen. The port's menu sets g_port_exclusive (from any thread);
++ * render_frame applies it here, GPU idle, before it records. SetFullscreenState(TRUE, NULL) uses the
++ * monitor the window is on at its current mode; DXGI then posts WM_SIZE and swap_chain_resize
++ * follows on the next frame. On failure (g_port_exclusive_state = -1) the request is dropped and the
++ * menu puts its row back. ASSUMPTION: DXGI allows this call from the thread that presents while the
++ * window lives on its own thread (0157); not seen failing, not tried on a laptop with two GPUs. */
++volatile int g_port_gpu_prof;           /* 1: record GPU timestamps (the menu's measure) */
++volatile int g_port_exclusive;
++volatile int g_port_exclusive_state;   /* 0 nothing asked, 1 on, -1 failed (taken by the menu) */
++static int s_excl_applied;
++static void exclusive_apply(void)
++{
++    const int want = g_port_exclusive ? 1 : 0;
++    if (want == s_excl_applied || !s_d3d.swap_chain) return;
++    const HRESULT hr = s_d3d.swap_chain->lpVtbl->SetFullscreenState(s_d3d.swap_chain, want ? TRUE : FALSE, NULL);
++    fprintf(stderr, "[D3D12] exclusive fullscreen %s: 0x%08lX%c", want ? "on" : "off", (long)hr, 10);
++    if (FAILED(hr)) { g_port_exclusive = 0; g_port_exclusive_state = want ? -1 : 0; return; }
++    s_excl_applied = want;
++    g_port_exclusive_state = want;
++}
++
+ /* Re:Fine 0151: the swap chain to the window's size. Called with the GPU idle. */
+ static void swap_chain_resize(void)
+ {
+@@ -5766,6 +5787,13 @@ static void render_height_apply(void)
+ static void render_frame(void)
+ {
+     double _rf0 = perf_on() ? perf_now() : 0.0;
++    /* Re:Fine 0167: the port's "Choose best for my PC" asks for the GPU timestamps for 5 s. They can only
++     * start between frames: EndQuery needs the heap that fp_init makes at the start of a frame. */
++    { static int applied, prev;
++      if (g_port_gpu_prof != applied) {
++          if (g_port_gpu_prof) { prev = g_frame_prof_on; g_frame_prof_on = 1; } else g_frame_prof_on = prev;
++          applied = g_port_gpu_prof;
++      } }
+     const double _fp0 = g_frame_prof_on ? perf_now() : 0.0;
+ 
+     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
+@@ -5776,6 +5804,7 @@ static void render_frame(void)
+      * costs little. */
+     wait_for_gpu();
+     swap_chain_resize();
++    exclusive_apply();       /* Re:Fine 0167 */
+     render_height_apply();   /* Re:Fine 0161 */
+     /* Re:Fine 0165: a new anisotropy level starts the sampler cache over (the GPU is idle here). */
+     if (s_aniso_applied != g_port_aniso) { s_aniso_applied = g_port_aniso; if (s_d3d.samp_n > 2) s_d3d.samp_n = 2; }

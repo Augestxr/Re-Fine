@@ -1,0 +1,95 @@
+{
+  "patches": [
+    {
+      "addr": "0x000106CC",
+      "check": "655f5db8395f2fb0a3f9cef83ee282e31104643046f60187e30b52456f679599",
+      "new": "0x60000000",
+      "guard": "g_fps_not_tick",
+      "note": "6d: the title's idle counter (compared with 900 at 0x117FC, 30 s to the demo) counts only on 30 Hz ticks. Never true with fps_target=30."
+    },
+    {
+      "addr": "0x0003CAA0",
+      "check": "570eed977967ad103f72351353539addb1dd5c72c3684c49b011c9c77a4c5593",
+      "new": "0x60000000",
+      "guard": "g_fps_not_tick",
+      "note": "6d: 0x564500, the delayed BGM start, counts 60 frames at +0x30: on 30 Hz ticks only."
+    },
+    {
+      "addr": "0x0003CAA8",
+      "check": "2256d422bc75d6d27412469a26ec13ba20c828c1b7de6f409c0623083c096350",
+      "new": "0x60000000",
+      "guard": "g_fps_not_tick",
+      "note": "6d: 0x5296C4, the sound update, on 30 Hz ticks only. Per frame it gives a new voice one frame before trusting its end flag (0x535BD4), lets the same SE play once a frame (list at +0xFD8) and fades buses by frames (0x538C08)."
+    },
+    {
+      "addr": "0x0003C3D0",
+      "check": "5d0ca9eef03957272453a08631a9e9499459405ca21392444f92c3575ee1b783",
+      "new": "0x60000000",
+      "guard": "g_fps_not_tick",
+      "note": "6d: as 0x3CAA0, in the other frame path (0x3C3B4)."
+    },
+    {
+      "addr": "0x0003C3D8",
+      "check": "367e004854063d7a4e7e162e8ddea3f3b7b31bb4ae7926be9b24266e983805d3",
+      "new": "0x60000000",
+      "guard": "g_fps_not_tick",
+      "note": "6d: as 0x3CAA8, in the other frame path (0x3C3B4)."
+    },
+    {
+      "addr": "0x0003CEA0",
+      "check": "9e6f501a821f6893d369730d09d350efc059fc0be9f10a4c4d45536f34bb23ac",
+      "new": "0x60000000",
+      "guard": "g_fps_not_tick",
+      "note": "6d: the global frame count (+0xC, read by 0x3BB30: blinks at 0xE0D7C, waves at 0xFE0C0 and 0x1D290C, every 900 frames at 0x18FFB4) counts 30 Hz ticks."
+    },
+    {
+      "addr": "0x0003CEFC",
+      "check": "a5acda8fa036876c6226f8c488a2d89cdd502f2a1384cf15e72ac3d97048ea5d",
+      "new": "0x60000000",
+      "guard": "g_fps_not_tick",
+      "note": "6d: as 0x3CEA0, the other path of 0x3CDA4."
+    },
+    {
+      "addr": "0x000141E8",
+      "check": "243835dd68412c416ac3ee06e23d3b835a9fface91a44c98225ebde5fb135492",
+      "new": "0x38000000",
+      "guard": "g_fps_high",
+      "note": "6d: AET layers with flag 0x400000, most of the menus', step without the game speed, a whole step a frame. Over 30 fps they take the speed like the rest."
+    },
+    {
+      "addr": "0x0034ED94",
+      "check": "54cb841eb669cd4e5b3a3d1a7fef19cb61069cf0d107980a1b0af40baedc58da",
+      "new": "0x60000000",
+      "guard": "g_fps_not_tick",
+      "note": "6d: TaskMaskScreen (0x34EBA0) fades by a frame count at +0x64: on 30 Hz ticks only."
+    },
+    {
+      "addr": "0x0001418C",
+      "check": "a22e22c78d79d05607c6c0574528b238245f7aa0422505cc63fc85cbe3ea36c1",
+      "new": "0x38000004",
+      "guard": "g_fps_aet_hold",
+      "note": "6d.14: with the game stopped (speed 0: pause menu, song loading) the AET layers with flag 0x400000 step a whole step a frame. Over 30 fps they then step only on 30 Hz ticks: 0x1416C returns at once, as for a layer with bit 0x4 of +0x1C. Never true with fps_target=30."
+    },
+    {
+      "addr": "0x0003C3C8",
+      "check": "51ba2ae90391692db192fb410f84dbd5e6044010a1ddc2d7dcb485b2407af448",
+      "new": "0x60000000",
+      "guard": "g_fps_menu_hold",
+      "note": "2026-11-12: outside a song over 30 fps the tasks' whole logic step (0x4C0F4: new tasks, Init, Ctrl, Dest) runs only on 30 Hz ticks, with the game speed at 1.0; Basic and Disp still run every frame. Before, only the Ctrl pass waited (0x4C2CC) and the other passes ran ahead of it: the task that starts a song read the chosen song (block at *0xBFAC34, +0x10) before the song select's Ctrl had written it, and the game started with no song (white screen). Never true with fps_target=30 or in a song."
+    },
+    {
+      "addr": "0x0003CA74",
+      "check": "5271b115e9d1c8d1b84f63e223939eefea916d97532491d770b2e3c4aa69b6f9",
+      "new": "0x60000000",
+      "guard": "g_fps_menu_hold",
+      "note": "2026-11-12: outside a song over 30 fps the tasks' whole logic step (0x4C0F4: new tasks, Init, Ctrl, Dest) runs only on 30 Hz ticks, with the game speed at 1.0; Basic and Disp still run every frame. Before, only the Ctrl pass waited (0x4C2CC) and the other passes ran ahead of it: the task that starts a song read the chosen song (block at *0xBFAC34, +0x10) before the song select's Ctrl had written it, and the game started with no song (white screen). Never true with fps_target=30 or in a song."
+    },
+    {
+      "addr": "0x0003CA2C",
+      "check": "34332433947942f2bb999b0f54456c1ab65489f01f915a940cb6b30f4dba7a03",
+      "new": "0x60000000",
+      "guard": "g_state_hold",
+      "note": "2026-11-12: the game's state machine (0x3E714, which calls the current state's function, e.g. 0x356A4C that starts a song) runs just before the tasks' step in the frame (0x3C950) and waits for the 30 Hz tick with it. Run every frame it got ahead of the tasks: it read the chosen song before the song select had written it (start_* runs: pv -1, null reads by 0x445234, no song). Tiempo real (2026-11-14): the guard is g_state_hold (the menus' hold or real time off a tick): run every frame at 120 fps the screen flow advanced four times as fast (speed test: the boot states 100 ms apart at 30, 25 at 120). It is a state machine, nothing animates from it."
+    }
+  ]
+}

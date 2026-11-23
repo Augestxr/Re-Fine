@@ -1,0 +1,106 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -786,8 +786,9 @@ static void pad_shutdown_backend(void)
+  * PAD_VPAD="<sec>:+<xbox|ps4|ps5|switch>,<sec>:-,..." attaches and detaches an
+  * SDL virtual gamepad, and PAD_VKEYS="<sec>:<keys>:<ms>,..." holds it for automatic
+  * runs: S E W N are the face buttons by position, U D L R the d-pad, s start,
+- * Q and F the left stick left and right, T the R2 trigger. With PAD_VPAD the focus
+- * gate is off, like PAD_KEYS, unless PAD_VPAD_FOCUS=1. Off unless set.
++ * Q and F the left stick left and right, q and f the same at half way, B a rebound
++ * of 0.39 to the right, T the R2 trigger. With PAD_VPAD the focus gate is off, like
++ * PAD_KEYS, unless PAD_VPAD_FOCUS=1. Off unless set.
+  * -----------------------------------------------------------------------*/
+ 
+ #if PAD_BACKEND_SDL3
+@@ -820,8 +821,27 @@ static const char* pad_sdl3_label(SDL_Gamepad* gp, SDL_GamepadButton b)
+     }
+ }
+ 
++/* A stick leaves the centre past stick_deadzone + stick_hysteresis and comes back under
++ * stick_deadzone; inside, it reads as centred. On release a stick swings past the
++ * centre (0.39 at worst for 25 ms on an Xbox Series pad, docs/STATUS.md 5d.3), and F
++ * would take that as another flick. A pad that reports slowly can jump to that side
++ * without a sample near the centre, so turning back past it counts as coming back.
++ * Outside, the value goes through as it is, so a soft flick reaches F as strong as it
++ * was. The radius is taken 500 times a second, finer than F's 30 reads a second. */
++static float s_stick_dz = -1.0f, s_stick_hy;
++typedef struct { int out, x, y; } PadStick;
++
++static void pad_sdl3_stick(PadStick* st, int x, int y, u8* ox, u8* oy)
++{
++    const float r = SDL_sqrtf((float)x * x + (float)y * y) / 32767.0f;
++    if (st->out && (r < s_stick_dz || (long long)x * st->x + (long long)y * st->y < 0)) st->out = 0;
++    else if (!st->out && r >= s_stick_dz + s_stick_hy) { st->out = 1; st->x = x; st->y = y; }
++    *ox = st->out ? pad_sdl3_axis(x) : 128;
++    *oy = st->out ? pad_sdl3_axis(y) : 128;
++}
++
+ /* One pad into a state; the rest of the struct is a release. */
+-static void pad_sdl3_read(SDL_Gamepad* gp, PadHostState* hs)
++static void pad_sdl3_read(SDL_Gamepad* gp, PadHostState* hs, int port)
+ {
+     static const struct { SDL_GamepadButton b; u16 cell; } map[] = {
+         { SDL_GAMEPAD_BUTTON_SOUTH,          CELL_PAD_CTRL_CROSS },
+@@ -852,10 +872,11 @@ static void pad_sdl3_read(SDL_Gamepad* gp, PadHostState* hs)
+     hs->buttons = btns;
+ 
+     /* SDL's Y is already down-positive, like the PS3's. */
+-    hs->analog_lx = pad_sdl3_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX));
+-    hs->analog_ly = pad_sdl3_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY));
+-    hs->analog_rx = pad_sdl3_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTX));
+-    hs->analog_ry = pad_sdl3_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTY));
++    static PadStick s_stick[PAD_MAX_HOST_PORTS][2];
++    pad_sdl3_stick(&s_stick[port][0], SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX),
++                   SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY), &hs->analog_lx, &hs->analog_ly);
++    pad_sdl3_stick(&s_stick[port][1], SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTX),
++                   SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTY), &hs->analog_rx, &hs->analog_ry);
+ 
+     /* Pressure: SDL has digital buttons, so 0 or 255 */
+     hs->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+@@ -960,7 +981,8 @@ static void pad_vpad_step(void)
+     for (unsigned i = 0; i < sizeof vb / sizeof vb[0]; i++)
+         SDL_SetJoystickVirtualButton(s_vp_joy, vb[i].b, hold[(unsigned char)vb[i].c] != 0);
+     SDL_SetJoystickVirtualAxis(s_vp_joy, SDL_GAMEPAD_AXIS_LEFTX,
+-                               hold['Q'] ? -32768 : hold['F'] ? 32767 : 0);
++                               hold['Q'] ? -32768 : hold['F'] ? 32767 :
++                               hold['q'] ? -16384 : hold['f'] ? 16384 : hold['B'] ? 12780 : 0);
+     /* A virtual trigger is a full-range axis: its rest is the bottom of it. */
+     SDL_SetJoystickVirtualAxis(s_vp_joy, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
+     SDL_SetJoystickVirtualAxis(s_vp_joy, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, hold['T'] ? 32767 : -32768);
+@@ -973,6 +995,8 @@ static SDL_JoystickID s_sdl3_id[PAD_MAX_HOST_PORTS];
+ static void pad_sdl3_open(SDL_JoystickID id)
+ {
+     int port = -1;
++    /* PAD_VPAD: the virtual pad must get port 0, the one F reads, with real pads plugged in. */
++    if (s_vp_n && !SDL_IsJoystickVirtual(id)) return;
+     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+         if (s_sdl3_pad[p] && s_sdl3_id[p] == id) return;
+         if (!s_sdl3_pad[p] && port < 0) port = p;
+@@ -1031,6 +1055,11 @@ static int SDLCALL pad_sdl3_main(void* unused)
+     (void)unused;
+     /* Whether a press counts is decided by the gate in pad_poll_sdl3, here always read. */
+     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++    { const char* dz = getenv("REFINE_STICK_DEADZONE");      /* refine.ini: stick_deadzone */
++      const char* hy = getenv("REFINE_STICK_HYSTERESIS");    /* refine.ini: stick_hysteresis */
++      s_stick_dz = dz ? (float)atof(dz) : 0.20f;
++      s_stick_hy = hy ? (float)atof(hy) : 0.25f;
++      fprintf(stderr, "[cellPad] stick dead zone %.2f, leaves the centre at %.2f%c", s_stick_dz, s_stick_dz + s_stick_hy, 10); }
+     const Uint64 t0 = SDL_GetTicksNS();
+     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
+         fprintf(stderr, "[cellPad] SDL_Init failed: %s: no pads%c", SDL_GetError(), 10);
+@@ -1054,10 +1083,10 @@ static int SDLCALL pad_sdl3_main(void* unused)
+         int open = 0;
+         for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+             if (s_sdl3_pad[p]) {
+-                pad_sdl3_read(s_sdl3_pad[p], &st[p]);
+-                if (s_vp_n) { static u16 was[PAD_MAX_HOST_PORTS];
+-                    if (st[p].buttons != was[p]) { was[p] = st[p].buttons;
+-                        fprintf(stderr, "[cellPad] vpad port %d buttons 0x%04X t=%.3f%c", p, was[p], (double)(GetTickCount64() - s_key_t0) / 1000.0, 10); } }
++                pad_sdl3_read(s_sdl3_pad[p], &st[p], p);
++                if (s_vp_n) { static u16 was[PAD_MAX_HOST_PORTS]; static u8 wasx[PAD_MAX_HOST_PORTS];
++                    if (st[p].buttons != was[p] || st[p].analog_lx != wasx[p]) { was[p] = st[p].buttons; wasx[p] = st[p].analog_lx;
++                        fprintf(stderr, "[cellPad] vpad port %d buttons 0x%04X lx=%u t=%.3f%c", p, was[p], wasx[p], (double)(GetTickCount64() - s_key_t0) / 1000.0, 10); } }
+                 pad_sdl3_rumble(p, focused);
+                 open = 1;
+             } else {

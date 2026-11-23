@@ -1,0 +1,59 @@
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index 74170f35..710db38f 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -357,6 +357,24 @@ static int rsx_vp_decompile_impl(
+     }
+     int block_open = 0;
+ 
++    /* Re:Fine 0122: a program whose branches all go forward, with no call, needs no
++     * loop: the blocks are in address order, so one pass runs the same path, and
++     * fxc takes about a third less (579 against 895 ms on the worst shader). */
++    int has_back = 0, has_call = 0;
++    if (has_flow) {
++        u32 o2 = 0; int k = 0;
++        while (o2 + 16 <= max_bytes && k < RSX_VP_MAX_INSTR) {
++            const u32 e0 = rd_le(ucode + o2), e1 = rd_le(ucode + o2 + 4);
++            const u32 e2 = rd_le(ucode + o2 + 8), e3 = rd_le(ucode + o2 + 12);
++            const u32 so = (e1 >> 27) & 0x1F;
++            if (so == 0x0A || so == 0x0B || so == 0x0C || so == 0x12) has_call = 1;
++            else if (vp_is_flow(so) && vp_branch_target(e0, e2, e3) <= (u32)k) has_back = 1;
++            k++; o2 += 16;
++            if (e3 & 1u) break;
++        }
++    }
++    const int one_pass = has_flow && !has_back && !has_call;
++
+     u32 off = 0; int instrs = 0;
+     while (off + 16 <= max_bytes) {
+         u32 d0 = rd_le(ucode+off+0), d1 = rd_le(ucode+off+4);
+@@ -638,9 +656,10 @@ static int rsx_vp_decompile_impl(
+          * text came out NaN, which the FP's NaN guard turned into black. */
+         /* Scalar logic per component: glslang's HLSL front end (the Metal
+          * path) does not take || on vectors. */
+-        "float vp_mul1(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }\n"
+-        "float4 vp_mul(float4 a, float4 b) { return float4(vp_mul1(a.x, b.x), vp_mul1(a.y, b.y),"
+-        " vp_mul1(a.z, b.z), vp_mul1(a.w, b.w)); }\n"
++        /* Re:Fine 0122: on whole vectors. Per component, fxc spent 28 % of the worst
++         * shader on the || and ?: of every product. Same result per component. */
++        "float4 vp_mul(float4 a, float4 b) { float4 m = a * b; m = (a == 0.0) ? 0.0 : m;"
++        " return (b == 0.0) ? 0.0 : m; }\n"
+         "float vp_dot3(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z; }\n"
+         "float vp_dot4(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z + m.w; }\n");
+ 
+@@ -681,11 +700,13 @@ static int rsx_vp_decompile_impl(
+         "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n"
+         "    float4 cc[2]; cc[0] = (float4)0; cc[1] = (float4)0;\n");
+ 
+-    if (has_flow)
++    if (one_pass)
++        emit(&o, "    int _pc = 0;\n");
++    else if (has_flow)
+         emit(&o, "    int _pc = 0; int _cs[8]; int _csp = 0;\n"
+                  "    [loop] for (int _it = 0; _it < 16384 && _pc >= 0; _it++) {\n");
+     emit(&o, body);
+-    if (has_flow) emit(&o, "    }\n");
++    if (has_flow && !one_pass) emit(&o, "    }\n");
+ 
+     /* Output register map (see header comment): o0 = HPOS through the RSX
+      * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7,

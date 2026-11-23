@@ -1,0 +1,64 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -6592,12 +6592,39 @@ static void render_height_apply(void)
+             want, s_d3d.rw, s_d3d.rh, s_d3d.rs, (perf_now() - t0) * 1000.0, 10);
+ }
+ 
++/* Re:Fine 0190, diagnostic only (REFINE_EVT / REFINE_ROUTE, src/evt.cpp): a hash of what each presented frame
++ * draws (the VP draws' vertices and constants), so the speed test can count the frames that differ from the
++ * one before. Nothing reads it otherwise. */
++volatile unsigned long long g_port_frame_hash;
++static void frame_hash_batch(void)
++{
++    static int on = -1; static u64 acc = 1469598103934665603ull;
++    if (on < 0) { const char* e = getenv("REFINE_EVT"); on = (e && *e != '0') || getenv("REFINE_ROUTE"); }
++    if (!on || !s_d3d.vp_vb_mapped || !s_d3d.vp_cb_mapped) return;
++    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
++    u64 h = acc;
++    /* a sample only: these are upload buffers (write-combined memory, very slow to read back; hashing all of
++     * it took the game from 30 to 15 fps). The first 16 bytes (the position) of one vertex in four, and the
++     * first 64 bytes of each draw's constants. */
++    const u8* v = (const u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * MAX_VERTICES * 256u;
++    const u32 verts = s_d3d.vp_vb_offset / 256u;
++    for (u32 i = 0; i < verts; i += 4) { const u64* q = (const u64*)(v + (u64)i * 256u); h = (h ^ q[0]) * 1099511628211ull; h = (h ^ q[1]) * 1099511628211ull; }
++    for (u32 d = 0; d < n; d++) {
++        const D3D12DrawRecord* dr = &s_d3d.draws[d];
++        if (!dr->is_vp || dr->is_clear || dr->cb_slot >= MAX_DRAWS) continue;
++        const u64* c = (const u64*)((const char*)s_d3d.vp_cb_mapped + ((u64)s_d3d.vp_parity * MAX_DRAWS + dr->cb_slot) * VP_CB_STRIDE);
++        for (u32 i = 0; i < 8u; i++) h = (h ^ c[i]) * 1099511628211ull;
++    }
++    if (s_present_this_frame) { g_port_frame_hash = h; acc = 1469598103934665603ull; } else acc = h;
++}
++
+ #ifdef REFINE_VULKAN
+ /* N1 V2b: the batch to the Vulkan executor, then the same end-of-frame resets as render_frame's. */
+ static void render_frame_vk(void)
+ {
+     rsx_vk_exec_wait();
+     ix_apply();              /* 0175: this batch's vertices into the executor's buffer */
++    frame_hash_batch();
+     { const LONG wh = InterlockedExchange(&s_d3d.want_wh, 0);
+       if (wh) rsx_vk_exec_resize((u32)wh >> 16, (u32)wh & 0xFFFFu); }
+     rsx_vk_frame f;
+@@ -6687,6 +6714,7 @@ static void render_frame(void)
+      * costs little. */
+     wait_for_gpu();
+     ix_apply();              /* Re:Fine 0175: before anything reads this batch's vertices */
++    frame_hash_batch();
+     swap_chain_resize();
+     exclusive_apply();       /* Re:Fine 0167 */
+     render_height_apply();   /* Re:Fine 0161 */
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2219,6 +2219,9 @@ static ppu_fn ppu_lookup(uint32_t a)
+ }
+ 
+ extern "C" uint32_t ppu_function_count(void) { return g_fn_count; }
++/* Re:Fine 0190: the function registered at a guest address, for a hook that wraps whatever a vtable slot
++ * points at (src/realtime.cpp) and must call the original it replaces. */
++extern "C" ppu_fn ppu_lookup_function(uint32_t a) { return ppu_lookup(a); }
+ 
+ /* Correct native memmove override for the game's hand-optimized memmove at
+  * guest 0x0036FA74. The lifted 1306-instruction version is mis-lifted (flagged

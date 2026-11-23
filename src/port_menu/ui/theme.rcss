@@ -1,0 +1,95 @@
+/* Re:Fine port menu: every colour lives here. "SETLIST" (2026-11-12, docs/diseno_menu.md): flat colours,
+ * one dominant accent. Our own palette; no art or logo of the game. RCSS has no variables, so the colour
+ * rules are grouped here and menu.rcss holds the layout. Palette:
+ *   stage black #0B0D10   charcoal #171B20   paper #F4F1EA   tape grey #8C9299
+ *   Miku teal #39C5BB     star yellow #FFD23F (changed / needs a restart)     magenta #E6007E (errors, soon) */
+body          { color: #F4F1EA; }
+#dim          { background-color: #0000008c; }
+#p_glow       { background-color: #0B0D10f0; }
+#p_accent, #bar_line { background-color: #39C5BB; }
+#c_accent     { background-color: #39C5BB; }
+#desc         { border-color: #8C929955; }
+.tab          { color: #8C9299; }
+.tab .tno     { color: #39C5BB; }
+.tab:hover    { color: #F4F1EA; }
+.tab.sel      { color: #0B0D10; }
+.tab.sel .tno { color: #0B0D10; }
+.tab.sel:hover { color: #0B0D10; }
+#tab_ink      { background-color: #39C5BB; }
+#xclose       { color: #8C9299; border-color: #8C929966; }
+#xclose:hover { color: #0B0D10; border-color: #39C5BB; background-color: #39C5BB; }
+.sect         { color: #39C5BB; }
+.pill         { background-color: #39C5BB; }
+.row          { color: #F4F1EA; }
+.row.focus    { color: #0B0D10; }
+.rval         { color: #8C9299; }
+.row.focus .rval { color: #0B0D10; }
+.row.off .rlabel, .row.off .rval { color: #555B62; }
+.row.off.focus .rlabel, .row.off.focus .rval { color: #0B0D1099; }
+.row.changed .rval { color: #FFD23F; }
+.row.changed.focus .rval { color: #0B0D10; }
+.soon         { color: #E6007E; }
+.rval .soon   { background-color: #E6007E22; }
+.row.focus .rval .soon { color: #0B0D10; background-color: #0B0D1022; }
+.rval .slot   { border-color: #8C929955; background-color: #171B20; color: #8C9299; }
+.row.focus .slot     { color: #F4F1EA; background-color: #0B0D10; border-color: #0B0D10; }
+.row.focus .slot.sel { color: #0B0D10; border-color: #0B0D10; background-color: #FFD23F; }
+.rval .listen { color: #E6007E; }
+#desc_title   { color: #F4F1EA; }
+#desc_text    { color: #B9BDC0; }
+#desc_note    { color: #FFD23F; background-color: #FFD23F14; border-color: #FFD23F; }
+#desc_note.warn { color: #FF5FB0; background-color: #E6007E1a; border-color: #E6007E; }
+#sv_box       { border-color: #8C9299; background-color: #171B20; }
+#sv_leave     { border-color: #39C5BB; }
+#sv_dz        { border-color: #FFD23F; background-color: #FFD23F22; }
+#sv_dot       { background-color: #F4F1EA; }
+#sv_dot.out   { background-color: #39C5BB; }
+#help         { color: #8C9299; }
+.hk           { border-color: #39C5BB; }
+#bar          { background-color: #0B0D10f0; }
+#bar_ink      { background-color: #39C5BB; }
+.btab         { color: #8C9299; }
+.btab:hover   { color: #F4F1EA; }
+.btab.focus   { color: #0B0D10; }
+.btab.focus:hover { color: #0B0D10; }
+.btab.off     { color: #555B62; }
+.btab .soon   { background-color: #E6007E22; }
+#bar_info     { color: #8C9299; }
+#bar_fps      { background-color: #171B20; color: #39C5BB; }
+#fps          { background-color: #0B0D10d9; color: #39C5BB; }
+#timing       { background-color: #0B0D10d9; color: #8C9299; }
+#tm_now       { color: #39C5BB; }
+#tm_now.early { color: #FFD23F; }
+#tm_now.late  { color: #FF6F91; }
+#note         { background-color: #0B0D10d9; color: #F4F1EA; }
+#confirm      { background-color: #00000099; }
+#confirm_box  { background-color: #0B0D10f5; }
+.cbtn         { color: #8C9299; border-color: #8C929966; background-color: #171B20; }
+.cbtn.focus   { color: #0B0D10; border-color: #39C5BB; background-color: #39C5BB; }
+.cbtn:hover   { border-color: #39C5BB; }
+#confirm_note { color: #FFD23F; }
+scrollbarvertical sliderbar { background-color: #39C5BB; }
+
+/* Start screen */
+#l_bg         { background-color: #0B0D10; }
+#l_black      { background-color: #000000; }
+#l_shade      { background-color: #0B0D10f0; }
+#l_glow       { background-color: #39C5BB; }
+#l_brand      { color: #F4F1EA; }
+#l_brandbar   { background-color: #39C5BB; }
+#l_ink        { background-color: #39C5BB; }
+.mitem        { color: #F4F1EA; }
+.mitem .mno   { color: #39C5BB; }
+.mitem.focus  { color: #0B0D10; }
+.mitem.focus .mno { color: #0B0D10; }
+#l_disc       { color: #8C9299; }
+#l_rver       { color: #F4F1EA; background-color: #0B0D10d9; }
+#l_disc .ok   { color: #39C5BB; }
+#l_disc .bad  { color: #FF5FB0; }
+#l_disc .btn  { color: #0B0D10; border-color: #FFD23F; background-color: #FFD23F; }
+#l_disc .btn:hover { background-color: #F4F1EA; border-color: #F4F1EA; }
+.gopt         { color: #8C9299; border-color: #8C929966; background-color: #0B0D10d9; }
+.gopt.sel     { color: #0B0D10; border-color: #39C5BB; background-color: #39C5BB; }
+.gopt.off     { color: #8C929999; }
+.gopt.off .gsub { color: #FF5FB0; }
+#l_toast      { background-color: #0B0D10f0; border-color: #39C5BB; color: #F4F1EA; }

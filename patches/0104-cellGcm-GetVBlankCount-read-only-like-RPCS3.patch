@@ -1,0 +1,24 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 298ee7defb61c7c39110c229efe1d25c1d64bd74..7afb646fd6692b0801a50a86445f313f965e6c00 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -4125,11 +4125,16 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
+     return CELL_OK;
+ }
+ 
+-/* Return incrementing VBlank counter */
++/* Re:Fine patches/0104: the vblank count, read-only, as RPCS3 does
++ * (rpcs3/Emu/Cell/Modules/cellGcmSys.cpp @ 1f59f0f2:
++ * "return rsx::get_current_renderer()->vblank_count;"). Only the vblank tick
++ * (cellGcmTickVBlank / cellGcm_request_tick) advances it. The old version
++ * incremented it on every query, so a title that waits "until the count moves
++ * by 2" (Project DIVA F's frame loop at 0x5897F0) never waited, and it flipped
++ * ~55 times a second instead of 30. */
+ u32 cellGcmGetVBlankCount(void)
+ {
+-    /* Approximate: increment each time queried (games use this for timing) */
+-    return s_vblank_count++;
++    return *(volatile u32*)&s_vblank_count;
+ }
+ 
+ /* Return tile info for a given index */

@@ -1,0 +1,86 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -4067,9 +4067,17 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+  * PSO/RTV formats -- values clamp to [0,1], which demosaic's RGB data fits.
+  * -----------------------------------------------------------------------*/
+ 
++/* Re:Fine 6d.4, diagnostic only: where the drain goes under FRAME_PROF, in TSC ticks:
++ * 0 draw callbacks, 1 vp_record_cb, 2 its memcpy of the constants, 3 dr_capture_texs. */
++extern int g_frame_prof_on;
++unsigned long long g_fp_parts[4];
++#define FP_PART_BEGIN unsigned long long _fpp = g_frame_prof_on ? __rdtsc() : 0
++#define FP_PART_END(i) do { if (g_frame_prof_on) g_fp_parts[i] += __rdtsc() - _fpp; } while (0)
++
+ /* The units bound right now, whole: one copy, whatever the program reads. */
+ static void dr_capture_texs(D3D12DrawRecord* dr)
+ {
++    FP_PART_BEGIN;
+     memcpy(dr->tex, s_d3d.cur_texs, sizeof dr->tex);
+     dr->tex_mask = s_d3d.cur_tex_mask;
+     dr->fp_units = 0xFFFFu;
+@@ -4083,12 +4091,21 @@ static void dr_capture_texs(D3D12DrawRecord* dr)
+                 tex_rec_capture(dr->tex[u].off, dr->tex[u].w, dr->tex[u].h, dr->tex[u].fmt);
+         }
+     }
++    FP_PART_END(3);
+ }
+ 
+ /* Snapshot the VP constant bank + viewport epilogue for one draw into its
+  * vp_cb slot. Runs at record time so every draw keeps the constants that
+  * were live when the guest issued it. */
++static void vp_record_cb_body(u32 slot, int vs_idx, const D3D12DrawRecord* dr);
+ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
++{
++    FP_PART_BEGIN;
++    vp_record_cb_body(slot, vs_idx, dr);
++    FP_PART_END(1);
++}
++
++static void vp_record_cb_body(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+ {
+     const rsx_state* st = s_d3d.current_rsx_state;
+     if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return;
+@@ -4132,7 +4149,9 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+     }
+     char* dst = (char*)s_d3d.vp_cb_mapped
+         + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
+-    memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
++    { FP_PART_BEGIN;
++      memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
++      FP_PART_END(2); }
+     /* VP_MVP=<N>: the constant bank as the shader will see it, for the first N
+      * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
+      * vertex program from the outside -- both give zero fragments. */
+@@ -8715,6 +8734,20 @@ static void d3d12_set_depth_stencil(void* ud, const rsx_state* state)
+  * Backend registration
+  * -----------------------------------------------------------------------*/
+ 
++static void d3d12_draw_arrays_prof(void* ud, u32 primitive, u32 first, u32 count)
++{
++    FP_PART_BEGIN;
++    d3d12_draw_arrays(ud, primitive, first, count);
++    FP_PART_END(0);
++}
++
++static void d3d12_draw_indexed_prof(void* ud, u32 primitive, u32 first, u32 count)
++{
++    FP_PART_BEGIN;
++    d3d12_draw_indexed(ud, primitive, first, count);
++    FP_PART_END(0);
++}
++
+ static rsx_backend s_d3d12_backend = {0};
+ 
+ /* ---------------------------------------------------------------------------
+@@ -8792,8 +8825,8 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+     s_d3d12_backend.set_depth_stencil = d3d12_set_depth_stencil;
+     s_d3d12_backend.set_shader        = d3d12_set_shader;
+     s_d3d12_backend.set_vertex_attribs = d3d12_set_vertex_attribs;
+-    s_d3d12_backend.draw_arrays       = d3d12_draw_arrays;
+-    s_d3d12_backend.draw_indexed      = d3d12_draw_indexed;
++    s_d3d12_backend.draw_arrays       = d3d12_draw_arrays_prof;
++    s_d3d12_backend.draw_indexed      = d3d12_draw_indexed_prof;
+     s_d3d12_backend.bind_texture      = d3d12_bind_texture;
+ 
+     rsx_set_backend(&s_d3d12_backend);

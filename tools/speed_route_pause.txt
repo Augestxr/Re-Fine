@@ -1,0 +1,63 @@
+# speed_route_pause.txt - el recorrido de tools\speed_test.ps1 hasta la cancion, y alli el menu de pausa:
+# abrirlo, mover el cursor y continuar. Comprueba que la pausa (16TaskPauseManager) va a la velocidad del
+# original a cualquier fps (2026-11-21). Uso: tools\speed_test.ps1 -Route tools\speed_route_pause.txt
+wait task+ 9TaskMovie
+sleep 1000
+until task+_12TaskAdvTitle s 2000
+mark title
+sleep 3000
+press s 100
+sleep 3000
+press n 100
+sleep 3000
+press n 100
+sleep 3000
+press n 100
+mark main_menu
+wait task+ 7SelMain
+wait task+ 10InfoWindow
+sleep 3000
+press n 100
+wait task- 10InfoWindow
+sleep 2000
+press n 100
+mark mode_select
+wait task+ 11SelFreeplay
+sleep 3000
+press n 100
+mark song_list
+wait task+ 5SelPv
+wait task+ 10InfoWindow
+sleep 3000
+press n 100
+wait task- 10InfoWindow
+sleep 2000
+press d 100
+sleep 1500
+press u 100
+sleep 1500
+until TaskPvGame n 2500
+mark song_load
+wait task+ 8SelStart
+sleep 2000
+press n 100
+mark song
+wait task- 8SelStart
+sleep 8000
+mark pause_open
+press s 100
+sleep 3000
+press d 100
+sleep 1500
+press d 100
+sleep 1500
+press u 100
+sleep 1500
+press u 100
+sleep 1500
+mark pause_close
+press n 100
+sleep 6000
+mark resumed
+sleep 2000
+close

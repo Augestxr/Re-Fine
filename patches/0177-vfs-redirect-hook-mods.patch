@@ -1,0 +1,57 @@
+diff --git a/libs/filesystem/cellFs.c b/libs/filesystem/cellFs.c
+--- a/libs/filesystem/cellFs.c
++++ b/libs/filesystem/cellFs.c
+@@ -136,6 +136,11 @@
+ 
+     if (!ps3_path || !host_buf || buf_size == 0)
+         return -1;
++    {   /* Re:Fine 0177: a mod's file (sys_fs.c) */
++        extern int (*ps3_vfs_redirect_hook)(const char* guest, char* host, size_t cap);
++        if (ps3_vfs_redirect_hook && ps3_vfs_redirect_hook(ps3_path, host_buf, buf_size))
++            return 0;
++    }
+ 
+     /* Find longest matching prefix */
+     int best = -1;
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -127,11 +127,13 @@
+ /* Defined in runtime/syscalls/sys_fs.c -- shared by all three path
+  * translators. (extern "C" is ill-formed at block scope.) */
+ extern "C" void ps3_vfs_ps3game_fallback(char* path, size_t cap);
++extern "C" int (*ps3_vfs_redirect_hook)(const char* guest, char* host, size_t cap);   /* Re:Fine 0177 */
+ 
+ /* Translate a guest path to a host path under ppu_vfs_root. Known PS3 mount
+  * prefixes are stripped; the rest is appended to the root. */
+ static void host_path(char* out, size_t cap, const char* guest)
+ {
++    if (ps3_vfs_redirect_hook && ps3_vfs_redirect_hook(guest, out, cap)) return;   /* 0177: a mod's file */
+     const char* rel = guest;
+     /* /dev_hdd0 overlays the installed game-update dir (a disc title patched to
+      * e.g. v1.30 runs the update's EBOOT and reads its patchN.farc from
+diff --git a/runtime/syscalls/sys_fs.c b/runtime/syscalls/sys_fs.c
+--- a/runtime/syscalls/sys_fs.c
++++ b/runtime/syscalls/sys_fs.c
+@@ -93,6 +93,11 @@
+  * only weak reference to it: under COFF each one emits its own fallback. */
+ extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
+ 
++/* Re:Fine 0177 (mods, docs/plan_6h.md P1): the port may serve a guest path from another host file. Called
++ * first by all three path translators (sys_fs, cellFs, ppu_fs) with the guest path as the title asked for it;
++ * returns 1 after writing the host path to use, 0 to translate as usual. NULL (the default): no mods. */
++int (*ps3_vfs_redirect_hook)(const char* guest, char* host, size_t cap);
++
+ void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+ {
+     struct stat st;
+@@ -157,6 +162,9 @@
+         const char* env = getenv("PS3_VFS_ROOT");
+         if (env && *env) { strncpy(g_sys_fs_root, env, sizeof(g_sys_fs_root) - 1); g_sys_fs_root[sizeof(g_sys_fs_root)-1] = 0; }
+     }
++    if (ps3_vfs_redirect_hook && ps3_path && host_path_size > 0
++        && ps3_vfs_redirect_hook(ps3_path, host_path, (size_t)host_path_size))
++        return;   /* 0177: a mod's file */
+ 
+     /* /dev_hdd0 overlays the installed game-update dir (patchN.farc live there
+      * for a disc title patched to e.g. v1.30) -- mirror ppu_fs.cpp host_path.

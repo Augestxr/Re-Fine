@@ -1,0 +1,20 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -1916,6 +1916,16 @@ skip_inject: ;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
+     }
++    /* Re:Fine 0196: while the port's menu or a system screen holds the pad, the presses queued for the title
++     * (0191) go too. The queue is added to the packet further down, after both gates: the title saw every press
++     * made in the menu, and a Cross there answered the pause menu behind it and the song went on. Tested before
++     * the gates are asked, so the read in which one lets go still drops what was pressed inside it. */
++    if (port_no < PAD_MAX_HOST_PORTS && (g_port_overlay_gate || g_sysui_gate)) {
++        pad_lock();
++        memset(s_tap_n[port_no], 0, sizeof s_tap_n[port_no]);
++        memset(s_tap_tick[port_no], 0, sizeof s_tap_tick[port_no]);
++        pad_unlock();
++    }
+     /* Re:Fine 0158: the port's overlay (its menu) holds the pad while it is open, before a
+      * system screen: the menu is drawn over everything. */
+     /* Re:Fine 0159: the port watches every read (its quick bar's long SELECT), and while its

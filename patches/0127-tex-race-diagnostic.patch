@@ -1,0 +1,211 @@
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index cd2c5c62..c6685a34 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -742,6 +742,9 @@ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alph
+     if (dst) {
+         if (ready) {
+             vm_memcpy_to(dst, pic.conv, bytes);
++            { extern void tex_race_pic(const u8*, u32);
++              if (pic.width == 1280 && pic.height == 720 && type < 3)
++                  tex_race_pic(pic.conv, dst); }
+         } else if (type >= 3) {
+             vdec_store_picture(dst, pic.yuv, pic.width, pic.height, type, matrix, alpha);
+         } else if (buf) {
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 7afb646f..943168b0 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -153,6 +153,9 @@ int cellGcm_take_flip_pending(void)
+     return v;
+ }
+ 
++/* Re:Fine 0127: see tex_race_event in rsx_d3d12_backend.c. */
++extern void tex_race_event(u32 type, u32 a, u32 b, const u32* sig, u32 nsig);
++
+ /* The flip now names this buffer. The shared draw engine presents on the
+  * host's call and only learns a buffer from 0xE944 by itself, so it would
+  * keep presenting display buffer 0 for a title that flips through 0xFEAD. */
+@@ -1943,6 +1946,8 @@ static void wprof_note_walker(void)
+ static void wprof_note_walker(void) {}
+ #endif
+ 
++u32 tex_race_put_ea(void) { return GCM_CONTROL_GUEST_ADDR; }
++
+ /* Host thread that last walked the FIFO, for PS3_SAMPLE_DRAIN. */
+ volatile unsigned long g_gcm_drain_tid;
+ 
+@@ -1952,7 +1957,9 @@ void cellGcm_rsx_process_fifo(void)
+     g_gcm_drain_tid = GetCurrentThreadId();
+     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
++    tex_race_event(9, s_fifo_getoff, 0, NULL, 0);
+     gcm_rsx_process_fifo_unlocked();
++    tex_race_event(10, s_fifo_getoff, 0, NULL, 0);
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
+     if (ft_t0) {
+         const uint64_t t1 = ps3_ft_now();
+@@ -2308,6 +2315,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 gcm_set_current_display_buffer(w & 7u);
+                 s_flip_pending = 1;
+                 s_flip_request_count++;
++                tex_race_event(6, s_flip_request_count, s_fifo_getoff, NULL, 0);
+                 /* Not past `queued`: a resync may already have written off
+                  * this flip. */
+                 if (s_fifo_flips_reached != s_fifo_flips_queued) s_fifo_flips_reached++;
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index b7a51e6f..ceab1962 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -523,6 +523,10 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+           s_sem_ctx = data;
+       }
+       if (method == 0x1D6C) { s_sem_off = data; return 0; }
++      if (method == 0x1D70 || method == 0x1D74) {
++          extern void tex_race_event(u32, u32, u32, const u32*, u32);
++          tex_race_event(5, s_sem_off | (method == 0x1D74 ? 0x80000000u : 0u), data, NULL, 0);
++      }
+       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+         extern void vm_write32(uint32_t a, uint32_t v);
+         extern u32 gcm_io_offset_to_ea(u32 io);
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index cc23d4ed..02d86888 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -3139,6 +3139,99 @@ static u32 rsx_remap_to_d3d(u32 c1, u32 basef)
+  * NV40 layout (matches RPCS3 convert_linear_swizzle). POT dims only, which is
+  * what the hardware requires for swizzled textures. */
+ 
++/* Re:Fine 0127, diagnostic only: TEX_RACE=<file>[,<hex ea>] (default ea 0xC713EC00)
++ * timestamps what touches one texture: `put`, the first and last row of the
++ * guest's copy (seen by a spinning watcher thread), the draw that records it,
++ * labels, flips, and the upload, with a signature per row of what was read. It
++ * answers whether an upload saw one picture whole. Off unless the variable is
++ * set; the spin is the diagnostic's own and never runs otherwise. Binary records:
++ * i64 qpc, u32 type, a, b, nsig, then nsig u32. tools/tex_race.py reads them. */
++enum { TR_PUT = 1, TR_TOP, TR_BOT, TR_REC, TR_LABEL, TR_FLIP, TR_UP, TR_PIC, TR_DRAIN,
++       TR_DRAIN_END, TR_UP_SRC };
++#define TR_W 1280u
++#define TR_H 720u
++#define TR_NSIG (TR_H / 4u)
++static FILE*   s_tr_f;
++static u32     s_tr_ea;
++static SRWLOCK s_tr_lock = SRWLOCK_INIT;
++
++void tex_race_event(u32 type, u32 a, u32 b, const u32* sig, u32 nsig)
++{
++    if (!s_tr_f) return;
++    struct { long long t; u32 type, a, b, n; } r;
++    LARGE_INTEGER q; QueryPerformanceCounter(&q);
++    r.t = q.QuadPart; r.type = type; r.a = a; r.b = b; r.n = sig ? nsig : 0;
++    AcquireSRWLockExclusive(&s_tr_lock);
++    fwrite(&r, sizeof r, 1, s_tr_f);
++    if (sig) fwrite(sig, 4, nsig, s_tr_f);
++    ReleaseSRWLockExclusive(&s_tr_lock);
++}
++
++/* One hash per fourth row. The bytes of a pixel are summed, so the guest's
++ * order and the decoded one give the same signature. */
++static void tex_race_sig(const u8* p, u32 pitch, u32* out)
++{
++    for (u32 y = 0; y < TR_NSIG; y++) {
++        const u8* r = p + (u64)y * 4u * pitch;
++        u32 h = 2166136261u;
++        for (u32 x = 0; x < TR_W; x++, r += 4)
++            h = (h ^ (u32)(r[0] + r[1] + r[2] + r[3])) * 16777619u;
++        out[y] = h;
++    }
++}
++
++void tex_race_pic(const u8* p, u32 n)
++{
++    if (!s_tr_f) return;
++    static u32 sig[TR_NSIG];
++    tex_race_sig(p, TR_W * 4u, sig);
++    tex_race_event(TR_PIC, n, 0, sig, TR_NSIG);
++}
++
++static DWORD WINAPI tex_race_watch(LPVOID base)
++{
++    const u8* top = (const u8*)base + TR_W * 4u * 2u;
++    const u8* bot = (const u8*)base + TR_W * 4u * (TR_H - 2u);
++    extern u32 vm_read32(u32);
++    extern u32 tex_race_put_ea(void);
++    extern void ppu_report_guest_lrs(void);
++    const u32 pa = tex_race_put_ea();
++    u64 lt = 0, lb = 0; u32 lp = 0; int said = 0;
++    for (;;) {
++        u64 t = 0, b = 0;
++        for (u32 i = 0; i < 1024u; i += 8u) {
++            t = t * 31u + *(const volatile u64*)(top + i * 4u);
++            b = b * 31u + *(const volatile u64*)(bot + i * 4u);
++        }
++        const u32 put = vm_read32(pa);
++        if (put != lp) { lp = put; tex_race_event(TR_PUT, put, 0, NULL, 0); }
++        if (t != lt) { lt = t; tex_race_event(TR_TOP, 0, 0, NULL, 0);
++                       if (said++ < 40 && said > 20) ppu_report_guest_lrs(); }
++        if (b != lb) { lb = b; tex_race_event(TR_BOT, 0, 0, NULL, 0); }
++    }
++}
++
++static void tex_race_init(void)
++{
++    static int done;
++    if (done) return;
++    done = 1;
++    const char* e = getenv("TEX_RACE");
++    if (!e) return;
++    char path[512]; strncpy(path, e, sizeof path - 1); path[sizeof path - 1] = 0;
++    s_tr_ea = 0xC713EC00u;
++    char* c = strrchr(path, ',');
++    if (c) { *c = 0; s_tr_ea = (u32)strtoul(c + 1, NULL, 16); }
++    s_tr_f = fopen(path, "wb");
++    if (!s_tr_f) return;
++    setvbuf(s_tr_f, NULL, _IOFBF, 1 << 20);
++    { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
++      struct { long long t; u32 type, a, b, n; } r = { f.QuadPart, 0, s_tr_ea, 0, 0 };
++      fwrite(&r, sizeof r, 1, s_tr_f); }
++    extern uint8_t* vm_base;
++    CreateThread(NULL, 64u * 1024, tex_race_watch, vm_base + s_tr_ea, 0, NULL);
++}
++
+ /* Sparse FNV-1a over a texture's source bytes -- enough to notice an animated
+  * surface changing, cheap enough to run on every bind. Kept a function rather
+  * than a statement-expression macro so the file still compiles under MSVC;
+@@ -3465,6 +3558,19 @@ static int vp_upload_tex_slot(u32 off, u32 w, u32 h, u32 fmt, int cube, u32 mips
+     /* Pixel conversion -- deswizzle, channel order, block copy -- is RSX
+      * semantics and lives in rsx_texture_layout.c, so a second backend gets
+      * it by calling this rather than porting the loops again. */
++    if (s_tr_f && key_off == s_tr_ea && w == TR_W && h == TR_H) {
++        /* Decoded to host memory first: reading `mapped` back is write-combined,
++         * ~22 ms for the signature, and it stalled the drain. */
++        static u32 sig[TR_NSIG];
++        static u8* tmp;
++        if (!tmp) tmp = (u8*)malloc((size_t)pitch * h);
++        tex_race_event(TR_UP_SRC, 0, 0, NULL, 0);
++        rsx_texture_decode(tmp, pitch, vm_base + off, w, h, &tl, rsx_texture_argb_is_rgba());
++        tex_race_event(TR_UP_SRC, 1, 0, NULL, 0);
++        memcpy(mapped, tmp, (size_t)pitch * h);
++        tex_race_sig(tmp, pitch, sig);
++        tex_race_event(TR_UP, (u32)slot, (u32)s_d3d.frame_count, sig, TR_NSIG);
++    } else
+     rsx_texture_decode(mapped, pitch, vm_base + off, w, h, &tl,
+                        rsx_texture_argb_is_rgba());
+ 
+@@ -3797,6 +3903,16 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+ {
+     const rsx_state* st = s_d3d.current_rsx_state;
+     if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return;
++    tex_race_init();
++    if (s_tr_f && dr) {
++        extern uint8_t* vm_base;
++        for (u32 u = 0; u < RSX_FP_TEX_UNITS; u++) {
++            if (!(dr->tex_mask & (1u << u)) || dr->tex[u].off != s_tr_ea) continue;
++            static u32 sig[TR_NSIG];
++            tex_race_sig(vm_base + s_tr_ea, TR_W * 4u, sig);
++            tex_race_event(TR_REC, slot, u, sig, TR_NSIG);
++        }
++    }
+     /* Re:Fine 0118: b1 as rsx_fp_decompile_buffered_ex lays it out. The constants
+      * are the ucode's bytes now: a title patches them between draws of one
+      * program, and render_frame only sees the frame's last value. */

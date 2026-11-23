@@ -1,0 +1,51 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2462,6 +2462,7 @@ static D3D12_TEXTURE_ADDRESS_MODE rsx_wrap(u32 w)
+  * TEXTURE_CONTROL0 (max anisotropy [6:4]) and BORDER_COLOR (ARGB). */
+ volatile int   g_port_aniso;     /* Re:Fine 0165 */
+ volatile float g_port_sharpen;
++volatile int g_port_area;     /* Re:Fine 0168: Output resampling = Area */
+ static int s_aniso_applied;
+ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
+ {
+@@ -5318,8 +5319,16 @@ static int present_blit_init(void)
+     static const char ps[] =
+         "Texture2D<float4> t : register(t0);\n"
+         "SamplerState s : register(s0);\n"
+-        "cbuffer K : register(b0) { float2 px; float sharp; float pad; };\n"
+-        "float3 S(float2 uv) { return t.SampleLevel(s, uv, 0).rgb; }\n"
++        "cbuffer K : register(b0) { float2 px; float sharp; float area; };\n"
++        "/* Re:Fine 0168: area > 1 is source texels per output pixel: a box of n x n bilinear taps. */\n"
++        "float3 S(float2 uv) {\n"
++        "    if (area <= 1.0) return t.SampleLevel(s, uv, 0).rgb;\n"
++        "    int n = (int)min(ceil(area), 4.0);\n"
++        "    float3 a = 0;\n"
++        "    for (int j = 0; j < n; j++) for (int i = 0; i < n; i++)\n"
++        "        a += t.SampleLevel(s, uv + (float2(i, j) + 0.5) / n * px - 0.5 * px, 0).rgb;\n"
++        "    return a / (n * n);\n"
++        "}\n"
+         "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+         "    float3 e = S(uv);\n"
+         "    if (sharp <= 0.0) return float4(e, 1.0);\n"
+@@ -5428,7 +5437,8 @@ static void present_blit(u32 fi)
+     s_blit.heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_blit.heap, &gh);
+     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, gh);
+     { float sh = g_port_sharpen; if (sh < 0.0f) sh = 0.0f; if (sh > 1.0f) sh = 1.0f;   /* Re:Fine 0165 */
+-      const float kc[4] = { 1.0f / (float)vw, 1.0f / (float)vh, sh, 0.0f };
++      const float kc[4] = { 1.0f / (float)vw, 1.0f / (float)vh, sh,
++                            (g_port_area && s_d3d.width > vw) ? (float)s_d3d.width / (float)vw : 0.0f };
+       cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, kc, 0); }
+     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -61,6 +61,7 @@ void rsx_d3d12_launcher_frame(void);
+  * g_port_sharpen: 0 = off, else 0-1 strength of a contrast-adaptive sharpen at the present. */
+ extern volatile int   g_port_aniso;
+ extern volatile float g_port_sharpen;
++extern volatile int g_port_area;      /* Re:Fine 0168: 1 = Output resampling Area (box filter when the picture is shrunk) */
+ 
+ #ifdef __cplusplus
+ }

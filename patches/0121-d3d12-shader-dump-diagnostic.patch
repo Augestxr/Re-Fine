@@ -1,0 +1,39 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 976e6931..ecb28419 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2007,6 +2007,18 @@ static void compile_time(const char* tag, CompileTime* t, u32 id, u32 uhash, int
+     }
+ }
+ 
++/* Re:Fine 0121: SHADER_DUMP=<dir> writes every generated shader as it is compiled,
++ * to look at it and to time it again outside the game. */
++static void shader_dump(const char* kind, u32 id, const char* hlsl)
++{
++    static const char* dir = (const char*)1; static u32 n;
++    if (dir == (const char*)1) dir = getenv("SHADER_DUMP");
++    if (!dir) return;
++    char path[512]; snprintf(path, sizeof path, "%s/%s_%03u_%08X.hlsl", dir, kind, n++, id);
++    FILE* f = fopen(path, "wb");
++    if (f) { fwrite(hlsl, 1, strlen(hlsl), f); fclose(f); }
++}
++
+ static int vp_get_vs(const rsx_state* st)
+ {
+     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+@@ -2089,6 +2101,7 @@ static int vp_get_vs(const rsx_state* st)
+             at += n;
+         }
+     }
++    shader_dump("vs", hash, hlsl);
+     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
+     const double t_vs = perf_now();
+     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
+@@ -2817,6 +2830,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+         char* rp = strstr(hlsl, "return r[0];");
+         if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
+     }
++    shader_dump("ps", uhash, hlsl);
+     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
+     t_dxc = perf_now();
+     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,

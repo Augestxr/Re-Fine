@@ -1,0 +1,216 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index ed30c50435a3eb8f8f16b6f8b757e71e1fb2a0a2..f4152fd3a1a539c0c98e4506405ccce22fa8d24b 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -253,22 +253,21 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
+     return (u8)val;
+ }
+ 
+-/* Keyboard fallback for port 0.
++/* Keyboard on port 0, together with a controller if there is one: a button
++ * counts from either, and a stick follows the controller while that is off
++ * centre. Keys are read only while a window of THIS process is in the
++ * foreground, so typing in another application does not drive the game. Set
++ * PAD_NO_KEYBOARD=1 to disable it entirely.
+  *
+- * The only backend here is XInput, so on a machine with no controller plugged
+- * in a title gets a pad that is reported present and never presses anything --
+- * it can be watched but not played. That is what The Simpsons Arcade Game hit:
+- * it reached its attract loop and no input existed to start a game.
++ * The layout is Re:Fine's (docs/inputs.md). F takes the d-pad and the face buttons
++ * as the same notes, and a double note as one of each, hence the two hands. A
++ * star is a flick of either stick in any direction (F's own Tutorial).
+  *
+- * Only fills in for port 0, only when XInput found nothing there, so a real
+- * controller always wins and nothing changes for a port that has one. Keys are
+- * read only while a window of THIS process is in the foreground, so typing in
+- * another application does not drive the game. Set PAD_NO_KEYBOARD=1 to
+- * disable it entirely.
+- *
+- * Arrows = d-pad, Z/X/A/S = cross/circle/square/triangle, Q/W = L1/R1,
+- * 1/2 = L2/R2, Enter = START, Tab = SELECT. The left stick mirrors the d-pad
+- * so a title that reads the stick instead is playable too. */
++ * PAD_KEYS="<sec>:<keys>:<ms>,..." and PAD_KEYCYCLE="<from>,<to>,<ms>,<keys>" act
++ * as those keys for automatic runs, window in the foreground or not. Keys are
++ * the letters of the table, in lower case for the arrows (u d l r), Enter (n),
++ * Backspace (b), Space (s) and Esc (e), '.' for none; PAD_KEYCYCLE moves to the next one
++ * every <ms> from second <from> to <to>. Off unless set, like PAD_SCRIPT. */
+ #ifdef _WIN32
+ static int pad_host_window_focused(void)
+ {
+@@ -279,51 +278,126 @@ static int pad_host_window_focused(void)
+     return pid == GetCurrentProcessId();
+ }
+ 
++#define PAD_KEY_EVENTS 512
++static struct { double from, to; char keys[12]; } s_key_ev[PAD_KEY_EVENTS];
++static int    s_key_ev_n;
++static double s_cycle_from, s_cycle_to, s_cycle_ms;
++static char   s_cycle_keys[16];
++static int    s_key_script = -1;
++static unsigned long long s_key_t0;
++
++static void pad_keys_parse(void)
++{
++    s_key_script = 0;
++    const char* e = getenv("PAD_KEYS");
++    if (e && *e) {
++        s_key_script = 1;
++        while (*e && s_key_ev_n < PAD_KEY_EVENTS) {
++            double t = 0, ms = 0; char k[12] = "";
++            int used = 0;
++            if (sscanf(e, "%lf:%11[^:]:%lf%n", &t, k, &ms, &used) != 3) break;
++            s_key_ev[s_key_ev_n].from = t;
++            s_key_ev[s_key_ev_n].to = t + ms / 1000.0;
++            memcpy(s_key_ev[s_key_ev_n].keys, k, sizeof k);
++            s_key_ev_n++;
++            e += used;
++            while (*e == ',' || *e == ' ') e++;
++        }
++        printf("[cellPad] PAD_KEYS: %d event(s)\n", s_key_ev_n);
++    }
++    e = getenv("PAD_KEYCYCLE");
++    if (e && sscanf(e, "%lf,%lf,%lf,%15s", &s_cycle_from, &s_cycle_to, &s_cycle_ms, s_cycle_keys) == 4)
++        s_key_script = 1;
++    s_key_t0 = GetTickCount64();
++}
++
++/* The letter a scripted run holds this instant. */
++static int pad_key_scripted(char c)
++{
++    const double now = (double)(GetTickCount64() - s_key_t0) / 1000.0;
++    for (int i = 0; i < s_key_ev_n; i++)
++        if (now >= s_key_ev[i].from && now < s_key_ev[i].to && strchr(s_key_ev[i].keys, c))
++            return 1;
++    if (s_cycle_ms > 0 && now >= s_cycle_from && now < s_cycle_to) {
++        const size_t n = strlen(s_cycle_keys);
++        const size_t k = (size_t)((now - s_cycle_from) * 1000.0 / s_cycle_ms) % n;
++        if (s_cycle_keys[k] == c) return 1;
++    }
++    return 0;
++}
++
++/* The last of the two pressed wins while both are down. */
++static u8 pad_key_axis(int neg, int pos, int* was_neg, int* was_pos, int* last)
++{
++    if (neg && !*was_neg) *last = -1;
++    if (pos && !*was_pos) *last = 1;
++    *was_neg = neg; *was_pos = pos;
++    const int v = (neg && pos) ? *last : neg ? -1 : pos ? 1 : 0;
++    return (u8)(v < 0 ? 0 : v > 0 ? 255 : 128);
++}
++
+ static void pad_poll_keyboard(void)
+ {
+     static int off = -1;
+     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+     if (off) return;
++    if (s_key_script < 0) pad_keys_parse();
+ 
+     PadHostState* hs = &s_host_state[0];
+-    if (!pad_host_window_focused()) {
++    const int focused = pad_host_window_focused();
++    const int has_pad = hs->connected;
++    if (!focused && !s_key_script) {
+         /* Release everything on focus loss, or a key held while alt-tabbing
+          * would stay down forever. */
+-        hs->buttons = 0;
+-        hs->analog_lx = hs->analog_ly = 128;
+-        hs->analog_rx = hs->analog_ry = 128;
+-        hs->connected = 1;
++        if (!has_pad) {
++            hs->buttons = 0;
++            hs->analog_lx = hs->analog_ly = 128;
++            hs->analog_rx = hs->analog_ry = 128;
++            hs->connected = 1;
++        }
+         return;
+     }
+ 
+-    static const struct { int vk; u16 btn; } map[] = {
+-        { VK_UP,     CELL_PAD_CTRL_UP },      { VK_DOWN,  CELL_PAD_CTRL_DOWN },
+-        { VK_LEFT,   CELL_PAD_CTRL_LEFT },    { VK_RIGHT, CELL_PAD_CTRL_RIGHT },
+-        { 'Z',       CELL_PAD_CTRL_CROSS },   { 'X',      CELL_PAD_CTRL_CIRCLE },
+-        { 'A',       CELL_PAD_CTRL_SQUARE },  { 'S',      CELL_PAD_CTRL_TRIANGLE },
+-        { 'Q',       CELL_PAD_CTRL_L1 },      { 'W',      CELL_PAD_CTRL_R1 },
+-        { '1',       CELL_PAD_CTRL_L2 },      { '2',      CELL_PAD_CTRL_R2 },
+-        { VK_RETURN, CELL_PAD_CTRL_START },   { VK_TAB,   CELL_PAD_CTRL_SELECT },
++    static const struct { int vk; u16 btn; char letter; } map[] = {
++        { 'W',       CELL_PAD_CTRL_TRIANGLE, 'W' }, { 'A',      CELL_PAD_CTRL_SQUARE, 'A' },
++        { 'S',       CELL_PAD_CTRL_CROSS,    'S' }, { 'D',      CELL_PAD_CTRL_CIRCLE, 'D' },
++        { 'I',       CELL_PAD_CTRL_UP,       'I' }, { 'J',      CELL_PAD_CTRL_LEFT,   'J' },
++        { 'K',       CELL_PAD_CTRL_DOWN,     'K' }, { 'L',      CELL_PAD_CTRL_RIGHT,  'L' },
++        { VK_UP,     CELL_PAD_CTRL_UP,       'u' }, { VK_DOWN,  CELL_PAD_CTRL_DOWN,   'd' },
++        { VK_LEFT,   CELL_PAD_CTRL_LEFT,     'l' }, { VK_RIGHT, CELL_PAD_CTRL_RIGHT,  'r' },
++        { VK_RETURN, CELL_PAD_CTRL_CROSS,    'n' }, { VK_BACK,  CELL_PAD_CTRL_CIRCLE, 'b' },
++        { VK_SPACE,  CELL_PAD_CTRL_START,    's' }, { VK_ESCAPE, CELL_PAD_CTRL_START, 'e' },
++        { VK_TAB,    CELL_PAD_CTRL_SELECT,   0 },
++        { '1',       CELL_PAD_CTRL_L1,       0 },   { '2',      CELL_PAD_CTRL_R1,     0 },
++        { '3',       CELL_PAD_CTRL_L2,       0 },   { '4',      CELL_PAD_CTRL_R2,     0 },
+     };
++#define PAD_KEY(vk, c) ((focused && (GetAsyncKeyState(vk) & 0x8000)) || \
++                        (s_key_script && (c) && pad_key_scripted(c)))
+ 
+     u16 btns = 0;
+     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+-        if (GetAsyncKeyState(map[i].vk) & 0x8000) btns |= map[i].btn;
++        if (PAD_KEY(map[i].vk, map[i].letter)) btns |= map[i].btn;
+ 
+-    hs->buttons   = btns;
+-    hs->connected = 1;
+-    hs->analog_lx = (u8)((btns & CELL_PAD_CTRL_LEFT) ? 0 :
+-                         (btns & CELL_PAD_CTRL_RIGHT) ? 255 : 128);
+-    hs->analog_ly = (u8)((btns & CELL_PAD_CTRL_UP) ? 0 :
+-                         (btns & CELL_PAD_CTRL_DOWN) ? 255 : 128);
+-    hs->analog_rx = hs->analog_ry = 128;
+-    hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
+-    hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
++    static int qn, qp, ql, un, up, ul;
++    const u8 lx = pad_key_axis(PAD_KEY('Q', 'Q'), PAD_KEY('E', 'E'), &qn, &qp, &ql);
++    const u8 rx = pad_key_axis(PAD_KEY('U', 'U'), PAD_KEY('O', 'O'), &un, &up, &ul);
+ 
+     { static int said = 0;
+-      if (!said && btns) { said = 1;
+-          printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
++      if (!said && (btns || lx != 128 || rx != 128)) { said = 1;
++          printf("[cellPad] keyboard active on port 0\n");
+           fflush(stdout); } }
++
++    const int near_centre = !has_pad || (hs->analog_lx > 100 && hs->analog_lx < 156 &&
++                                         hs->analog_ly > 100 && hs->analog_ly < 156);
++    const int near_centre_r = !has_pad || (hs->analog_rx > 100 && hs->analog_rx < 156 &&
++                                           hs->analog_ry > 100 && hs->analog_ry < 156);
++    hs->buttons = (u16)((has_pad ? hs->buttons : 0) | btns);
++    hs->connected = 1;
++    if (near_centre) { hs->analog_lx = lx; if (!has_pad) hs->analog_ly = 128; }
++    if (near_centre_r) { hs->analog_rx = rx; if (!has_pad) hs->analog_ry = 128; }
++    if (btns & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255; else if (!has_pad) hs->trigger_l2 = 0;
++    if (btns & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255; else if (!has_pad) hs->trigger_r2 = 0;
++#undef PAD_KEY
+ }
+ #endif
+ 
+@@ -713,7 +787,7 @@ static void pad_poll_backend(void)
+     pad_poll_sdl2();
+ #endif
+ #ifdef _WIN32
+-    if (!s_host_state[0].connected) pad_poll_keyboard();
++    pad_poll_keyboard();
+ #endif
+     pad_track_assign();
+     pad_unlock();
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 231553b01f3f3cde4976c94ee78e7a465d85b852..61167f3d2bf6b06e87888499fc7e60adab1ed704 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -805,10 +805,6 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     case WM_DESTROY:
+         PostQuitMessage(0);
+         return 0;
+-    case WM_KEYDOWN:
+-        if (wp == VK_ESCAPE)
+-            s_d3d.window_closed = 1;
+-        return 0;
+     }
+     return DefWindowProcA(hwnd, msg, wp, lp);
+ }

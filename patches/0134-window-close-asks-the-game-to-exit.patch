@@ -1,0 +1,50 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index b4b1f03..ce9c7c6 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -796,17 +796,16 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     switch (msg) {
+     case WM_CLOSE:
++        /* Re:Fine: a request, not the end. The title still has to finish its save and
++         * needs the RSX for that; the window goes with the process. */
+         s_d3d.window_closed = 1;
+-        DestroyWindow(hwnd);
+         return 0;
+     case WM_DESTROY:
+         PostQuitMessage(0);
+         return 0;
+     case WM_KEYDOWN:
+-        if (wp == VK_ESCAPE) {
++        if (wp == VK_ESCAPE)
+             s_d3d.window_closed = 1;
+-            DestroyWindow(hwnd);
+-        }
+         return 0;
+     }
+     return DefWindowProcA(hwnd, msg, wp, lp);
+diff --git a/libs/system/cellSysutil.c b/libs/system/cellSysutil.c
+index c4eb87d..5460a31 100644
+--- a/libs/system/cellSysutil.c
++++ b/libs/system/cellSysutil.c
+@@ -738,7 +738,8 @@ static void* host_quit_thread(void* unused)
+ {
+     (void)unused;
+     extern int ps3_savedata_busy(void);   /* cellSaveData.c */
+-    int grace = 3000;
++    /* Re:Fine: 20 s, not 3: the time limit for the title to leave by itself. */
++    int grace = 20000;
+     { const char* e = getenv("PS3_QUIT_GRACE_MS"); if (e && *e) grace = atoi(e); }
+     if (grace < 0) grace = 0;
+     int asked = 0;
+@@ -768,8 +769,8 @@ static void* host_quit_thread(void* unused)
+ #endif
+         waited += step;
+     }
+-    printf("[quit] the game did not exit on its own; ending it (save in flight: %s, waited %d ms) -> exit 0\n",
+-           ps3_savedata_busy() ? "yes, gave up" : "no", waited);
++    printf("[quit] WARNING: the game did not exit on its own in %d ms; ending it (save in flight: %s, waited %d ms) -> exit 0\n",
++           grace, ps3_savedata_busy() ? "yes, gave up, THE SAVE MAY BE INCOMPLETE" : "no", waited);
+     fflush(NULL);
+     exit(0);
+ #ifdef _WIN32

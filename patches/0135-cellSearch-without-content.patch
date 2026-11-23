@@ -1,0 +1,449 @@
+diff --git a/libs/system/cellSysutil.c b/libs/system/cellSysutil.c
+index 5460a31..4cd54ac 100644
+--- a/libs/system/cellSysutil.c
++++ b/libs/system/cellSysutil.c
+@@ -109,16 +109,18 @@ typedef struct GuestCompletion {
+     struct GuestCompletion* next;
+     u32 opd;
+     u64 args[8];
++    void (*before)(void);
+ } GuestCompletion;
+ static GuestCompletion* s_completion_head;
+ static GuestCompletion* s_completion_tail;
+ 
+-s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
++s32 cellSysutilQueueGuestCallbackBefore(u32 opd, const u64 args[8], void (*before)(void))
+ {
+     if (!opd) return CELL_OK;
+     GuestCompletion* item = malloc(sizeof(*item));
+     if (!item) return (s32)CELL_ENOMEM;
+     item->next = NULL; item->opd = opd; memcpy(item->args, args, sizeof(item->args));
++    item->before = before;
+     COMPLETION_LOCK();
+     if (s_completion_tail) s_completion_tail->next = item;
+     else s_completion_head = item;
+@@ -127,6 +129,11 @@ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
+     return CELL_OK;
+ }
+ 
++s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8])
++{
++    return cellSysutilQueueGuestCallbackBefore(opd, args, NULL);
++}
++
+ s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1)
+ {
+     const u64 args[8] = {arg0, arg1, 0, 0, 0, 0, 0, 0};
+@@ -144,6 +151,7 @@ static void drain_guest_completions(void)
+     COMPLETION_UNLOCK();
+     while (item) {
+         GuestCompletion* next = item->next;
++        if (item->before) item->before();
+         g_ps3_guest_caller(item->opd, item->args[0], item->args[1], item->args[2],
+             item->args[3], item->args[4], item->args[5], item->args[6], item->args[7]);
+         free(item);
+diff --git a/libs/system/cellSysutil.h b/libs/system/cellSysutil.h
+index 97a370a..606b5a5 100644
+--- a/libs/system/cellSysutil.h
++++ b/libs/system/cellSysutil.h
+@@ -114,6 +114,8 @@ s32 cellSysutilRegisterCallback(s32 slot, CellSysutilCallback func, void* userda
+ s32 cellSysutilUnregisterCallback(s32 slot);
+ s32 cellSysutilCheckCallback(void);
+ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
++/* As ...Args, with a host function run on the pumping thread just before the guest call. */
++s32 cellSysutilQueueGuestCallbackBefore(u32 opd, const u64 args[8], void (*before)(void));
+ s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
+ 
+ /* Internal HLE completion queue, delivered by the guest's next callback poll. */
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 82c6b1f..460c134 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -714,6 +714,7 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
+ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
+ extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
+ extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
++extern "C" void cellSearch_register_ctx_handlers(unsigned int (*guest_alloc)(unsigned int, unsigned int)); /* libs/system/cellSearch.c */
+ extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
+ static uint32_t g_net_errno_ea = 0;
+ static void hle_net_errno_loc(ppu_context* ctx)
+@@ -1049,6 +1050,7 @@ extern "C" void ppu_sysprx_register(void)
+      * (userdata) is on the guest stack, so they need the full context too.
+      * Registered here so no project has to remember the call. */
+     cellSaveData_register_ctx_handlers();
++    cellSearch_register_ctx_handlers(gcm_guest_alloc);
+     /* cellVideoOutSetGamma's float argument is in f1. */
+     avconf_register_ctx();
+     /* sys_net offline model (NIDs from PSL1GHT libnet exports). Covers every
+diff --git a/libs/system/cellSearch.c b/libs/system/cellSearch.c
+new file mode 100644
+index 0000000..3881332
+--- /dev/null
++++ b/libs/system/cellSearch.c
+@@ -0,0 +1,245 @@
++/*
++ * cellSearch: the system's content database, for a console that has no content.
++ *
++ * Project DIVA F opens it in Edit Play to list the user's music
++ * (cellSearchStartContentSearch MUSIC_ALL / IMPORTEDDATE / DESCENDING). There is
++ * no music database on the host, so every search finds 0 items: that is the
++ * truth here, and it is what RPCS3 answers with an empty /dev_hdd0/music. Return
++ * codes, their order and the state machine follow RPCS3's cellSearch.cpp
++ * (behaviour, no code copied). Every completion goes through the sysutil pump,
++ * and the state changes just before the title's callback runs.
++ *
++ * ctx handlers, so the NID table does not have to be regenerated.
++ */
++#include "cellSysutil.h"
++#include "../../runtime/ppu/ppu_context.h"
++#include "../../runtime/ppu/ppu_memory.h"
++#include <stdio.h>
++#include <string.h>
++
++#define CELL_SEARCH_ERROR_PARAM               ((s32)0x8002C801)
++#define CELL_SEARCH_ERROR_BUSY                ((s32)0x8002C802)
++#define CELL_SEARCH_ERROR_NO_MEMORY           ((s32)0x8002C803)
++#define CELL_SEARCH_ERROR_UNKNOWN_MODE        ((s32)0x8002C804)
++#define CELL_SEARCH_ERROR_ALREADY_INITIALIZED ((s32)0x8002C805)
++#define CELL_SEARCH_ERROR_NOT_INITIALIZED     ((s32)0x8002C806)
++#define CELL_SEARCH_ERROR_FINALIZING          ((s32)0x8002C807)
++#define CELL_SEARCH_ERROR_NOT_SUPPORTED_SEARCH ((s32)0x8002C808)
++#define CELL_SEARCH_ERROR_CONTENT_NOT_FOUND   ((s32)0x8002C80A)
++#define CELL_SEARCH_ERROR_OUT_OF_RANGE        ((s32)0x8002C80C)
++#define CELL_SEARCH_ERROR_INVALID_SEARCHID    ((s32)0x8002C80D)
++#define CELL_SEARCH_ERROR_GENERIC             ((s32)0x8002C8FF)
++
++#define EVENT_INITIALIZE_RESULT    1
++#define EVENT_FINALIZE_RESULT      2
++#define EVENT_CONTENTSEARCH_RESULT 5
++
++enum { TYPE_MUSIC_ALL = 1, TYPE_PHOTO_ALL = 2, TYPE_VIDEO_ALL = 3 };
++enum { KEY_NONE, KEY_DEFAULT, KEY_TITLE, KEY_ALBUMTITLE, KEY_GENRENAME, KEY_ARTISTNAME,
++       KEY_IMPORTEDDATE, KEY_TRACKNUMBER, KEY_TAKENDATE, KEY_USERDEFINED, KEY_MODIFIEDDATE };
++enum { ORDER_ASCENDING = 1, ORDER_DESCENDING = 2 };
++
++#define CONTENT_BUFFER_SIZE_MAX 2048
++#define CONTENT_ID_SIZE         16
++#define CONTENT_INFO_PATH_SIZE  128
++#define MAX_SEARCHES            1024
++
++enum { ST_NOT_INITIALIZED, ST_IDLE, ST_IN_PROGRESS, ST_INITIALIZING, ST_FINALIZING };
++
++static volatile int s_state = ST_NOT_INITIALIZED;
++static u32 s_func, s_userdata;
++static unsigned char s_live[MAX_SEARCHES];   /* search id - 1 */
++static unsigned int (*s_guest_alloc)(unsigned int, unsigned int);
++static u32 s_result_param;                   /* CellSearchResultParam, 8 bytes */
++
++static int state_get(void) { return __atomic_load_n(&s_state, __ATOMIC_ACQUIRE); }
++static void state_set(int v) { __atomic_store_n(&s_state, v, __ATOMIC_RELEASE); }
++static void become_idle(void) { state_set(ST_IDLE); }
++static void become_uninitialized(void) { state_set(ST_NOT_INITIALIZED); }
++
++static int state_cas(int from, int to, int* seen)
++{
++    *seen = from;
++    return __atomic_compare_exchange_n(&s_state, seen, to, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
++}
++
++/* What an operation that needs an idle library answers in each state. */
++static s32 not_idle_error(int state)
++{
++    switch (state) {
++    case ST_IDLE: return CELL_OK;
++    case ST_NOT_INITIALIZED:
++    case ST_INITIALIZING: return CELL_SEARCH_ERROR_NOT_INITIALIZED;
++    case ST_FINALIZING: return CELL_SEARCH_ERROR_FINALIZING;
++    case ST_IN_PROGRESS: return CELL_SEARCH_ERROR_BUSY;
++    default: return CELL_SEARCH_ERROR_GENERIC;
++    }
++}
++
++static s32 finalize_error(int state)
++{
++    switch (state) {
++    case ST_IDLE: return CELL_OK;
++    case ST_NOT_INITIALIZED: return CELL_SEARCH_ERROR_NOT_INITIALIZED;
++    case ST_FINALIZING: return CELL_SEARCH_ERROR_FINALIZING;
++    case ST_IN_PROGRESS:
++    case ST_INITIALIZING: return CELL_SEARCH_ERROR_BUSY;
++    default: return CELL_SEARCH_ERROR_GENERIC;
++    }
++}
++
++static void notify(u32 event, u32 param, void (*before)(void))
++{
++    /* func(event, result, param, userData) */
++    const u64 args[8] = { event, CELL_OK, param, s_userdata, 0, 0, 0, 0 };
++    cellSysutilQueueGuestCallbackBefore(s_func, args, before);
++}
++
++s32 cellSearchInitialize(u32 mode, u32 container, u32 func, u32 userData)
++{
++    (void)container;
++    if (mode != 0) return CELL_SEARCH_ERROR_UNKNOWN_MODE;
++    if (!func) return CELL_SEARCH_ERROR_PARAM;
++    int seen;
++    if (!state_cas(ST_NOT_INITIALIZED, ST_INITIALIZING, &seen)) {
++        if (seen == ST_INITIALIZING) return CELL_SEARCH_ERROR_BUSY;
++        if (seen == ST_FINALIZING) return CELL_SEARCH_ERROR_FINALIZING;
++        return CELL_SEARCH_ERROR_ALREADY_INITIALIZED;
++    }
++    s_func = func;
++    s_userdata = userData;
++    printf("[cellSearch] Initialize -> OK, callback queued\n");
++    notify(EVENT_INITIALIZE_RESULT, 0, become_idle);
++    return CELL_OK;
++}
++
++s32 cellSearchFinalize(void)
++{
++    int seen;
++    if (!state_cas(ST_IDLE, ST_FINALIZING, &seen))
++        return finalize_error(seen);
++    printf("[cellSearch] Finalize -> OK, callback queued\n");
++    notify(EVENT_FINALIZE_RESULT, 0, become_uninitialized);
++    return CELL_OK;
++}
++
++s32 cellSearchStartContentSearch(u32 type, u32 sortKey, u32 sortOrder, u32 outSearchId)
++{
++    if (!outSearchId) return CELL_SEARCH_ERROR_PARAM;
++    vm_write32(outSearchId, 0);
++
++    if (sortKey == KEY_NONE || sortKey > KEY_MODIFIEDDATE) return CELL_SEARCH_ERROR_PARAM;
++    if (sortOrder != ORDER_ASCENDING && sortOrder != ORDER_DESCENDING) return CELL_SEARCH_ERROR_PARAM;
++    if (type != TYPE_MUSIC_ALL && type != TYPE_PHOTO_ALL && type != TYPE_VIDEO_ALL)
++        return CELL_SEARCH_ERROR_PARAM;
++
++    int seen;
++    if (!state_cas(ST_IDLE, ST_IN_PROGRESS, &seen))
++        return not_idle_error(seen);
++
++    if (sortKey == KEY_DEFAULT)
++        sortKey = type == TYPE_MUSIC_ALL ? KEY_ARTISTNAME : type == TYPE_PHOTO_ALL ? KEY_TAKENDATE : KEY_TITLE;
++
++    s32 unsupported = 0;
++    if (sortKey != KEY_IMPORTEDDATE && sortKey != KEY_MODIFIEDDATE) {
++        switch (type) {
++        case TYPE_MUSIC_ALL:
++            unsupported = sortOrder != ORDER_ASCENDING ||
++                (sortKey != KEY_ARTISTNAME && sortKey != KEY_ALBUMTITLE &&
++                 sortKey != KEY_GENRENAME && sortKey != KEY_TITLE);
++            break;
++        case TYPE_PHOTO_ALL:
++            unsupported = sortKey != KEY_TAKENDATE &&
++                (sortOrder != ORDER_ASCENDING || sortKey != KEY_TITLE);
++            break;
++        default:
++            unsupported = sortOrder != ORDER_ASCENDING || sortKey != KEY_TITLE;
++            break;
++        }
++    }
++    /* RPCS3 stays in_progress here, and later calls answer BUSY. A title that
++     * retries with a supported sort would hang there; ours goes back to idle. */
++    if (unsupported) { state_set(ST_IDLE); return CELL_SEARCH_ERROR_NOT_SUPPORTED_SEARCH; }
++
++    if (!s_result_param && s_guest_alloc) s_result_param = s_guest_alloc(8, 8);
++    int slot = 0;
++    while (slot < MAX_SEARCHES && s_live[slot]) slot++;
++    if (!s_result_param || slot == MAX_SEARCHES) { state_set(ST_IDLE); return CELL_SEARCH_ERROR_NO_MEMORY; }
++    s_live[slot] = 1;
++
++    const u32 id = (u32)slot + 1;
++    vm_write32(outSearchId, id);
++    vm_write32(s_result_param, id);
++    vm_write32(s_result_param + 4, 0);   /* resultNum: no content on this system */
++    printf("[cellSearch] StartContentSearch(type=%u, sortKey=%u, sortOrder=%u) -> id %u, 0 results\n",
++           type, sortKey, sortOrder, id);
++    notify(EVENT_CONTENTSEARCH_RESULT, s_result_param, become_idle);
++    return CELL_OK;
++}
++
++s32 cellSearchGetContentInfoByOffset(u32 searchId, s32 offset, u32 infoBuffer, u32 outContentType, u32 outContentId)
++{
++    (void)offset;
++    if (outContentType) vm_write32(outContentType, 0);
++    if (infoBuffer) memset(vm_base + infoBuffer, 0, CONTENT_BUFFER_SIZE_MAX);
++    if (outContentId) {
++        memset(vm_base + outContentId, 0, 4);
++        memset(vm_base + outContentId + 4, 0xFF, CONTENT_ID_SIZE - 4);
++    }
++    if (searchId == 0 || searchId > MAX_SEARCHES || !s_live[searchId - 1])
++        return CELL_SEARCH_ERROR_INVALID_SEARCHID;
++    if (!outContentType || (!outContentId && !infoBuffer)) return CELL_SEARCH_ERROR_PARAM;
++    const s32 e = not_idle_error(state_get());
++    if (e) return e;
++    return CELL_SEARCH_ERROR_OUT_OF_RANGE;   /* every search has 0 items */
++}
++
++s32 cellSearchGetContentInfoPath(u32 contentId, u32 infoPath)
++{
++    if (infoPath) memset(vm_base + infoPath, 0, CONTENT_INFO_PATH_SIZE);
++    if (!contentId || !infoPath) return CELL_SEARCH_ERROR_PARAM;
++    const s32 e = not_idle_error(state_get());
++    if (e) return e;
++    return CELL_SEARCH_ERROR_CONTENT_NOT_FOUND;
++}
++
++/* Nothing to prepare: only content that a search found has a link to mount. */
++s32 cellSearchPrepareFile(u32 path)
++{
++    if (!path) return CELL_SEARCH_ERROR_PARAM;
++    return not_idle_error(state_get());
++}
++
++s32 cellSearchEnd(u32 searchId)
++{
++    if (!searchId) return CELL_SEARCH_ERROR_INVALID_SEARCHID;
++    const s32 e = finalize_error(state_get());
++    if (e) return e;
++    if (searchId > MAX_SEARCHES || !s_live[searchId - 1]) return CELL_SEARCH_ERROR_INVALID_SEARCHID;
++    s_live[searchId - 1] = 0;
++    return CELL_OK;
++}
++
++extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
++
++#define R(n) ((u32)ctx->gpr[n])
++#define RET(x) (ctx->gpr[3] = (u64)(s64)(x))
++static void hle_Initialize(ppu_context* ctx) { RET(cellSearchInitialize(R(3), R(4), R(5), R(6))); }
++static void hle_Finalize(ppu_context* ctx) { RET(cellSearchFinalize()); }
++static void hle_StartContentSearch(ppu_context* ctx) { RET(cellSearchStartContentSearch(R(3), R(4), R(5), R(6))); }
++static void hle_GetContentInfoByOffset(ppu_context* ctx) { RET(cellSearchGetContentInfoByOffset(R(3), (s32)R(4), R(5), R(6), R(7))); }
++static void hle_GetContentInfoPath(ppu_context* ctx) { RET(cellSearchGetContentInfoPath(R(3), R(4))); }
++static void hle_PrepareFile(ppu_context* ctx) { RET(cellSearchPrepareFile(R(3))); }
++static void hle_End(ppu_context* ctx) { RET(cellSearchEnd(R(3))); }
++
++void cellSearch_register_ctx_handlers(unsigned int (*guest_alloc)(unsigned int, unsigned int))
++{
++    s_guest_alloc = guest_alloc;
++    ps3_hle_register_ctx(0xC81CCF8Au, "cellSearchInitialize", hle_Initialize);
++    ps3_hle_register_ctx(0xBFAB7616u, "cellSearchFinalize", hle_Finalize);
++    ps3_hle_register_ctx(0x0591826Fu, "cellSearchStartContentSearch", hle_StartContentSearch);
++    ps3_hle_register_ctx(0x3B210319u, "cellSearchGetContentInfoByOffset", hle_GetContentInfoByOffset);
++    ps3_hle_register_ctx(0xFFB28491u, "cellSearchGetContentInfoPath", hle_GetContentInfoPath);
++    ps3_hle_register_ctx(0xE73CB0D2u, "cellSearchPrepareFile", hle_PrepareFile);
++    ps3_hle_register_ctx(0x774033D6u, "cellSearchEnd", hle_End);
++}
+diff --git a/libs/system/tests/test_cellSearch.c b/libs/system/tests/test_cellSearch.c
+new file mode 100644
+index 0000000..3a3981f
+--- /dev/null
++++ b/libs/system/tests/test_cellSearch.c
+@@ -0,0 +1,115 @@
++/* clang-cl /O1 -w -Iinclude -Ilibs/system libs/system/tests/test_cellSearch.c libs/system/cellSearch.c \
++ *     /link /force:unresolved /out:test_cellSearch.exe
++ *
++ * cellSearch without content, with RPCS3's return codes and order. The sysutil queue is a
++ * fake: a callback runs when the test "pumps", and its host hook first, as in cellSysutil.c. */
++#include "../cellSysutil.h"
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++uint8_t* vm_base;
++uint32_t ppu_vm_size = 0x100000;
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++void ps3_hle_register_ctx(uint32_t nid, const char* name, void* fn) { (void)nid; (void)name; (void)fn; }
++
++extern s32 cellSearchInitialize(u32, u32, u32, u32);
++extern s32 cellSearchFinalize(void);
++extern s32 cellSearchStartContentSearch(u32, u32, u32, u32);
++extern s32 cellSearchGetContentInfoByOffset(u32, s32, u32, u32, u32);
++extern s32 cellSearchGetContentInfoPath(u32, u32);
++extern s32 cellSearchPrepareFile(u32);
++extern s32 cellSearchEnd(u32);
++extern void cellSearch_register_ctx_handlers(unsigned int (*)(unsigned int, unsigned int));
++
++static struct { u32 opd; u64 a[8]; void (*before)(void); } q[8];
++static int qn;
++s32 cellSysutilQueueGuestCallbackBefore(u32 opd, const u64 args[8], void (*before)(void))
++{
++    q[qn].opd = opd; memcpy(q[qn].a, args, 64); q[qn].before = before; qn++;
++    return CELL_OK;
++}
++
++static u32 last_event, last_result, last_param, last_user;
++static void pump(void)
++{
++    for (int i = 0; i < qn; i++) {
++        if (q[i].before) q[i].before();
++        last_event = (u32)q[i].a[0]; last_result = (u32)q[i].a[1];
++        last_param = (u32)q[i].a[2]; last_user = (u32)q[i].a[3];
++    }
++    qn = 0;
++}
++
++static u32 rd32(u32 a) { uint8_t* p = vm_base + a; return (u32)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
++static unsigned int alloc(unsigned int size, unsigned int align) { (void)size; (void)align; return 0x8000; }
++
++static int failed;
++#define CHECK(expr, want) do { s32 got_ = (s32)(expr); if (got_ != (s32)(want)) { \
++    printf("[FAIL] line %d: %s = 0x%08X, expected 0x%08X\n", __LINE__, #expr, (u32)got_, (u32)(want)); failed++; } } while (0)
++
++int main(void)
++{
++    vm_base = calloc(1, ppu_vm_size);
++    cellSearch_register_ctx_handlers(alloc);
++    const u32 OPD = 0x1000, USER = 0x2000, ID = 0x3000, TYPE = 0x3010, CID = 0x3020, INFO = 0x4000;
++
++    CHECK(cellSearchStartContentSearch(1, 6, 2, ID), 0x8002C806);
++    CHECK(cellSearchFinalize(), 0x8002C806);
++    CHECK(cellSearchInitialize(1, 0, OPD, USER), 0x8002C804);
++    CHECK(cellSearchInitialize(0, 0, 0, USER), 0x8002C801);
++
++    CHECK(cellSearchInitialize(0, 0xFFFFFFFF, OPD, USER), CELL_OK);
++    CHECK(cellSearchInitialize(0, 0xFFFFFFFF, OPD, USER), 0x8002C802);
++    CHECK(cellSearchFinalize(), 0x8002C802);
++    CHECK(cellSearchStartContentSearch(1, 6, 2, ID), 0x8002C806);
++    pump();
++    CHECK(last_event, 1); CHECK(last_result, CELL_OK); CHECK(last_param, 0); CHECK(last_user, USER);
++    CHECK(cellSearchInitialize(0, 0, OPD, USER), 0x8002C805);
++
++    /* what F asks for */
++    CHECK(cellSearchStartContentSearch(0, 6, 2, ID), 0x8002C801);
++    CHECK(cellSearchStartContentSearch(1, 0, 2, ID), 0x8002C801);
++    CHECK(cellSearchStartContentSearch(1, 2, 2, ID), 0x8002C808);
++    CHECK(cellSearchStartContentSearch(1, 6, 2, 0), 0x8002C801);
++    CHECK(cellSearchStartContentSearch(1, 6, 2, ID), CELL_OK);
++    CHECK(rd32(ID), 1);
++    CHECK(cellSearchStartContentSearch(1, 6, 2, ID), 0x8002C802);
++    pump();
++    CHECK(last_event, 5); CHECK(last_result, CELL_OK);
++    CHECK(rd32(last_param), 1); CHECK(rd32(last_param + 4), 0);
++
++    memset(vm_base + INFO, 0xAB, 2048);
++    CHECK(cellSearchGetContentInfoByOffset(9, 0, INFO, TYPE, CID), 0x8002C80D);
++    CHECK(vm_base[INFO + 2047], 0);
++    CHECK(rd32(CID), 0); CHECK(rd32(CID + 4), 0xFFFFFFFF);
++    CHECK(cellSearchGetContentInfoByOffset(1, 0, INFO, 0, CID), 0x8002C801);
++    CHECK(cellSearchGetContentInfoByOffset(1, 0, INFO, TYPE, CID), 0x8002C80C);
++    CHECK(cellSearchGetContentInfoPath(0, INFO), 0x8002C801);
++    CHECK(cellSearchGetContentInfoPath(CID, INFO), 0x8002C80A);
++    CHECK(cellSearchPrepareFile(0), 0x8002C801);
++    CHECK(cellSearchPrepareFile(INFO), CELL_OK);
++
++    CHECK(cellSearchEnd(0), 0x8002C80D);
++    CHECK(cellSearchEnd(2), 0x8002C80D);
++    CHECK(cellSearchEnd(1), CELL_OK);
++    CHECK(cellSearchEnd(1), 0x8002C80D);
++
++    CHECK(cellSearchFinalize(), CELL_OK);
++    CHECK(cellSearchFinalize(), 0x8002C807);
++    CHECK(cellSearchInitialize(0, 0, OPD, USER), 0x8002C807);
++    pump();
++    CHECK(last_event, 2); CHECK(last_result, CELL_OK);
++    CHECK(cellSearchFinalize(), 0x8002C806);
++    CHECK(cellSearchInitialize(0, 0, OPD, USER), CELL_OK);
++
++    printf("[cellSearch] %s (%d failed)\n", failed ? "FAIL" : "PASS", failed);
++    return failed != 0;
++}

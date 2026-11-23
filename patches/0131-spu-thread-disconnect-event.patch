@@ -1,0 +1,167 @@
+diff --git a/runtime/spu/tests/test_spu_disconnect_event.c b/runtime/spu/tests/test_spu_disconnect_event.c
+new file mode 100644
+index 0000000..71cdca7
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_disconnect_event.c
+@@ -0,0 +1,107 @@
++/* sys_spu_thread_disconnect_event undoes one sys_spu_thread_connect_event, with RPCS3's checks in RPCS3's order.
++ *
++ * clang-cl /O1 -w -I include -I runtime -I runtime/syscalls -I runtime/spu -I libs/video
++ *   runtime/spu/tests/test_spu_disconnect_event.c /link /force:unresolved
++ * (only the handlers below run; the rest of lv2_register.c stays unreferenced at run time)
++ */
++#include <stdint.h>
++int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; return 0; }
++#include "../../syscalls/lv2_register.c"
++#include <assert.h>
++#include <stdio.h>
++
++uint8_t* vm_base;
++uint32_t ppu_vm_size;
++uint32_t spurs_port_queue(uint32_t port) { (void)port; return 0; }
++int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
++
++/* What the delivery pushes at the queue, recorded instead of sent. */
++static uint32_t pushed_queue;
++static int pushes;
++int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source, uint64_t d1, uint64_t d2, uint64_t d3)
++{
++    (void)source; (void)d1; (void)d2; (void)d3;
++    pushed_queue = queue_id; pushes++;
++    return 0;
++}
++
++static int fails;
++#define CHECK(c, ...) do { if (!(c)) { printf("FAIL: "); printf(__VA_ARGS__); printf("\n"); fails++; } } while (0)
++
++static spu_thread_t* thr;
++static spu_context   spu;
++
++static void connect(uint32_t queue, uint32_t port)
++{
++    ppu_context c = {0};
++    c.gpr[3] = thr->tid; c.gpr[4] = queue; c.gpr[5] = 1; c.gpr[6] = port;
++    assert(sys_spu_thread_connect_event_handler(&c) == 0);
++}
++
++static uint32_t disconnect(uint32_t tid, uint32_t et, uint32_t port)
++{
++    ppu_context c = {0};
++    c.gpr[3] = tid; c.gpr[4] = et; c.gpr[5] = port;
++    const int64_t rc = sys_spu_thread_disconnect_event_handler(&c);
++    CHECK((uint32_t)c.gpr[3] == (uint32_t)rc && (int64_t)c.gpr[3] == rc, "r3 0x%llX and the return differ", c.gpr[3]);
++    return (uint32_t)rc;
++}
++
++/* One send_event on `port`; returns the SPU's answer. */
++static uint32_t send_event(uint32_t port)
++{
++    spu_channel_write(&spu.ch_out_mbox, 0xBEEFu);
++    assert(spu_deliver_user_event(&spu, (port << 24) | 0x000001u) == 1);
++    return spu_channel_read(&spu.ch_in_mbox);
++}
++
++int main(void)
++{
++    vm_base = calloc(1, 1u << 20); assert(vm_base);
++    ppu_vm_size = 1u << 20;
++    spu_group_t* grp = spu_alloc_group(); thr = spu_alloc_thread();
++    assert(grp && thr);
++    grp->thread_indices[0] = (uint32_t)(thr - s_spu_threads); grp->num_threads = 1;
++    memset(&spu, 0, sizeof spu);
++    spu.spu_group_id = grp->id; spu.spu_id = thr->tid;
++    uint32_t r;
++
++    /* The errors, each with the check before it passing. */
++    r = disconnect(0x7FFFFF, 2, 99);
++    CHECK(r == CELL_ESRCH, "no such thread comes first: 0x%08X", r);
++    r = disconnect(thr->tid, 2, 58);
++    CHECK(r == CELL_EINVAL, "et other than user: 0x%08X", r);
++    r = disconnect(thr->tid, 1, 64);
++    CHECK(r == CELL_EINVAL, "spup above 63: 0x%08X", r);
++    r = disconnect(thr->tid, 1, 58);
++    CHECK(r == CELL_ENOTCONN, "a port nothing is connected to: 0x%08X", r);
++
++    /* F's port, with a second one beside it. */
++    connect(0x77, 58);
++    connect(0x88, 5);
++    CHECK(send_event(58) == CELL_OK && pushed_queue == 0x77, "port 58 before the disconnect");
++    r = disconnect(thr->tid, 1, 58);
++    CHECK(r == CELL_OK, "disconnect of a connected port: 0x%08X", r);
++    pushes = 0;
++    r = send_event(58);
++    CHECK(r == CELL_ENOTCONN && pushes == 0, "port 58 after the disconnect: 0x%08X, %d pushes", r, pushes);
++    r = disconnect(thr->tid, 1, 58);
++    CHECK(r == CELL_ENOTCONN, "a second disconnect: 0x%08X", r);
++    r = send_event(5);
++    CHECK(r == CELL_OK && pushed_queue == 0x88, "the other port is untouched: 0x%08X, queue 0x%X", r, pushed_queue);
++    CHECK(thr->connected_queue == 0x88 && thr->connect_spup == 5,
++          "the default binding left with its port: queue 0x%X spup %u", thr->connected_queue, thr->connect_spup);
++
++    connect(0x99, 58);
++    r = send_event(58);
++    CHECK(r == CELL_OK && pushed_queue == 0x99, "connect again on the same port: 0x%08X, queue 0x%X", r, pushed_queue);
++
++    r = disconnect(thr->tid, 1, 5); CHECK(r == CELL_OK, "port 5: 0x%08X", r);
++    r = disconnect(thr->tid, 1, 58); CHECK(r == CELL_OK, "port 58 again: 0x%08X", r);
++    CHECK(thr->evt_bind_n == 0 && thr->connected_queue == 0 && thr->connect_spup == 0,
++          "nothing left: %d bindings, default queue 0x%X", thr->evt_bind_n, thr->connected_queue);
++
++    printf("[spu_disconnect_event] %s (%d failed)\n", fails ? "FAIL" : "PASS", fails);
++    free(vm_base);
++    return fails ? 1 : 0;
++}
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 65806ae..24e7161 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1780,6 +1780,40 @@ static int64_t sys_spu_thread_connect_event_handler(ppu_context* ctx)
+     return 0;
+ }
+ 
++/* sys_spu_thread_disconnect_event(thread_id, et, spup) undoes one connect_event. The checks and their order are
++ * RPCS3's (sys_spu.cpp, oracle, no code copied): ESRCH without the thread, so a title that destroyed its group
++ * first gets that, then EINVAL for anything but a user-event port, then ENOTCONN for a port nothing is connected
++ * to. This used to be sys_spu_thread_stub, which answered CELL_OK and left the port bound. */
++static int64_t sys_spu_thread_disconnect_event_handler(ppu_context* ctx)
++{
++    uint32_t tid  = (uint32_t)ctx->gpr[3];
++    uint32_t et   = (uint32_t)ctx->gpr[4];
++    uint32_t spup = (uint32_t)ctx->gpr[5];
++    spu_thread_t* t = spu_find_thread(tid);
++    uint32_t result = CELL_OK;
++    if (!t) result = CELL_ESRCH;
++    else if (et != 1 /* SYS_SPU_THREAD_EVENT_USER */ || spup > 63) result = CELL_EINVAL;
++    else {
++        result = CELL_ENOTCONN;
++        AcquireSRWLockExclusive(&s_spu_port_lock);
++        for (int i = 0; i < t->evt_bind_n; i++)
++            if (t->evt_bind[i].spup == spup) {
++                t->evt_bind[i] = t->evt_bind[--t->evt_bind_n];
++                result = CELL_OK;
++                break;
++            }
++        /* The default binding of connect_event must not outlive its port. */
++        if (result == CELL_OK && t->connect_spup == spup) {
++            t->connected_queue = t->evt_bind_n ? t->evt_bind[0].queue : 0;
++            t->connect_spup    = t->evt_bind_n ? t->evt_bind[0].spup  : 0;
++        }
++        ReleaseSRWLockExclusive(&s_spu_port_lock);
++    }
++    fprintf(stderr, "[SPU] thread_disconnect_event tid=0x%X et=0x%X spup=0x%X -> 0x%X\n", tid, et, spup, result);
++    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
++    return (int64_t)(int32_t)result;
++}
++
+ /* sys_spu_thread_bind_queue(thread_id, spuq, spuq_num) / unbind_queue
+  * (thread_id, spuq_num). Unregistered before, so the call failed and an SPU
+  * thread's receive_event had no queue to read: Demon's Souls' MO synth SPU
+@@ -2656,7 +2690,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
+       g_spu_out_mbox_hook = ydkj_spu_out_mbox_deliver; }
+     { extern int (*g_spu_user_event_hook)(spu_context*, uint32_t);
+       g_spu_user_event_hook = spu_deliver_user_event; }
+-    lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_stub);
++    lv2_syscall_register(tbl, SYS_SPU_THREAD_DISCONNECT_EVENT,sys_spu_thread_disconnect_event_handler);
+     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT, sys_spu_thread_group_connect_event_handler);
+     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT, sys_spu_thread_group_disconnect_event_handler);
+     lv2_syscall_register(tbl, SYS_SPU_THREAD_WRITE_LS,        sys_spu_thread_write_ls_handler);

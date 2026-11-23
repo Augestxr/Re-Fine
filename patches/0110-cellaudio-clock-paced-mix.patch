@@ -1,0 +1,122 @@
+Re:Fine 0110: el hilo de mezcla de cellAudio entrega un bloque cada 5,33 ms por reloj, con el
+dispositivo WASAPI como cola. Antes mezclaba en rafagas de ~2 bloques cada 10 ms (periodo del
+dispositivo) y F dejaba un bloque de cada dos en silencio. Evidencia en docs/STATUS.md (4f.2).
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index cde5319905dd8bdda0f02107593703920db2e6bb..a8bb90594758e2fb53a2d9bd28d22e393c58cc50 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -56,6 +56,11 @@ extern uint32_t sys_event_queue_create_direct(uint64_t key, int32_t size);
+   #include <audioclient.h>
+   #include <process.h>
+ 
++  /* Re:Fine patches/0110: frames kept queued on the device, and the band the
++   * mixing thread steers it into. 30 ms: one device period (10 ms) and margin. */
++  #define AUDIO_QUEUE_TARGET 1440u
++  #define AUDIO_QUEUE_LOW     960u
++  #define AUDIO_QUEUE_HIGH   1920u
+   /* Define WASAPI COM GUIDs (avoids needing uuid.lib linkage for these) */
+   #ifdef __cplusplus
+     #define GUID_SECT
+@@ -351,6 +356,13 @@ static int audio_backend_init(void)
+         return -1;
+     }
+ 
++    /* Re:Fine patches/0110: start with AUDIO_QUEUE_TARGET frames of silence queued.
++     * The mixing thread adds blocks at the rate the device takes them, so this is
++     * the cushion that outlasts the device's 10 ms period. */
++    { BYTE* pre = NULL;
++      if (SUCCEEDED(s_wasapi_render->lpVtbl->GetBuffer(s_wasapi_render, AUDIO_QUEUE_TARGET, &pre)))
++          s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, AUDIO_QUEUE_TARGET, AUDCLNT_BUFFERFLAGS_SILENT); }
++
+     s_wasapi_client->lpVtbl->Start(s_wasapi_client);
+     return 0;
+ }
+@@ -593,34 +605,55 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+       if (set_mm && !set_mm(L"Pro Audio", &task))
+           fprintf(stderr, "[cellAudio] MMCSS Pro Audio unavailable (%lu)%c", (unsigned long)GetLastError(), 10); }
+ 
+-    /* Pace to the device clock. The PS3 consumes one block every 5.33 ms;
+-     * the old Sleep(2)/Sleep(5) loop keyed on a queue depth the 1056-frame
+-     * WASAPI buffer can never reach, so it mixed ~225 blocks/s and the device
+-     * dropped the surplus: 20% of the audio thrown away, and a guest mixer
+-     * (GH3's FMOD) that could not keep ahead of the read index played gaps.
+-     * With no device, pace on the performance counter instead. */
++    /* Re:Fine patches/0110: one block every 5.33 ms by the clock, as the PS3's audio
++     * heartbeat does and as RPCS3 does (cell_audio_thread::operator(): period_end
++     * = m_counter * audio_block_period + m_start_time), with the device as a queue
++     * behind it. This loop used to mix whenever the device had room. The device
++     * makes room 10 ms at a time, so about two blocks went out back to back, and
++     * the title, which writes one block per MIX event, had no time to fill the
++     * second: Project DIVA F played one block in two silent (46 %, the 1 - 100/187.5
++     * of 100 wake-ups for 187.5 blocks a second), and the late block landed in a
++     * slot already read. The device clock still rules in the long run: the schedule
++     * slips when the device is full, and leans a little while the queue is outside
++     * its band. */
+     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
++    const long long period = qf.QuadPart * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE;
++    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
++    if (!timer) fprintf(stderr, "[cellAudio] no high-resolution timer (%lu); using Sleep%c", (unsigned long)GetLastError(), 10);
+     unsigned long long blocks = 0;
++    int q_min = 0x7FFFFFFF, q_max = 0;
+     while (s_mix_thread_running) {
++        LARGE_INTEGER now; QueryPerformanceCounter(&now);
++        const long long due = q0.QuadPart +
++            (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
++        if (now.QuadPart < due) {
++            const long long us = (due - now.QuadPart) * 1000000 / qf.QuadPart;
++            if (timer) {
++                LARGE_INTEGER t; t.QuadPart = -(us * 10 > 0 ? us * 10 : 1);
++                SetWaitableTimer(timer, &t, 0, NULL, NULL, FALSE);
++                WaitForSingleObject(timer, 10);
++            } else {
++                Sleep(1);
++            }
++            continue;
++        }
++        /* More than 50 ms behind (device just went away, a debugger stop): drop
++         * the backlog instead of mixing it in a burst. */
++        if (now.QuadPart - due > qf.QuadPart / 20) q0.QuadPart += now.QuadPart - due;
+         const int room = audio_backend_room();
+-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
+ #if AUDIO_BACKEND_WASAPI
+-        /* Device queue under half a block: it is about to play silence (an
+-         * audible click/stutter). AUDIO_RATE reports how often. */
+-        if (room >= 0 && blocks > 64 &&
+-            (UINT32)room + CELL_AUDIO_BLOCK_SAMPLES / 2 >= s_wasapi_buf_frames) g_audio_underruns++;
+-#endif
+-        if (room < 0) {
+-            LARGE_INTEGER now; QueryPerformanceCounter(&now);
+-            const long long due = q0.QuadPart +
+-                (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
+-            if (now.QuadPart < due) { Sleep(1); continue; }
+-            /* More than 50 ms behind (device just went away, a debugger
+-             * stop): drop the backlog instead of mixing it in a burst. */
+-            if (now.QuadPart - due > qf.QuadPart / 20)
+-                q0.QuadPart = now.QuadPart -
+-                    (long long)(blocks * CELL_AUDIO_BLOCK_SAMPLES * qf.QuadPart / CELL_AUDIO_SAMPLE_RATE);
++        if (room >= 0) {
++            if (room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
++            const int queued = (int)s_wasapi_buf_frames - room;
++            if (queued < q_min) q_min = queued;
++            if (queued > q_max) q_max = queued;
++            /* Device queue under half a block: it is about to play silence (an
++             * audible click/stutter). AUDIO_RATE reports how often. */
++            if (blocks > 64 && queued <= CELL_AUDIO_BLOCK_SAMPLES / 2) g_audio_underruns++;
++            if (queued < (int)AUDIO_QUEUE_LOW)  q0.QuadPart -= period / 64;
++            if (queued > (int)AUDIO_QUEUE_HIGH) q0.QuadPart += period / 64;
+         }
++#endif
+         blocks++;
+         /* Mix and submit one block */
+         audio_mix_one_block();
+@@ -653,6 +686,9 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+ #else
+                         0u, 10);
+ #endif
++                fprintf(stderr, "[audio-queue] device queue frames: min=%d max=%d (target %u)%c",
++                        q_min, q_max, 1440u, 10);
++                q_min = 0x7FFFFFFF; q_max = 0;
+                 n = z = 0; d0 = g_audio_dropped; u0 = g_audio_underruns; t0 = now; } } }
+ 
+         /* Notify event queues */

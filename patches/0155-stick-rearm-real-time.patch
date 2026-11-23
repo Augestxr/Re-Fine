@@ -1,0 +1,51 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -827,17 +827,31 @@ static const char* pad_sdl3_label(SDL_Gamepad* gp, SDL_GamepadButton b)
+  * would take that as another flick. A pad that reports slowly can jump to that side
+  * without a sample near the centre, so turning back past it counts as coming back.
+  * Outside, the value goes through as it is, so a soft flick reaches F as strong as it
+- * was. The radius is taken 500 times a second, finer than F's 30 reads a second. */
++ * was. The radius is taken 500 times a second, finer than F's 30 reads a second.
++ * F takes a stick as centred only on two reads in a row (0x379C4), 33 ms at 30 fps but 8 ms
++ * at 120, and a shorter dip does not re-arm a flick. So over 30 fps the same rule goes by
++ * real time here: after coming back, the last value stays until the stick has been under
++ * the dead zone for stick_rearm_ms (34 by default over 30 fps, 0 at 30). */
+ static float s_stick_dz = -1.0f, s_stick_hy;
+-typedef struct { int out, x, y; } PadStick;
++static Uint64 s_stick_rearm_ms;
++typedef struct { int out, x, y, wait; Uint64 since; u8 lx, ly; } PadStick;
+ 
+ static void pad_sdl3_stick(PadStick* st, int x, int y, u8* ox, u8* oy)
+ {
+     const float r = SDL_sqrtf((float)x * x + (float)y * y) / 32767.0f;
+-    if (st->out && (r < s_stick_dz || (long long)x * st->x + (long long)y * st->y < 0)) st->out = 0;
+-    else if (!st->out && r >= s_stick_dz + s_stick_hy) { st->out = 1; st->x = x; st->y = y; }
++    const Uint64 now = SDL_GetTicks();
++    if (st->out && (r < s_stick_dz || (long long)x * st->x + (long long)y * st->y < 0)) {
++        st->out = 0; st->wait = s_stick_rearm_ms != 0; st->since = 0;
++    } else if (!st->out && !st->wait && r >= s_stick_dz + s_stick_hy) { st->out = 1; st->x = x; st->y = y; }
++    if (st->wait) {
++        if (r >= s_stick_dz) st->since = 0;
++        else if (!st->since) st->since = now;
++        if (st->since && now - st->since >= s_stick_rearm_ms) st->wait = 0;
++    }
++    if (st->wait) { *ox = st->lx; *oy = st->ly; return; }
+     *ox = st->out ? pad_sdl3_axis(x) : 128;
+     *oy = st->out ? pad_sdl3_axis(y) : 128;
++    st->lx = *ox; st->ly = *oy;
+ }
+ 
+ /* One pad into a state; the rest of the struct is a release. */
+@@ -1059,7 +1073,10 @@ static int SDLCALL pad_sdl3_main(void* unused)
+       const char* hy = getenv("REFINE_STICK_HYSTERESIS");    /* refine.ini: stick_hysteresis */
+       s_stick_dz = dz ? (float)atof(dz) : 0.20f;
+       s_stick_hy = hy ? (float)atof(hy) : 0.25f;
+-      fprintf(stderr, "[cellPad] stick dead zone %.2f, leaves the centre at %.2f%c", s_stick_dz, s_stick_dz + s_stick_hy, 10); }
++      const char* rm = getenv("REFINE_STICK_REARM_MS");    /* refine.ini: stick_rearm_ms */
++      const char* fp = getenv("REFINE_FPS_TARGET");
++      s_stick_rearm_ms = rm ? (Uint64)atoi(rm) : (fp && atoi(fp) > 30 ? 34 : 0);
++      fprintf(stderr, "[cellPad] stick dead zone %.2f, leaves the centre at %.2f, re-arms after %d ms%c", s_stick_dz, s_stick_dz + s_stick_hy, (int)s_stick_rearm_ms, 10); }
+     const Uint64 t0 = SDL_GetTicksNS();
+     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
+         fprintf(stderr, "[cellPad] SDL_Init failed: %s: no pads%c", SDL_GetError(), 10);

@@ -1,0 +1,17 @@
+diff --git a/libs/system/cellGame.c b/libs/system/cellGame.c
+--- a/libs/system/cellGame.c
++++ b/libs/system/cellGame.c
+@@ -291,6 +291,13 @@ static int sfo_read_string(const char* sfo_path, const char* key,
+     return ret;
+ }
+ 
++/* Re:Fine 0194: the same reader for another game's PARAM.SFO (the start screen's game choice, plan 6h S1:
++ * it tells a Project DIVA F 2nd disc folder by its TITLE_ID). 0 on success. */
++int cellGame_sfo_string(const char* sfo_path, const char* key, char* out, int out_size)
++{
++    return sfo_read_string(sfo_path, key, out, out_size);
++}
++
+ /* Read title/version fields from the game's PARAM.SFO at boot. Call once
+  * from main.cpp before the guest runs. Falls back to the defaults if the SFO
+  * can't be read (keeps the game working without it). */

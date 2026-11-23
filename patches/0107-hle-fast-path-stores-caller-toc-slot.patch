@@ -1,0 +1,32 @@
+Re:Fine 0107: la via rapida de imports hoja tambien escribe la TOC del llamador en sp+0x28.
+
+Upstream 9a3fbffd ("ppu_hle: a fast path for leaf imports; lwmutex lock/unlock use it",
+v0.18.0) vuelve de ps3_hle_call antes de crear _TocGuard. Ese guard hace
+    ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc); ...
+y la via rapida solo hacia
+    if (const hle_fast_fn f = hle_fast(nid))
+        if (f(ctx)) return;
+Los stubs de import traducidos son solo ps3_hle_call(nid), asi que el `std r2,40(r1)` del
+stub original no corre y el hueco solo lo escribia el guard. F hace `ld r2,0x28(r1)` tras
+cada import (func_006D8900 -> func_009CAFA8): r2 = 0 y caida en el CRT antes de main.
+Informe para upstream en docs/upstream.md.
+
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 0d6c86b846949ea9c12acdc232136af7bd38e394..921271ef3606a8bba4ca7e3d4c31531f2df5042b 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -254,8 +254,13 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
+ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+ {
++    /* Re:Fine patches/0107: _TocGuard below also stores the caller's TOC in its
++     * reserved stack doubleword. A lifted import stub is only ps3_hle_call(nid), so
++     * the stub's `std r2,40(r1)` never ran, and the caller's `ld r2,40(r1)` after
++     * the import reads that slot. The fast path must store it too, or a caller that
++     * never wrote the slot comes back with r2 = 0. A fast form leaves r2 alone. */
+     if (const hle_fast_fn f = hle_fast(nid))
+-        if (f(ctx)) return;
++        if (f(ctx)) { vm_write64(ctx->gpr[1] + 0x28, ctx->gpr[2]); return; }
+ 
+     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
+      * call it makes. WAITBT_EVERY only samples threads that are blocking on an

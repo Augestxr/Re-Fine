@@ -1,0 +1,75 @@
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -41,6 +41,7 @@
+ #include "rsx_texture_layout.h"
+ #include "rsx_vk_exec.h"
+ #include "port_overlay.h"   /* g_port_overlay_active (0186) */
++#include "../system/sysui.h"   /* the save list and the save dialogs (0195) */
+ 
+ #define FRAMES     2
+ #define MAX_IMAGES 8
+@@ -1751,9 +1752,52 @@ static void vk_ui_ring(uint32_t f)   /* this frame's ring from its start, once a
+ }
+ 
+ /* in_color: the image is already a colour attachment (the present shader drew it), else in TRANSFER_DST. */
++/* Re:Fine 0195: the system's own screens (sysui.c: the save list, "Load this data?", the other cellSaveData and
++ * cellMsgDialog screens) on the image about to be presented, as the D3D12 backend does in sysui_present. Until
++ * this patch only D3D12 drew them, so with Vulkan (the default since 2026-11-12) LOAD GAME showed nothing and the
++ * pad still answered the invisible list (work/run/ld60: "[sysui] list 'Load Save'" with no list on screen).
++ * sysui_draw gives BGRA with straight alpha and only when the screen changed; the overlay pipeline blends
++ * premultiplied RGBA, so the pixels are converted into one texture that stays until the next change. */
++static u32 s_sysui_tex;
++
++static void vk_sysui_draw(u32 w, u32 h)
++{
++    const void* px = NULL;
++    if (sysui_draw(w, h, &px) && px) {
++        u8* rgba = (u8*)malloc((size_t)w * h * 4);
++        if (rgba) {
++            const u8* src = (const u8*)px;
++            for (size_t i = 0, n = (size_t)w * h; i < n; i++) {
++                const u32 a = src[i * 4 + 3];
++                rgba[i * 4 + 0] = (u8)(src[i * 4 + 2] * a / 255u);
++                rgba[i * 4 + 1] = (u8)(src[i * 4 + 1] * a / 255u);
++                rgba[i * 4 + 2] = (u8)(src[i * 4 + 0] * a / 255u);
++                rgba[i * 4 + 3] = (u8)a;
++            }
++            const u32 id = rsx_vk_ui_texture(rgba, w, h);
++            free(rgba);
++            if (id) { rsx_vk_ui_texture_free(s_sysui_tex); s_sysui_tex = id; }
++        }
++    }
++    if (!s_sysui_tex) return;
++    struct { float x, y; u8 r, g, b, a; float u, v; } q[4] = {
++        { 0.0f,     0.0f,     255, 255, 255, 255, 0.0f, 0.0f }, { (float)w, 0.0f,     255, 255, 255, 255, 1.0f, 0.0f },
++        { (float)w, (float)h, 255, 255, 255, 255, 1.0f, 1.0f }, { 0.0f,     (float)h, 255, 255, 255, 255, 0.0f, 1.0f },
++    };
++    static const int idx[6] = { 0, 1, 2, 0, 2, 3 };
++    rsx_vk_ui_cmd d; memset(&d, 0, sizeof d);
++    d.verts = q; d.nverts = 4; d.idx = idx; d.nidx = 6;
++    d.mvp[0] = 2.0f / (float)w; d.mvp[5] = -2.0f / (float)h; d.mvp[10] = 1.0f;   /* pixels, y down, to clip space */
++    d.mvp[12] = -1.0f; d.mvp[13] = 1.0f; d.mvp[15] = 1.0f;
++    d.tex = s_sysui_tex;
++    d.sx = 0; d.sy = 0; d.sw = (int)w; d.sh = (int)h;
++    rsx_vk_ui_draw(&d);
++}
++
+ static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii, int in_color)
+ {
+-    if (!g_rsx_vk_ui || !g_port_overlay_active || !s_vk.view[ii] || !vk_ui_init()) return 0;
++    const int port_ui = g_rsx_vk_ui && g_port_overlay_active;
++    if ((!port_ui && !g_sysui_visible) || !s_vk.view[ii] || !vk_ui_init()) return 0;
+     vk_ui_ring(f);
+     s_ui.c = c; s_ui.ii = ii;
+     s_ui.frame_no++;
+@@ -1763,7 +1807,8 @@ static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii, int in_color)
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+     vk_ui_begin();
+-    g_rsx_vk_ui(s_vk.extent.width, s_vk.extent.height);
++    if (g_sysui_visible) vk_sysui_draw(s_vk.extent.width, s_vk.extent.height);
++    if (port_ui) g_rsx_vk_ui(s_vk.extent.width, s_vk.extent.height);   /* the port's menu over everything */
+     vkCmdEndRendering_(c);
+     s_ui.in_pass = 0; s_ui.c = VK_NULL_HANDLE;
+     vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,

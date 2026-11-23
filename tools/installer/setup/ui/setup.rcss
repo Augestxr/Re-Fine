@@ -1,0 +1,48 @@
+/* Re:Fine installer: same palette as the start screen (src/port_menu/ui/theme.rcss).
+ * Sizes in dp: 1 dp = 1 px at 1080 lines. */
+body, div, p { display: block; }
+span { display: inline; }
+body { font-family: Inter; font-size: 28dp; width: 100%; height: 100%; color: #F2F6F8; }
+#bg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; background-color: #0B0C10; }
+#bg.art { decorator: image(art/bg.png cover center center); }
+#shade { position: absolute; left: 0; top: 0; width: 100%; height: 100%; background-color: #0B0C10b3; }
+#card { position: absolute; left: 280dp; top: 130dp; width: 1360dp; height: 820dp; box-sizing: border-box; background-color: #0A1220e6; border-width: 1dp; border-color: #39C5BB; border-radius: 14dp; }
+#head { position: absolute; left: 56dp; right: 56dp; top: 30dp; height: 80dp; border-bottom-width: 1dp; border-color: #1E3048; }
+#brand { font-family: "Barlow Condensed"; font-weight: bold; font-size: 64dp; color: #7FE3DA; }
+#stepno { float: right; font-size: 24dp; color: #8FA3AD; padding-top: 28dp; }
+#body { position: absolute; left: 56dp; right: 56dp; top: 140dp; bottom: 130dp; }
+.screen { display: none; }
+.screen.shown { display: block; }
+.h1 { font-family: "Barlow Condensed"; font-weight: bold; font-size: 56dp; margin-bottom: 20dp; }
+.opt { font-size: 24dp; color: #8FA3AD; font-family: Inter; font-weight: normal; margin-left: 16dp; }
+.p { color: #F2F6F8; margin-bottom: 20dp; font-size: 28dp; line-height: 40dp; }
+.p.dim { color: #8FA3AD; font-size: 24dp; }
+.link { color: #7FE3DA; margin-left: 12dp; }
+.link:hover { color: #F2F6F8; }
+.pathrow { height: 72dp; margin-top: 12dp; margin-bottom: 14dp; }
+.path { display: block; box-sizing: border-box; width: 1000dp; height: 72dp; padding: 18dp 20dp; font-size: 24dp; color: #8FA3AD; background-color: #13233A; border-width: 1dp; border-color: #1E3048; border-radius: 8dp; overflow: hidden; float: left; }
+.path.set { color: #F2F6F8; }
+.pathrow .btn { float: left; margin-left: 20dp; width: 200dp; min-width: 200dp; }
+.status { font-size: 26dp; min-height: 40dp; color: #8FA3AD; }
+.status.ok { color: #7FE3DA; }
+.status.bad { color: #FF5FA2; }
+#foot { position: absolute; left: 56dp; right: 56dp; bottom: 40dp; height: 72dp; }
+.btn { display: block; box-sizing: border-box; float: right; margin-left: 20dp; height: 72dp; min-width: 200dp; padding: 18dp 36dp; text-align: center; font-size: 28dp; color: #F2F6F8; border-width: 1dp; border-color: #39C5BB; border-radius: 8dp; background-color: #00000000; }
+.btn:hover { background-color: #13233A; border-color: #7FE3DA; }
+.btn.primary { background-color: #39C5BB; color: #0B0C10; font-weight: bold; }
+.btn.primary:hover { background-color: #7FE3DA; }
+.btn.quiet { border-color: #1E3048; color: #8FA3AD; }
+.btn.quiet:hover { color: #F2F6F8; border-color: #8FA3AD; }
+.btn.danger { border-color: #FF5FA2; color: #FF5FA2; }
+.btn.off, .btn.off:hover { background-color: #00000000; border-color: #1E3048; color: #4F6170; }
+.btn.hidden { display: none; }
+#btn_back { float: left; margin-left: 0dp; }
+.steps { margin-top: 10dp; margin-bottom: 30dp; }
+.step { height: 54dp; font-size: 28dp; color: #4F6170; }
+.step .mark { display: inline-block; width: 44dp; }
+.step.cur { color: #F2F6F8; }
+.step.done { color: #7FE3DA; }
+#pbar { width: 100%; height: 14dp; background-color: #13233A; border-radius: 7dp; }
+#pfill { width: 0%; height: 14dp; background-color: #39C5BB; border-radius: 7dp; }
+#inst_status { margin-top: 24dp; }
+#ver { position: absolute; right: 24dp; bottom: 16dp; font-size: 20dp; color: #4F6170; }

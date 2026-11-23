@@ -1,0 +1,110 @@
+Re:Fine 0119: reinicio de primitiva y strips indexados de mas de 256 indices.
+
+rsx_state no conocia SET_RESTART_INDEX(_ENABLE): 0xFFFF se leia como un vertice mas. Ademas DRAW_INDEX_ARRAY
+lleva 256 indices como mucho y cada entrada arrancaba un strip nuevo: se perdian las uniones y la paridad.
+Los modelos de la PV600 son strips asi. Evidencia en docs/STATUS.md (4i).
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 9c8476a..e9d47e8 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -7197,27 +7197,47 @@ static u32 upload_tris_vp_indexed(const rsx_state* state, u32 first, u32 count)
+  * -- the octopus tentacles -- are indexed strips. Odd strip triangles swap
+  * two vertices, as in upload_strip_vp: guest culling is honoured now, and
+  * without the swap every second triangle comes out back-facing (God of War
+- * HD's fullscreen 4-index quads lost their lower-right half). */
++ * HD's fullscreen 4-index quads lost their lower-right half).
++ *
++ * Re:Fine 0119: DRAW_INDEX_ARRAY carries at most 256 indices, so a longer strip
++ * is several calls here inside one BEGIN/END, and Project DIVA F's models are
++ * all drawn that way. Consecutive ranges are one primitive, as in RPCS3's draw
++ * clause: the last two indices and the parity carry over. A disjoint range
++ * starts a new one. The restart index ends the strip without being a vertex. */
++static struct { u32 epoch, next, n, odd, v[2]; int valid; } s_strip;
++
+ static u32 upload_strip_vp_indexed(const rsx_state* state, u32 first, u32 count, int fan)
+ {
+     extern uint8_t* vm_base;
+     if (!state || !vm_base || !s_d3d.vp_vb_mapped) return 0;
+     if (!state->vertex_attribs[0].enabled) return 0;
+-    if (count < 3) return 0;
+-    u32 tris = count - 2;
++    if (!s_strip.valid || s_strip.epoch != state->begin_epoch || s_strip.next != first) {
++        s_strip.n = 0; s_strip.odd = 0;
++    }
++    s_strip.valid = 1; s_strip.epoch = state->begin_epoch; s_strip.next = first + count;
++    const int sixteen = (((state->index_array_dma >> 4) & 0xF) == 1);
++    /* RPCS3 rsx_methods.h: a 16-bit buffer cannot hold a larger restart index. */
++    const int restart = state->restart_index_enable && (!sixteen || state->restart_index <= 0xFFFFu);
++    { static int _n = 0; if (PS3_LOG_FIRST(_n, 1))
++        fprintf(stderr, "[STRIP] restart enable=%d index=0x%X width=%d%c",
++                state->restart_index_enable, state->restart_index, sixteen ? 16 : 32, 10); }
+     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+-    if (tris * 3 > maxv) tris = maxv / 3;
+     VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+         + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
+     u32 o = 0;
+     vc_begin_draw();
+-    for (u32 t = 0; t < tris; t++) {
+-        u32 i0 = fan ? 0 : t;
+-        u32 i1 = t + 1, i2 = t + 2;
+-        if (!fan && (t & 1)) { u32 tmp = i1; i1 = i2; i2 = tmp; }
+-        read_vp_vertex_cached(state, read_guest_index(state, first + i0), &out[o*16]); o++;
+-        read_vp_vertex_cached(state, read_guest_index(state, first + i1), &out[o*16]); o++;
+-        read_vp_vertex_cached(state, read_guest_index(state, first + i2), &out[o*16]); o++;
++    for (u32 k = 0; k < count; k++) {
++        const u32 ix = read_guest_index(state, first + k);
++        if (restart && ix == state->restart_index) { s_strip.n = 0; s_strip.odd = 0; continue; }
++        if (s_strip.n < 2) { s_strip.v[s_strip.n++] = ix; continue; }
++        if (o + 3 > maxv) break;
++        u32 i1 = s_strip.v[1], i2 = ix;
++        if (!fan && s_strip.odd) { u32 tmp = i1; i1 = i2; i2 = tmp; }
++        read_vp_vertex_cached(state, s_strip.v[0], &out[o*16]); o++;
++        read_vp_vertex_cached(state, i1, &out[o*16]); o++;
++        read_vp_vertex_cached(state, i2, &out[o*16]); o++;
++        if (!fan) { s_strip.v[0] = s_strip.v[1]; s_strip.odd ^= 1u; }
++        s_strip.v[1] = ix;
+     }
+     s_d3d.vp_vb_offset += o * VP_VERT_STRIDE;
+     return o;
+diff --git a/libs/video/rsx_commands.c b/libs/video/rsx_commands.c
+index a39639f1..b7a51e6f 100644
+--- a/libs/video/rsx_commands.c
++++ b/libs/video/rsx_commands.c
+@@ -933,6 +933,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
+         state->index_array_dma = data;
+         return 0;
+     }
++    if (method == NV4097_SET_RESTART_INDEX_ENABLE) {
++        state->restart_index_enable = data & 1;
++        return 0;
++    }
++    if (method == NV4097_SET_RESTART_INDEX) {
++        state->restart_index = data;
++        return 0;
++    }
+     if (method == NV4097_DRAW_INDEX_ARRAY) {
+         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
+         u32 first = data & 0xFFFFFF;
+diff --git a/libs/video/rsx_commands.h b/libs/video/rsx_commands.h
+index 246ca166..e6b503e7 100644
+--- a/libs/video/rsx_commands.h
++++ b/libs/video/rsx_commands.h
+@@ -104,6 +104,8 @@ extern "C" {
+ #define NV4097_DRAW_ARRAYS                     0x00001814
+ #define NV4097_SET_INDEX_ARRAY_ADDRESS         0x0000181C
+ #define NV4097_SET_INDEX_ARRAY_DMA             0x00001820
++#define NV4097_SET_RESTART_INDEX_ENABLE        0x00001DAC
++#define NV4097_SET_RESTART_INDEX               0x00001DB0
+ #define NV4097_DRAW_INDEX_ARRAY                0x00001824
+ 
+ /* Vertex attributes */
+@@ -350,6 +352,8 @@ typedef struct rsx_state {
+     u32 begin_epoch;
+     u32 index_array_offset;
+     u32 index_array_dma;
++    u32 restart_index_enable;   /* Re:Fine 0119: primitive restart */
++    u32 restart_index;
+ 
+     /* Shader state */
+     /* RSX viewport transform (SET_VIEWPORT_OFFSET 0x0A20 / _SCALE 0x0A30,

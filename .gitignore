@@ -1,0 +1,112 @@
+# ============================================================
+# Re:Fine — Firewall: nada del juego entra en git
+# ============================================================
+
+# --- Carpetas de trabajo (insumos del usuario, salidas, builds) ---
+/game/
+/work/
+/build/
+/out/
+
+# --- Código generado por el lifter (es código del juego traducido) ---
+**/recompiled/
+**/ppu_hle_nids.cpp
+**/spu_workloads.c
+
+# --- Binarios y datos de PS3 ---
+*.elf
+*.ELF
+*.self
+*.SELF
+*.prx
+*.PRX
+*.sprx
+*.SPRX
+EBOOT.BIN
+PARAM.SFO
+*.sfo
+*.SFO
+*.iso
+*.ISO
+*.pkg
+*.PKG
+*.pup
+*.PUP
+*.rap
+*.RAP
+*.dkey
+*.edat
+*.EDAT
+*.sdat
+*.SDAT
+*.psarc
+*.farc
+*.dsc
+*.avc
+*.at3
+*.dds
+*.gtf
+*.ird
+
+# --- Logs y volcados (pueden contener datos del juego o rutas personales) ---
+*.log
+*.log.gz
+*.dmp
+*.tracy
+*.etl
+*.wpix
+
+# --- Ghidra (los proyectos contienen el binario) ---
+*.gpr
+*.rep/
+
+# --- Compilación ---
+*.exe
+*.dll
+*.pdb
+*.ilk
+*.obj
+*.o
+*.lib
+*.exp
+*.idb
+*.pch
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+.ninja_deps
+.ninja_log
+
+# --- Python / Node ---
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+
+# --- Documentos personales del flujo con el revisor (como en f2nd-recomp) ---
+PROMPT_HITO_*.md
+HANDOFF_REVISOR.md
+
+# --- Editores y sistema ---
+.vs/
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+dist/
+
+# Capturas con imagen del juego (6b+6c): nunca a git
+docs/capturas/
+
+# Instalador: arte de terceros (fan art / SEGA), solo version privada
+/tools/installer/art_privado/
+# Partidas: nunca en git ni en releases
+/tools/installer/partida/
+**/NPUB31241*/
+**/PARAM.PFD
+**/hdd0/
+build_*/

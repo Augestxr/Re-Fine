@@ -1,0 +1,69 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -845,17 +845,42 @@
+ static float s_stick_dz = -1.0f, s_stick_hy;
+ static Uint64 s_stick_rearm_ms;
+ static int s_rearm_env;   /* Re:Fine 0161: stick_rearm_ms set by the user: the frame rate does not change it */
++static int s_fps_high;   /* Re:Fine 0166: fps_target is over 30 */
+ /* Re:Fine 0161: the frame rate changed in the running game (the port's menu). */
+-void pad_set_fps_high(int high) { if (!s_rearm_env) s_stick_rearm_ms = high ? 34 : 0; }
++void pad_set_fps_high(int high) { s_fps_high = high; if (!s_rearm_env) s_stick_rearm_ms = high ? 34 : 0; }
+ typedef struct { int out, x, y, wait; Uint64 since; u8 lx, ly; } PadStick;
+ 
++/* Re:Fine 0166: the port's menu changes the three numbers while the game runs (rearm_ms < 0: automatic,
++ * 34 over 30 fps and 0 at 30), reads the left stick of port 0 to draw it, and REFINE_PAD_STAR_LOG=1
++ * prints each time a stick leaves the centre (what F can count as a star): position, time, and how long
++ * since the last one -- two of them a few tens of ms apart are one flick counted twice. */
++static volatile float s_view_x, s_view_y;
++static int s_star_log = -1;
++void pad_set_stick(float dz, float hy, int rearm_ms)
++{
++    if (dz >= 0) s_stick_dz = dz;
++    if (hy >= 0) s_stick_hy = hy;
++    s_rearm_env = rearm_ms >= 0;
++    s_stick_rearm_ms = rearm_ms >= 0 ? (Uint64)rearm_ms : (s_fps_high ? 34 : 0);
++}
++void pad_view_stick(float* x, float* y) { *x = s_view_x; *y = s_view_y; }
++
+ static void pad_sdl3_stick(PadStick* st, int x, int y, u8* ox, u8* oy)
+ {
+     const float r = SDL_sqrtf((float)x * x + (float)y * y) / 32767.0f;
+     const Uint64 now = SDL_GetTicks();
+     if (st->out && (r < s_stick_dz || (long long)x * st->x + (long long)y * st->y < 0)) {
+         st->out = 0; st->wait = s_stick_rearm_ms != 0; st->since = 0;
+-    } else if (!st->out && !st->wait && r >= s_stick_dz + s_stick_hy) { st->out = 1; st->x = x; st->y = y; }
++    } else if (!st->out && !st->wait && r >= s_stick_dz + s_stick_hy) {
++        st->out = 1; st->x = x; st->y = y;
++        if (s_star_log < 0) { const char* e = getenv("REFINE_PAD_STAR_LOG"); s_star_log = e && atoi(e); }
++        if (s_star_log) {
++            static Uint64 last;
++            fprintf(stderr, "[pad] star: stick (%+.2f, %+.2f) r=%.2f at %llu ms, %llu ms after the last%c",
++                    x / 32767.0f, y / 32767.0f, r, (unsigned long long)now, (unsigned long long)(last ? now - last : 0), 10);
++            last = now;
++        }
++    }
+     if (st->wait) {
+         if (r >= s_stick_dz) st->since = 0;
+         else if (!st->since) st->since = now;
+@@ -907,6 +932,10 @@
+ 
+     /* SDL's Y is already down-positive, like the PS3's. */
+     static PadStick s_stick[PAD_MAX_HOST_PORTS][2];
++    if (port == 0) {
++        s_view_x = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f;
++        s_view_y = SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY) / 32767.0f;
++    }
+     pad_sdl3_stick(&s_stick[port][0], SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX),
+                    SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY), &hs->analog_lx, &hs->analog_ly);
+     pad_sdl3_stick(&s_stick[port][1], SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTX),
+@@ -1102,7 +1131,8 @@
+       const char* rm = getenv("REFINE_STICK_REARM_MS");    /* refine.ini: stick_rearm_ms */
+       const char* fp = getenv("REFINE_FPS_TARGET");
+       s_rearm_env = rm != NULL;
+-      s_stick_rearm_ms = rm ? (Uint64)atoi(rm) : (fp && atoi(fp) > 30 ? 34 : 0);
++      s_fps_high = fp && atoi(fp) > 30;
++      s_stick_rearm_ms = rm ? (Uint64)atoi(rm) : (s_fps_high ? 34 : 0);
+       fprintf(stderr, "[cellPad] stick dead zone %.2f, leaves the centre at %.2f, re-arms after %d ms%c", s_stick_dz, s_stick_dz + s_stick_hy, (int)s_stick_rearm_ms, 10); }
+     const Uint64 t0 = SDL_GetTicksNS();
+     if (!SDL_Init(SDL_INIT_GAMEPAD)) {

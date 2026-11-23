@@ -1,0 +1,215 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -97,6 +97,38 @@
+ char g_port_pad_name[128];
+ int (*g_port_overlay_pad)(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly);
+ 
++/* Re:Fine 0171: bindings from the port's menu (port_overlay.h), changed live. The menu thread
++ * publishes a whole new table and the poll reads one pointer, so a poll never sees half a
++ * change; an old table is never freed (a few hundred bytes per rebinding). NULL: the defaults,
++ * which are the layouts of 0142 (keyboard) and 0145 (controller). */
++static const u16 s_bind_btn[PORT_BIND_PAD_COUNT] = {
++    CELL_PAD_CTRL_CROSS, CELL_PAD_CTRL_CIRCLE, CELL_PAD_CTRL_SQUARE, CELL_PAD_CTRL_TRIANGLE,
++    CELL_PAD_CTRL_UP, CELL_PAD_CTRL_DOWN, CELL_PAD_CTRL_LEFT, CELL_PAD_CTRL_RIGHT,
++    CELL_PAD_CTRL_L1, CELL_PAD_CTRL_R1, CELL_PAD_CTRL_L2, CELL_PAD_CTRL_R2,
++    CELL_PAD_CTRL_L3, CELL_PAD_CTRL_R3, CELL_PAD_CTRL_START, CELL_PAD_CTRL_SELECT,
++};
++typedef struct { int vk[PORT_BIND_COUNT][PORT_BIND_KEYS]; } PadKeyBinds;
++typedef struct { int src[PORT_BIND_PAD_COUNT]; } PadPadBinds;
++static PadKeyBinds* s_key_binds;
++static PadPadBinds* s_pad_binds;
++static volatile long s_raw_sources;   /* port 0's controller as pressed, before any binding */
++
++void pad_set_key_binds(const int vk[PORT_BIND_COUNT][PORT_BIND_KEYS])
++{
++    PadKeyBinds* t = (PadKeyBinds*)malloc(sizeof *t);
++    if (!t) return;
++    memcpy(t->vk, vk, sizeof t->vk);
++    __atomic_store_n(&s_key_binds, t, __ATOMIC_RELEASE);
++}
++void pad_set_pad_binds(const int src[PORT_BIND_PAD_COUNT])
++{
++    PadPadBinds* t = (PadPadBinds*)malloc(sizeof *t);
++    if (!t) return;
++    memcpy(t->src, src, sizeof t->src);
++    __atomic_store_n(&s_pad_binds, t, __ATOMIC_RELEASE);
++}
++unsigned pad_raw_sources(void) { return (unsigned)s_raw_sources; }
++
+ #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
+ 
+ typedef struct {
+@@ -391,29 +423,43 @@
+         return;
+     }
+ 
+-    static const struct { int vk; u16 btn; char letter; } map[] = {
+-        { 'W',       CELL_PAD_CTRL_TRIANGLE, 'W' }, { 'A',      CELL_PAD_CTRL_SQUARE, 'A' },
+-        { 'S',       CELL_PAD_CTRL_CROSS,    'S' }, { 'D',      CELL_PAD_CTRL_CIRCLE, 'D' },
+-        { 'I',       CELL_PAD_CTRL_UP,       'I' }, { 'J',      CELL_PAD_CTRL_LEFT,   'J' },
+-        { 'K',       CELL_PAD_CTRL_DOWN,     'K' }, { 'L',      CELL_PAD_CTRL_RIGHT,  'L' },
+-        { VK_UP,     CELL_PAD_CTRL_UP,       'u' }, { VK_DOWN,  CELL_PAD_CTRL_DOWN,   'd' },
+-        { VK_LEFT,   CELL_PAD_CTRL_LEFT,     'l' }, { VK_RIGHT, CELL_PAD_CTRL_RIGHT,  'r' },
+-        { VK_RETURN, CELL_PAD_CTRL_CROSS,    'n' }, { VK_BACK,  CELL_PAD_CTRL_CIRCLE, 'b' },
+-        { VK_SPACE,  CELL_PAD_CTRL_START,    's' }, { VK_ESCAPE, CELL_PAD_CTRL_START, 'e' },
+-        { VK_TAB,    CELL_PAD_CTRL_SELECT,   0 },
+-        { '1',       CELL_PAD_CTRL_L1,       0 },   { '2',      CELL_PAD_CTRL_R1,     0 },
+-        { '3',       CELL_PAD_CTRL_L2,       0 },   { '4',      CELL_PAD_CTRL_R2,     0 },
++    /* Re:Fine 0171: the keys come from the bindings (two per action, 0 = none); the default is the
++     * layout of 0142. PAD_KEYS scripts keep their letters, tied to the action, not to a key. */
++    static const PadKeyBinds def = { {
++        [PORT_BIND_CROSS] = { 'S', VK_RETURN },  [PORT_BIND_CIRCLE] = { 'D', VK_BACK },
++        [PORT_BIND_SQUARE] = { 'A', 0 },         [PORT_BIND_TRIANGLE] = { 'W', 0 },
++        [PORT_BIND_UP] = { 'I', VK_UP },         [PORT_BIND_DOWN] = { 'K', VK_DOWN },
++        [PORT_BIND_LEFT] = { 'J', VK_LEFT },     [PORT_BIND_RIGHT] = { 'L', VK_RIGHT },
++        [PORT_BIND_L1] = { '1', 0 },             [PORT_BIND_R1] = { '2', 0 },
++        [PORT_BIND_L2] = { '3', 0 },             [PORT_BIND_R2] = { '4', 0 },
++        [PORT_BIND_START] = { VK_SPACE, VK_ESCAPE }, [PORT_BIND_SELECT] = { VK_TAB, 0 },
++        [PORT_BIND_LS_LEFT] = { 'Q', 0 },        [PORT_BIND_LS_RIGHT] = { 'E', 0 },
++        [PORT_BIND_RS_LEFT] = { 'U', 0 },        [PORT_BIND_RS_RIGHT] = { 'O', 0 },
++    } };
++    static const struct { u16 btn; char letter; } script[] = {
++        { CELL_PAD_CTRL_TRIANGLE, 'W' }, { CELL_PAD_CTRL_SQUARE, 'A' }, { CELL_PAD_CTRL_CROSS, 'S' },
++        { CELL_PAD_CTRL_CIRCLE, 'D' },   { CELL_PAD_CTRL_UP, 'I' },     { CELL_PAD_CTRL_LEFT, 'J' },
++        { CELL_PAD_CTRL_DOWN, 'K' },     { CELL_PAD_CTRL_RIGHT, 'L' },  { CELL_PAD_CTRL_UP, 'u' },
++        { CELL_PAD_CTRL_DOWN, 'd' },     { CELL_PAD_CTRL_LEFT, 'l' },   { CELL_PAD_CTRL_RIGHT, 'r' },
++        { CELL_PAD_CTRL_CROSS, 'n' },    { CELL_PAD_CTRL_CIRCLE, 'b' }, { CELL_PAD_CTRL_START, 's' },
++        { CELL_PAD_CTRL_START, 'e' },
+     };
+-#define PAD_KEY(vk, c) ((focused && (GetAsyncKeyState(vk) & 0x8000)) || \
+-                        (s_key_script && (c) && pad_key_scripted(c)))
++    const PadKeyBinds* kb = __atomic_load_n(&s_key_binds, __ATOMIC_ACQUIRE);
++    if (!kb) kb = &def;
++#define PAD_VK(a) (focused && ((kb->vk[a][0] && (GetAsyncKeyState(kb->vk[a][0]) & 0x8000)) || \
++                               (kb->vk[a][1] && (GetAsyncKeyState(kb->vk[a][1]) & 0x8000))))
++#define PAD_SCRIPTED(c) (s_key_script && pad_key_scripted(c))
+ 
+     u16 btns = 0;
+-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+-        if (PAD_KEY(map[i].vk, map[i].letter)) btns |= map[i].btn;
++    for (int a = 0; a < PORT_BIND_PAD_COUNT; a++)
++        if (PAD_VK(a)) btns |= s_bind_btn[a];
++    if (s_key_script)
++        for (unsigned i = 0; i < sizeof script / sizeof script[0]; i++)
++            if (pad_key_scripted(script[i].letter)) btns |= script[i].btn;
+ 
+     static int qn, qp, ql, un, up, ul;
+-    const u8 lx = pad_key_axis(PAD_KEY('Q', 'Q'), PAD_KEY('E', 'E'), &qn, &qp, &ql);
+-    const u8 rx = pad_key_axis(PAD_KEY('U', 'U'), PAD_KEY('O', 'O'), &un, &up, &ul);
++    const u8 lx = pad_key_axis(PAD_VK(PORT_BIND_LS_LEFT) || PAD_SCRIPTED('Q'), PAD_VK(PORT_BIND_LS_RIGHT) || PAD_SCRIPTED('E'), &qn, &qp, &ql);
++    const u8 rx = pad_key_axis(PAD_VK(PORT_BIND_RS_LEFT) || PAD_SCRIPTED('U'), PAD_VK(PORT_BIND_RS_RIGHT) || PAD_SCRIPTED('O'), &un, &up, &ul);
+ 
+     { static int said = 0;
+       if (!said && (btns || lx != 128 || rx != 128)) { said = 1;
+@@ -430,7 +476,8 @@
+     if (near_centre_r) { hs->analog_rx = rx; if (!has_pad) hs->analog_ry = 128; }
+     if (btns & CELL_PAD_CTRL_L2) hs->trigger_l2 = 255; else if (!has_pad) hs->trigger_l2 = 0;
+     if (btns & CELL_PAD_CTRL_R2) hs->trigger_r2 = 255; else if (!has_pad) hs->trigger_r2 = 0;
+-#undef PAD_KEY
++#undef PAD_VK
++#undef PAD_SCRIPTED
+ }
+ #endif
+ 
+@@ -912,39 +959,47 @@
+ /* One pad into a state; the rest of the struct is a release. */
+ static void pad_sdl3_read(SDL_Gamepad* gp, PadHostState* hs, int port)
+ {
+-    static const struct { SDL_GamepadButton b; u16 cell; } map[] = {
+-        { SDL_GAMEPAD_BUTTON_SOUTH,          CELL_PAD_CTRL_CROSS },
+-        { SDL_GAMEPAD_BUTTON_EAST,           CELL_PAD_CTRL_CIRCLE },
+-        { SDL_GAMEPAD_BUTTON_WEST,           CELL_PAD_CTRL_SQUARE },
+-        { SDL_GAMEPAD_BUTTON_NORTH,          CELL_PAD_CTRL_TRIANGLE },
+-        { SDL_GAMEPAD_BUTTON_DPAD_UP,        CELL_PAD_CTRL_UP },
+-        { SDL_GAMEPAD_BUTTON_DPAD_DOWN,      CELL_PAD_CTRL_DOWN },
+-        { SDL_GAMEPAD_BUTTON_DPAD_LEFT,      CELL_PAD_CTRL_LEFT },
+-        { SDL_GAMEPAD_BUTTON_DPAD_RIGHT,     CELL_PAD_CTRL_RIGHT },
+-        { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,  CELL_PAD_CTRL_L1 },
+-        { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, CELL_PAD_CTRL_R1 },
+-        { SDL_GAMEPAD_BUTTON_LEFT_STICK,     CELL_PAD_CTRL_L3 },
+-        { SDL_GAMEPAD_BUTTON_RIGHT_STICK,    CELL_PAD_CTRL_R3 },
+-        { SDL_GAMEPAD_BUTTON_START,          CELL_PAD_CTRL_START },
+-        { SDL_GAMEPAD_BUTTON_BACK,           CELL_PAD_CTRL_SELECT },
+-    };
++    /* Re:Fine 0171: a source (SDL button, or a trigger past PAD_TRIGGER_THRESHOLD) feeds the PS3 button
++     * the bindings give it; the default is the layout of 0145. */
++    _Static_assert(SDL_GAMEPAD_BUTTON_COUNT <= PORT_SRC_LT, "SDL buttons overlap the trigger sources");
++    static const PadPadBinds def = { {
++        [PORT_BIND_CROSS] = SDL_GAMEPAD_BUTTON_SOUTH,      [PORT_BIND_CIRCLE] = SDL_GAMEPAD_BUTTON_EAST,
++        [PORT_BIND_SQUARE] = SDL_GAMEPAD_BUTTON_WEST,      [PORT_BIND_TRIANGLE] = SDL_GAMEPAD_BUTTON_NORTH,
++        [PORT_BIND_UP] = SDL_GAMEPAD_BUTTON_DPAD_UP,       [PORT_BIND_DOWN] = SDL_GAMEPAD_BUTTON_DPAD_DOWN,
++        [PORT_BIND_LEFT] = SDL_GAMEPAD_BUTTON_DPAD_LEFT,   [PORT_BIND_RIGHT] = SDL_GAMEPAD_BUTTON_DPAD_RIGHT,
++        [PORT_BIND_L1] = SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, [PORT_BIND_R1] = SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER,
++        [PORT_BIND_L2] = PORT_SRC_LT,                      [PORT_BIND_R2] = PORT_SRC_RT,
++        [PORT_BIND_L3] = SDL_GAMEPAD_BUTTON_LEFT_STICK,    [PORT_BIND_R3] = SDL_GAMEPAD_BUTTON_RIGHT_STICK,
++        [PORT_BIND_START] = SDL_GAMEPAD_BUTTON_START,      [PORT_BIND_SELECT] = SDL_GAMEPAD_BUTTON_BACK,
++    } };
++    const u8 lt = pad_sdl3_trigger(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
++    const u8 rt = pad_sdl3_trigger(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
++    unsigned raw = 0;
++    for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)
++        if (SDL_GetGamepadButton(gp, (SDL_GamepadButton)b)) raw |= 1u << b;
++    if (lt > PAD_TRIGGER_THRESHOLD) raw |= 1u << PORT_SRC_LT;
++    if (rt > PAD_TRIGGER_THRESHOLD) raw |= 1u << PORT_SRC_RT;
++    if (port == 0) s_raw_sources = (long)raw;
++    const PadPadBinds* pb = __atomic_load_n(&s_pad_binds, __ATOMIC_ACQUIRE);
++    if (!pb) pb = &def;
+     u16 btns = 0;
+-    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+-        if (SDL_GetGamepadButton(gp, map[i].b)) btns |= map[i].cell;
++    for (int a = 0; a < PORT_BIND_PAD_COUNT; a++)
++        if (pb->src[a] >= 0 && pb->src[a] < 32 && ((raw >> pb->src[a]) & 1)) btns |= s_bind_btn[a];
+     /* Re:Fine 0159: the touchpad's click is no PS3 button; it opens the port's quick bar. */
+     {
+         static int s_touch[PAD_MAX_HOST_PORTS];
+-        const int t = SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_TOUCHPAD);
++        const int t = (raw >> SDL_GAMEPAD_BUTTON_TOUCHPAD) & 1;
+         if (t && !s_touch[port]) g_port_overlay_touchpad = 1;
+         s_touch[port] = t;
+     }
+ 
+     pad_host_release(hs);
+     hs->connected = 1;
+-    hs->trigger_l2 = pad_sdl3_trigger(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
+-    hs->trigger_r2 = pad_sdl3_trigger(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+-    if (hs->trigger_l2 > PAD_TRIGGER_THRESHOLD) btns |= CELL_PAD_CTRL_L2;
+-    if (hs->trigger_r2 > PAD_TRIGGER_THRESHOLD) btns |= CELL_PAD_CTRL_R2;
++    /* L2/R2 keep the trigger's travel when a trigger is bound to them, else full or nothing. */
++    hs->trigger_l2 = pb->src[PORT_BIND_L2] == PORT_SRC_LT ? lt : pb->src[PORT_BIND_L2] == PORT_SRC_RT ? rt
++                   : (btns & CELL_PAD_CTRL_L2) ? 255 : 0;
++    hs->trigger_r2 = pb->src[PORT_BIND_R2] == PORT_SRC_RT ? rt : pb->src[PORT_BIND_R2] == PORT_SRC_LT ? lt
++                   : (btns & CELL_PAD_CTRL_R2) ? 255 : 0;
+     hs->buttons = btns;
+ 
+     /* SDL's Y is already down-positive, like the PS3's. */
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -63,6 +63,26 @@
+ extern volatile float g_port_sharpen;
+ extern volatile int g_port_area;      /* Re:Fine 0168: 1 = Output resampling Area (box filter when the picture is shrunk) */
+ 
++/* Re:Fine 0171. Bindings from the port's menu, live, for cellPad. An action is one of the 16 PS3
++ * buttons, or (keyboard only) the left or right stick pushed left or right. Keys are Windows virtual
++ * keys, two per action (0 = none). A controller source is an SDL_GamepadButton, or PORT_SRC_LT/RT
++ * for a trigger past the threshold; one per action (-1 = none). Each call replaces the whole table. */
++enum {
++    PORT_BIND_CROSS, PORT_BIND_CIRCLE, PORT_BIND_SQUARE, PORT_BIND_TRIANGLE,
++    PORT_BIND_UP, PORT_BIND_DOWN, PORT_BIND_LEFT, PORT_BIND_RIGHT,
++    PORT_BIND_L1, PORT_BIND_R1, PORT_BIND_L2, PORT_BIND_R2, PORT_BIND_L3, PORT_BIND_R3,
++    PORT_BIND_START, PORT_BIND_SELECT, PORT_BIND_PAD_COUNT,
++    PORT_BIND_LS_LEFT = PORT_BIND_PAD_COUNT, PORT_BIND_LS_RIGHT, PORT_BIND_RS_LEFT, PORT_BIND_RS_RIGHT,
++    PORT_BIND_COUNT
++};
++#define PORT_BIND_KEYS 2
++#define PORT_SRC_LT 26
++#define PORT_SRC_RT 27
++void pad_set_key_binds(const int vk[PORT_BIND_COUNT][PORT_BIND_KEYS]);
++void pad_set_pad_binds(const int src[PORT_BIND_PAD_COUNT]);
++/* Port 0's controller as pressed right now (bit n = source n), before any binding. */
++unsigned pad_raw_sources(void);
++
+ #ifdef __cplusplus
+ }
+ #endif

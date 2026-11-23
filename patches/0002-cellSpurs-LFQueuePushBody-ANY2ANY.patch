@@ -1,0 +1,200 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 2e9e33b62f30e8c132b47f7b3971e8df8b28c228..8aad5e6eb574e77ddc07f381456f55104b31ae0a 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -896,6 +896,31 @@ static int spurs_guest_range_valid(u32 ea, u32 bytes)
+  * Taskset
+  * =====================================================================*/
+ 
++/* Which tasksets each SPURS instance owns. A CellSpursLFQueue whose owner is a
++ * SPURS instance stores eaSignal = SPURS | 1 and names its waiter only by
++ * (workload id << 8 | task id); real SPURS maps the workload id to a taskset
++ * through wklInfo1[wid].arg, but this runtime builds every taskset with wid 0
++ * and never publishes it there. Remember the owner at creation instead.
++ * Adapted from ico-recomp port/stubs.cpp (MIT, commit 55b66b94d2f4, see
++ * THIRD_PARTY_NOTICES.md in the f2nd-recomp port). */
++static SRWLOCK s_lfq_ts_lock = SRWLOCK_INIT;
++static struct { u32 taskset, spurs; } s_lfq_tasksets[32];
++static unsigned s_lfq_ntasksets;
++
++static void spurs_taskset_remember(u32 spurs_ea, u32 taskset_ea)
++{
++    AcquireSRWLockExclusive(&s_lfq_ts_lock);
++    unsigned i = 0;
++    for (; i < s_lfq_ntasksets; i++)
++        if (s_lfq_tasksets[i].taskset == taskset_ea) break;
++    if (i < 32) {
++        s_lfq_tasksets[i].taskset = taskset_ea;
++        s_lfq_tasksets[i].spurs   = spurs_ea;
++        if (i == s_lfq_ntasksets) s_lfq_ntasksets++;
++    }
++    ReleaseSRWLockExclusive(&s_lfq_ts_lock);
++}
++
+ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+                                 u64 args, const u8* priority, u32 maxContention,
+                                 u32 taskset_size)
+@@ -934,6 +959,7 @@ static s32 spurs_create_taskset(CellSpurs* spurs, CellSpursTaskset* taskset,
+     g_ydkj_real_taskset_ea = taskset_ea;
+ 
+     g_ydkj_real_spurs_ea = spurs_ea;   /* capture for the taskset-policy handoff (LS[0x1C0]) */
++    spurs_taskset_remember(spurs_ea, taskset_ea);
+     printf("[cellSpurs] CreateTaskset() ea=0x%08X spurs=0x%08X (real BE layout)\n", taskset_ea, spurs_ea);
+     return CELL_OK;
+ }
+@@ -3501,3 +3527,142 @@ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea)
+     if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] LFQueueAttachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
+     return CELL_OK;
+ }
++
++/* ---------------------------------------------------------------------------
++ * _cellSpursLFQueuePushBody(CellSpursLFQueue* q, const void* buffer, u32 isBlocking)
++ *
++ * Adapted from ico-recomp port/stubs.cpp, ico_LFQueuePushBody (MIT, commit
++ * 55b66b94d2f411019ce2ac4f0d8f9df363cd3ecd; notice in the f2nd-recomp port's
++ * THIRD_PARTY_NOTICES.md). RPCS3 has no HLE body for this export (it runs the real
++ * libsre) and its cellSync models only the PPU2SPU push; the layout below is the
++ * CellSyncLFQueue one RPCS3 uses (pop1 +0x00, push1 +0x08, size +0x10, depth +0x14,
++ * buffer +0x18, direction +0x24, push2 pack, m_hs1 +0x32, eaSignal +0x70), and the
++ * ANY2ANY parts follow what the lifted SPU consumer (Edge zlib) reads:
++ *
++ *   +0x00 u16 pop1.m_h1   pops completed      +0x06 u16 pop1.m_h4  pops claimed
++ *   +0x08 u16 push1.m_h5  pushes published    +0x10 u32 size, +0x14 u32 depth
++ *   +0x18 u64 buffer                          +0x24 u32 direction
++ *   +0x30 u16 waiter pack (A<<10 | B<<5 | C)  +0x32 u16 m_hs1[15] waiter ids
++ *   +0x70 u64 eaSignal (taskset, or SPURS | 1)
++ *
++ * Counters run modulo 2*depth and a pointer p names slot p mod depth. A consumer
++ * that finds nothing registers its id at m_hs1[C mod 15], advances C and waits;
++ * once signalled it advances B. The producer advances A when it signals, so
++ * (C-A) mod 30 are waiting unsignalled and (A-B) mod 30 signalled but not back.
++ * With direction 3 (ANY2ANY) the pack lives in pop1.m_h3 (+0x04) instead of +0x30.
++ *
++ * PPU pushes are serialized, so publication is in order and push1.m_h5 is both
++ * the next free pointer and the published count. The line is changed under the
++ * SPU lock-line lock, atomic against the consumer's GETLLAR/PUTLLC; the accesses
++ * inside are raw, because vm_read/vm_write take that same non-recursive lock.
++ * Error codes are RPCS3's CellSpursTaskError values (0x804109xx), written out:
++ * the CELL_SPURS_TASK_ERROR_* macros in cellSpurs.h sit on the 0x804107xx core
++ * base and do not match the firmware.
++ * -----------------------------------------------------------------------*/
++static inline u16 lfq_r16(u32 a) { const uint8_t* p = vm_base + a; return (u16)((p[0] << 8) | p[1]); }
++static inline u32 lfq_r32(u32 a) { const uint8_t* p = vm_base + a; return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3]; }
++static inline void lfq_w16(u32 a, u16 v) { uint8_t* p = vm_base + a; p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
++
++/* Optional observer, called after each published element (outside the line lock)
++ * with the queue, the guest address of the slot and its size. NULL by default; a
++ * port can install one for diagnostics. */
++void (*g_spurs_lfqueue_push_observer)(u32 queue_ea, u32 slot_ea, u32 size) = NULL;
++
++/* Wake waiter `id` of queue `q`, whose eaSignal is `sig`. */
++static void spurs_lfqueue_signal(u32 q, u32 sig, u16 id)
++{
++    extern void spu_taskset_signal_task(uint32_t taskset_ea, uint32_t taskId);
++    const u32 tid = id & 0xFFu;
++    if (!(sig & 1u)) { spu_taskset_signal_task(sig, tid); return; }
++
++    /* eaSignal = SPURS | 1 does not say which taskset consumes the queue, and the
++     * waiter id cannot either (every taskset here has wid 0). Bind the queue to the
++     * taskset it signalled while that was the only one on its SPURS; an unbound
++     * queue signals that task id in each of them, and says so once. */
++    static struct { u32 q, taskset; } s_bind[16];
++    static unsigned s_nbind;
++    const u32 spurs = sig & ~0x7Fu;
++    u32 hits[32]; unsigned n = 0; u32 bound = 0;
++    AcquireSRWLockExclusive(&s_lfq_ts_lock);
++    for (unsigned i = 0; i < s_lfq_ntasksets; i++)
++        if (s_lfq_tasksets[i].spurs == spurs) hits[n++] = s_lfq_tasksets[i].taskset;
++    for (unsigned i = 0; i < s_nbind; i++)
++        if (s_bind[i].q == q) { bound = s_bind[i].taskset; break; }
++    if (!bound && n == 1 && s_nbind < 16) {
++        s_bind[s_nbind].q = q; s_bind[s_nbind].taskset = hits[0]; s_nbind++;
++        bound = hits[0];
++        printf("[cellSpurs] LFQueue q=0x%08X bound to taskset 0x%08X\n", q, bound);
++    }
++    ReleaseSRWLockExclusive(&s_lfq_ts_lock);
++    if (bound) { spu_taskset_signal_task(bound, tid); return; }
++    { static int warned;
++      if (!warned++)
++          fprintf(stderr, "[cellSpurs] LFQueue signal: q=0x%08X unbound, SPURS 0x%08X owns %u tasksets; "
++                  "signalling task %u in each\n", q, spurs, n, tid); }
++    for (unsigned i = 0; i < n; i++) spu_taskset_signal_task(hits[i], tid);
++}
++
++s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u32 isBlocking)
++{
++    static SRWLOCK s_push_lock = SRWLOCK_INIT;
++    const u32 q = (u32)queue_ea, src = (u32)buffer_ea;
++    if (!q || !src) return (s32)0x80410911u;                  /* CELL_SPURS_TASK_ERROR_NULL_POINTER */
++    if (q & 0x7Fu)  return (s32)0x80410910u;                  /* CELL_SPURS_TASK_ERROR_ALIGN */
++
++    AcquireSRWLockExclusive(&s_push_lock);
++    for (unsigned spins = 0;; spins++) {
++        u16 waiter = 0; int signal = 0; u32 sig = 0;
++
++        spu_lockline_lock();
++        const u32 size  = lfq_r32(q + 0x10);
++        const u32 depth = lfq_r32(q + 0x14);
++        const u32 buf   = lfq_r32(q + 0x1C);                  /* low half of the u64 */
++        if (!depth || depth > 0x7FFF || !size) {
++            spu_lockline_unlock();
++            ReleaseSRWLockExclusive(&s_push_lock);
++            return (s32)0x80410902u;                          /* CELL_SPURS_TASK_ERROR_INVAL */
++        }
++        const u32 ring = depth * 2;
++        const u32 h1 = lfq_r16(q + 0x00), h4 = lfq_r16(q + 0x06), h5 = lfq_r16(q + 0x08);
++        const u32 used = (h5 + ring - h1) % ring;
++
++        if (used < depth) {
++            const u32 slot = h5 >= depth ? h5 - depth : h5;
++            const u32 slot_ea = buf + slot * size;
++            memcpy(vm_base + slot_ea, vm_base + src, size);
++            const u32 nh5 = h5 + 1 == ring ? 0 : h5 + 1;
++            lfq_w16(q + 0x08, (u16)nh5);
++
++            const u32 pack_ea = lfq_r32(q + 0x24) == 3 ? q + 0x04 : q + 0x30;
++            const u16 P = lfq_r16(pack_ea);
++            const u32 A = (P >> 10) & 31, B = (P >> 5) & 31, C = P & 31;
++            const u32 waiting  = (C + 30 - A) % 30;
++            const u32 signaled = (A + 30 - B) % 30;
++            const u32 avail    = (nh5 + ring - h4) % ring;
++            if (waiting && signaled < avail) {
++                waiter = lfq_r16(q + 0x32 + 2 * (A % 15));
++                const u32 nA = A == 29 ? 0 : A + 1;
++                lfq_w16(pack_ea, (u16)((P & 0x83FFu) | (nA << 10)));
++                signal = 1;
++                sig = lfq_r32(q + 0x74);                      /* low half of eaSignal */
++            }
++            spu_coh_notify_write(q);
++            spu_lockline_unlock();
++            ReleaseSRWLockExclusive(&s_push_lock);
++
++            if (g_spurs_lfqueue_push_observer) g_spurs_lfqueue_push_observer(q, slot_ea, size);
++            if (signal && sig) spurs_lfqueue_signal(q, sig, waiter);
++            static int _n = 0;
++            if (PS3_LOG_FIRST(_n, 8))
++                printf("[cellSpurs] LFQueuePush q=0x%08X slot=%u h5->%u%s\n", q, slot, nh5,
++                       signal ? " (signalled waiter)" : "");
++            return CELL_OK;
++        }
++        spu_lockline_unlock();
++
++        if (!isBlocking) { ReleaseSRWLockExclusive(&s_push_lock); return (s32)0x80410901u; } /* TASK_ERROR_AGAIN */
++        /* Full: a PPU producer cannot be woken by a SPURS task signal, so poll for
++         * the consumer to complete pops instead of registering in m_hs2. */
++        Sleep(spins < 64 ? 0 : 1);
++    }
++}
+diff --git a/libs/spurs/cellSpurs.h b/libs/spurs/cellSpurs.h
+index 3c276b8132d1565127c01c645270f2de6e03117b..b7c3503cace92c53c8d86c095df246bc73074f84 100644
+--- a/libs/spurs/cellSpurs.h
++++ b/libs/spurs/cellSpurs.h
+@@ -309,6 +309,8 @@ s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea);
+ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+                                 u32 size, u32 depth, u32 direction);
+ s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
++s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 buffer_ea, u32 isBlocking);
++extern void (*g_spurs_lfqueue_push_observer)(u32 queue_ea, u32 slot_ea, u32 size);
+ 
+ s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
+ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,

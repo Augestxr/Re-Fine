@@ -1,0 +1,85 @@
+<rml>
+<head>
+    <title>Re:Fine Setup</title>
+    <link type="text/rcss" href="setup.rcss"/>
+</head>
+<body>
+    <div id="bg"></div>
+    <div id="shade"></div>
+    <div id="card">
+        <div id="head"><span id="brand">Re:Fine</span><span id="stepno"></span></div>
+        <div id="body">
+
+            <div class="screen" id="s_welcome">
+                <div class="h1">Welcome</div>
+                <div class="p">Re:Fine runs Hatsune Miku: Project DIVA F on your PC. It is built here, from your own copy of the game. Nothing of the game is included in this installer.</div>
+                <div class="p dim">You need the disc files of BLUS31319 (USA), version 01.00.</div>
+            </div>
+
+            <div class="screen" id="s_game">
+                <div class="h1">Your game</div>
+                <div class="p">Choose the folder of your game: the one that contains PS3_GAME.</div>
+                <div class="pathrow"><div class="path" id="game_path">No folder chosen</div><div class="btn" id="btn_game">Browse</div></div>
+                <div class="status" id="game_status"></div>
+            </div>
+
+            <div class="screen" id="s_rpcs3">
+                <div class="h1">Open the game file</div>
+                <div class="p">Your game file is encrypted. Re:Fine asks your own RPCS3 to open it; nothing else is needed. Choose the folder where RPCS3 is installed.</div>
+                <div class="pathrow"><div class="path" id="rpcs3_path">No folder chosen</div><div class="btn" id="btn_rpcs3">Browse</div></div>
+                <div class="status" id="rpcs3_status"></div>
+                <div class="p dim">No RPCS3? It is free at rpcs3.net. <span class="link" id="btn_web">Open rpcs3.net</span></div>
+            </div>
+
+            <div class="screen" id="s_save">
+                <div class="h1">Import save <span class="opt">optional</span></div>
+                <div class="p">Bring your progress from a PS3 or from RPCS3. Choose the folder named NPUB31241_SYSTEM00.</div>
+                <div class="pathrow"><div class="path" id="save_path">No save selected</div><div class="btn" id="btn_save">Browse</div></div>
+                <div class="status" id="save_status"></div>
+                <div class="p dim" id="save_note"></div>
+            </div>
+
+            <div class="screen" id="s_tools">
+                <div class="h1">Download tools</div>
+                <div class="p">Re:Fine is built on this PC from your game. These free tools are missing, so the installer will download them (it checks each file before using it):</div>
+                <div class="p" id="tools_list"></div>
+                <div class="p dim">Windows asks for administrator permission once, for the Microsoft tools. Nothing from your game is sent anywhere.</div>
+            </div>
+
+            <div class="screen" id="s_install">
+                <div class="h1" id="inst_title">Installing</div>
+                <div class="steps">
+                    <div class="step" id="st0"><span class="mark" id="m0"></span>Checking your files</div>
+                    <div class="step" id="st1"><span class="mark" id="m1"></span>Preparing</div>
+                    <div class="step" id="st2"><span class="mark" id="m2"></span>Building the game</div>
+                    <div class="step" id="st3"><span class="mark" id="m3"></span>Creating shortcuts</div>
+                </div>
+                <div id="pbar"><div id="pfill"></div></div>
+                <div class="status" id="inst_status"></div>
+            </div>
+
+            <div class="screen" id="s_done">
+                <div class="h1" id="done_title">Ready to play</div>
+                <div class="p" id="done_text"></div>
+            </div>
+
+            <div class="screen" id="s_unask">
+                <div class="h1">Remove Re:Fine?</div>
+                <div class="p">This removes the program and its shortcuts. Your game files are not touched.</div>
+            </div>
+
+            <div class="screen" id="s_undata">
+                <div class="h1">Your saves and settings</div>
+                <div class="p">Delete them too? They are kept in the folder below.</div>
+                <div class="path set" id="data_path"></div>
+            </div>
+        </div>
+        <div id="foot">
+            <div class="btn quiet" id="btn_back">Back</div>
+            <div class="btn primary" id="btn_next">Next</div>
+            <div class="btn quiet" id="btn_alt"></div>
+        </div>
+    </div>
+    <div id="ver">Setup 1.0.0-rc1</div>
+</body>
+</rml>

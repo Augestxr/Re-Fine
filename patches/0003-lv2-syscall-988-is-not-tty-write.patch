@@ -1,0 +1,27 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 9309f2d305c7caead8c18f4c2b92981b5c50b233..293f0f1f190cafdee19f94430f34dc768024bffa 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3302,8 +3302,20 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+         ctx->gpr[3] = 0;
+         return;
+     }
+-    case 988:     /* sys_tty_write — canonical LV2 number (psdevwiki); some CRTs
+-                   * use this instead of 403. Same ABI. */
++    case 988: {   /* NOT sys_tty_write. RPCS3's table has 988 as a debug syscall
++                   * (sys_dbg_..._ppu_exception_handler) bound to null_func, and
++                   * BLES02029's exit() (0x640F5C) issues it with r3=1, r4=0 before
++                   * running atexit. Treating it as tty_write(buf=r4=0, len=r5) wrote
++                   * 16 KB of guest address 0 to stdout on every exit and buried the
++                   * title's own abort backtrace. Do what RPCS3 does: nothing, and
++                   * report it once. (f2nd-recomp patches/0003) */
++        static int s_988 = 0;
++        if (!s_988++)
++            fprintf(stderr, "[lv2] syscall 988 (sys_dbg ppu exception handler, unimplemented as in RPCS3) r3=0x%llX r4=0x%llX -> CELL_OK\n",
++                    (unsigned long long)ctx->gpr[3], (unsigned long long)ctx->gpr[4]);
++        ctx->gpr[3] = 0;
++        return;
++    }
+     case 403: {   /* sys_tty_write(s32 ch, cptr buf, u32 len, ptr pwritelen) */
+         uint32_t ch   = (uint32_t)ctx->gpr[3];
+         uint32_t buf  = (uint32_t)ctx->gpr[4];

@@ -1,0 +1,2396 @@
+Re:Fine 0111: cellPamf real (formato PAMF de disco), con las 8 funciones que usa F.
+
+Origen: JonathanDC64/ps3recomp, commit ce105e69cbc8cd3615f31c395971f2acf3bb9548
+("cellPamf: parse the real PAMF header layout"),
+MIT, Copyright (c) 2026 Ned Heller / sp00nznet; autor del commit Jonathan Del Corpo.
+Atribucion en THIRD_PARTY_NOTICES.md.
+
+Cambios frente al commit:
+  - nota de atribucion en la cabecera de cellPamf.c;
+  - test_cellPamf.c: stubs spu_lockline_lock_ea/unlock_ea, del commit f7f5e6db del
+    mismo fork (los pide ppu_memory.h de v0.18.0).
+
+diff --git a/libs/codec/cellPamf.c b/libs/codec/cellPamf.c
+index 1b6275d3ad9449a01ebb4e405d6b88b6fdbf8af2..a2813cbd3ed7edcb3e5e67c87654212114c05e34 100644
+--- a/libs/codec/cellPamf.c
++++ b/libs/codec/cellPamf.c
+@@ -1,219 +1,765 @@
+ /*
+  * ps3recomp - cellPamf HLE implementation
+  *
+- * Parses PAMF container headers to extract stream information.
+- * The actual PAMF header format is parsed to provide correct stream
+- * counts and codec parameters to cellDmux/cellVdec/cellAdec.
++ * Reads the real on-disc PAMF header: stream counts, per-stream codec
++ * parameters, presentation times and entry points, as cellDmux/cellVdec/
++ * cellAdec set-up asks for them. Return codes and argument checks follow the
++ * real library (including a few of its quirks, noted where they matter).
++ *
++ * Adapted from JonathanDC64/ps3recomp ce105e69cbc8cd3615f31c395971f2acf3bb9548
++ * (MIT, Copyright (c) 2026 Ned Heller / sp00nznet; commit author Jonathan Del
++ * Corpo). See THIRD_PARTY_NOTICES.md of Re:Fine.
+  */
+ 
+ #include "cellPamf.h"
+-#include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host pointer */
++#include "../../runtime/ppu/ppu_memory.h"   /* vm_ptr8 / vm_read* / vm_write*: guest EA access */
++#include <stddef.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
++#ifdef _WIN32
++#include <windows.h>
++#else
++#include "../../runtime/platform/win32_compat.h"   /* SRWLOCK */
++#endif
+ 
+ /* ---------------------------------------------------------------------------
+- * PAMF file header layout (big-endian on disc)
++ * PAMF header layout (big-endian, byte-packed; offsets from the file start)
+  *
+- * Offset  Size  Description
+- * 0x00    4     Magic "PAMF"
+- * 0x04    4     Version (typically 0x00040100)
+- * 0x08    4     Data offset (header size / start of mux data)
+- * 0x0C    4     Data size
+- * 0x10    4     Stream descriptor table offset
+- * 0x14    2     Number of streams
+- * 0x18    4     Presentation start time (90kHz ticks)
+- * 0x1C    4     Presentation end time (90kHz ticks)
+- * 0x20    4     Mux rate (bytes/sec)
+- * 0x24    4     EP table offset
+- * 0x28    4     EP count
++ * 0x00  4  magic "PAMF"
++ * 0x04  4  version, ASCII "0040" or "0041"
++ * 0x08  4  header_size  \  both in 2048-byte units; the elementary stream
++ * 0x0C  4  data_size    /  data starts right after the header
++ * 0x10  4  psmf_marks_offset, 0x14 psmf_marks_size  (0 in practice)
++ * 0x18  4  unk_offset,        0x1C unk_size         (0 in practice)
++ * 0x20 48  reserved
++ * 0x50     sequence info:
++ *   0x50 4  size (excluding this field)
++ *   0x56 2  start_pts_high   0x58 4 start_pts_low     (90 kHz)
++ *   0x5C 2  end_pts_high     0x5E 4 end_pts_low
++ *   0x62 4  mux_rate_bound (low 22 bits, 50 bytes/s units)
++ *   0x66 4  std_delay_bound
++ *   0x6A 4  total_stream_num
++ *   0x6F 1  grouping_period_num (always 1)
++ * 0x70     grouping period:
++ *   0x70 4  size   0x74 2+4 start pts   0x7A 2+4 end pts
++ *   0x81 1  group_num (always 1)
++ * 0x82     group:
++ *   0x82 4  size   0x87 1 stream_num
++ * 0x88     stream_num x 48-byte stream headers:
++ *   +0  coding type (0x1B AVC, 0x02 M2V, 0xDC ATRAC3+, 0x80 LPCM, 0x81 AC3,
++ *       0xDD user data)
++ *   +4  PES stream_id (0xE0|ch for video, 0xBD private stream for the rest)
++ *   +5  private_stream_id (ATRAC3+ ch, LPCM 0x40|ch, AC3 0x30|ch, user 0x20|ch)
++ *   +6  P-STD buffer   +8 ep_offset (from file start)   +12 ep_num
++ *   +16 32 bytes of codec-specific info (see cellPamfReaderGetStreamInfo)
++ * EP tables: 12 bytes each, sorted by stream, right after the stream headers:
++ *   +0 u16: 2 bits indexN-1, 13 bits nThRefPictureOffset/2048 - 1
++ *   +2 u16 pts_high   +4 u32 pts_low   +8 u32 rpnOffset (2048-byte units)
+  *
+- * We access these via raw byte offsets rather than a packed struct to
+- * avoid alignment/padding issues across compilers.
++ * Only one grouping period with one group is ever produced or supported, so
++ * the group's position is fixed and everything is read at fixed offsets.
+  * -----------------------------------------------------------------------*/
+ 
++#define PAMF_UNIT                 0x800u
++
+ #define PAMF_OFF_MAGIC            0x00
+ #define PAMF_OFF_VERSION          0x04
+-#define PAMF_OFF_DATA_OFFSET      0x08
++#define PAMF_OFF_HEADER_SIZE      0x08
+ #define PAMF_OFF_DATA_SIZE        0x0C
+-#define PAMF_OFF_STREAM_TABLE     0x10
+-#define PAMF_OFF_NUM_STREAMS      0x14
+-#define PAMF_OFF_PRESENT_START    0x18
+-#define PAMF_OFF_PRESENT_END      0x1C
+-#define PAMF_OFF_MUX_RATE         0x20
+-#define PAMF_OFF_EP_OFFSET        0x24
+-#define PAMF_OFF_EP_COUNT         0x28
+-
+-/* Minimum valid header size (enough to read all fields above) */
+-#define PAMF_MIN_HEADER_SIZE      0x2C
+-
+-/* Stream descriptor size (fixed 24 bytes per descriptor) */
+-#define PAMF_STREAM_DESC_SIZE     24
+-
+-/* Raw stream type values in the PAMF file (different from SDK constants!) */
+-#define PAMF_RAW_TYPE_AVC         1
+-#define PAMF_RAW_TYPE_M2V         2
+-#define PAMF_RAW_TYPE_ATRAC3PLUS  3
+-#define PAMF_RAW_TYPE_AC3         4
+-#define PAMF_RAW_TYPE_LPCM        5
+-#define PAMF_RAW_TYPE_USERDATA    6
++#define PAMF_OFF_MARKS_OFFSET     0x10
++#define PAMF_OFF_MARKS_SIZE       0x14
++#define PAMF_OFF_UNK_OFFSET       0x18
++#define PAMF_OFF_UNK_SIZE         0x1C
++
++#define PAMF_OFF_SEQ              0x50
++#define PAMF_OFF_SEQ_START_HI     0x56
++#define PAMF_OFF_SEQ_START_LO     0x58
++#define PAMF_OFF_SEQ_END_HI       0x5C
++#define PAMF_OFF_SEQ_END_LO       0x5E
++#define PAMF_OFF_SEQ_MUX_RATE     0x62
++#define PAMF_OFF_SEQ_TOTAL_NUM    0x6A
++#define PAMF_OFF_SEQ_GP_NUM       0x6F
++
++#define PAMF_OFF_GP               0x70
++#define PAMF_OFF_GP_START_HI      0x74
++#define PAMF_OFF_GP_START_LO      0x76
++#define PAMF_OFF_GP_END_LO        0x7C
++#define PAMF_OFF_GP_GROUP_NUM     0x81
++
++#define PAMF_OFF_GROUP            0x82
++#define PAMF_OFF_GROUP_STREAM_NUM 0x87
++
++#define PAMF_OFF_STREAMS          0x88
++#define PAMF_STREAM_SIZE          48
++#define PAMF_EP_SIZE              12
++
++/* Sizes inside the nested sections, as the real size checks use them */
++#define PAMF_GP_HEAD              0x12   /* grouping period bytes before its group */
++#define PAMF_SEQ_HEAD             0x20   /* sequence info bytes before its period */
++
++/* Fixed part plus the largest stream table: what the real library may read
++ * without consulting header_size. */
++#define PAMF_MAX_FIXED            (PAMF_OFF_STREAMS + 255u * PAMF_STREAM_SIZE)
++
++/* Stream header fields */
++#define ST_CODING                 0
++#define ST_STREAM_ID              4
++#define ST_PRIVATE_ID             5
++#define ST_EP_OFFSET              8
++#define ST_EP_NUM                 12
++#define ST_INFO                   16
++
++#define PTS_MAX                   0xFFFFFFFFull   /* CODEC_TS_INVALID */
++
++/* The guest-layout structs in cellPamf.h must keep the SDK sizes/offsets. */
++_Static_assert(sizeof(CellPamfAvcInfo) == 0x20, "CellPamfAvcInfo size");
++_Static_assert(sizeof(CellPamfM2vInfo) == 0x18, "CellPamfM2vInfo size");
++_Static_assert(sizeof(CellPamfLpcmInfo) == 8 &&
++               offsetof(CellPamfLpcmInfo, bitsPerSample) == 6, "CellPamfLpcmInfo layout");
++_Static_assert(sizeof(CellPamfAtrac3plusInfo) == 8 && sizeof(CellPamfAc3Info) == 8,
++               "audio info size");
++_Static_assert(sizeof(CellPamfEp) == 0x18 && sizeof(CellPamfEpUnk) == 0x20, "CellPamfEp size");
++_Static_assert(sizeof(CellPamfEpIterator) == 0x10, "CellPamfEpIterator size");
+ 
+ /* ---------------------------------------------------------------------------
+- * Endian helpers (PAMF is big-endian)
++ * Byte helpers
+  * -----------------------------------------------------------------------*/
+-static u32 be32(const void* p)
++static u16 be16(const u8* p) { return (u16)((p[0] << 8) | p[1]); }
++static u32 be32(const u8* p)
++{
++    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
++}
++static void put16(u8* p, u32 v) { p[0] = (u8)(v >> 8); p[1] = (u8)v; }
++static void put32(u8* p, u32 v)
++{
++    p[0] = (u8)(v >> 24); p[1] = (u8)(v >> 16); p[2] = (u8)(v >> 8); p[3] = (u8)v;
++}
++
++/* Pointer arguments arrive as raw guest EAs (ppu_hle.cpp's generic adapter). */
++static u32 ea_of(const void* p) { return (u32)(uintptr_t)p; }
++
++static u64 pts_of(const u8* hi, const u8* lo) { return ((u64)be16(hi) << 32) | be32(lo); }
++
++/* ---------------------------------------------------------------------------
++ * SDK stream type <-> on-disc stream identification
++ * -----------------------------------------------------------------------*/
++
++/* Per SDK type: coding type, stream_id and private_stream_id base. The
++ * channel goes into stream_id for video (0xE0) and private_stream_id
++ * otherwise. Types 6-9 are the PSMF flavours, coding type 0xFF. */
++static const struct { u8 coding, sid, psid; } k_type_ids[10] = {
++    { CELL_PAMF_CODEC_TYPE_AVC,        0xE0, 0x00 },
++    { CELL_PAMF_CODEC_TYPE_M2V,        0xE0, 0x00 },
++    { CELL_PAMF_CODEC_TYPE_ATRAC3PLUS, 0xBD, 0x00 },
++    { CELL_PAMF_CODEC_TYPE_LPCM,       0xBD, 0x40 },
++    { CELL_PAMF_CODEC_TYPE_AC3,        0xBD, 0x30 },
++    { CELL_PAMF_CODEC_TYPE_USER_DATA,  0xBD, 0x20 },
++    { CELL_PAMF_CODEC_TYPE_PSMF,       0xE0, 0x00 },
++    { CELL_PAMF_CODEC_TYPE_PSMF,       0xBD, 0x00 },
++    { CELL_PAMF_CODEC_TYPE_PSMF,       0xBD, 0x10 },
++    { CELL_PAMF_CODEC_TYPE_PSMF,       0xBD, 0x20 },
++};
++
++static s32 pamf_type_to_stream(u8 type, u8 ch, u8* coding, u8* sid, u8* psid)
++{
++    /* The real library ORs any channel in unchecked; above 15 the ids collide
++     * with other types, so refuse it. */
++    if (type >= 10 || ch > 15)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const int video = k_type_ids[type].sid == 0xE0;
++    if (coding) *coding = k_type_ids[type].coding;
++    if (sid)    *sid    = (u8)(k_type_ids[type].sid | (video ? ch : 0));
++    if (psid)   *psid   = (u8)(k_type_ids[type].psid | (video ? 0 : ch));
++    return CELL_OK;
++}
++
++static s32 pamf_stream_to_type(u8 coding, u8 sid, u8 psid, u8* type, u8* ch)
+ {
+-    const u8* b = (const u8*)p;
+-    return ((u32)b[0] << 24) | ((u32)b[1] << 16) | ((u32)b[2] << 8) | b[3];
++    u8 t, c = (u8)(psid & 0x0F);
++
++    switch (coding) {
++    case CELL_PAMF_CODEC_TYPE_AVC:        t = CELL_PAMF_STREAM_TYPE_AVC; c = sid & 0x0F; break;
++    case CELL_PAMF_CODEC_TYPE_M2V:        t = CELL_PAMF_STREAM_TYPE_M2V; c = sid & 0x0F; break;
++    case CELL_PAMF_CODEC_TYPE_ATRAC3PLUS: t = CELL_PAMF_STREAM_TYPE_ATRAC3PLUS; break;
++    case CELL_PAMF_CODEC_TYPE_LPCM:       t = CELL_PAMF_STREAM_TYPE_PAMF_LPCM; break;
++    case CELL_PAMF_CODEC_TYPE_AC3:        t = CELL_PAMF_STREAM_TYPE_AC3; break;
++    case CELL_PAMF_CODEC_TYPE_USER_DATA:  t = CELL_PAMF_STREAM_TYPE_USER_DATA; break;
++    case CELL_PAMF_CODEC_TYPE_PSMF:
++        if ((sid & 0xF0) == 0xE0) {
++            if (psid != 0)
++                return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
++            t = CELL_PAMF_STREAM_TYPE_PSMF_AVC;
++            c = sid & 0x0F;
++        } else if (sid == 0xBD) {
++            switch (psid & 0xF0) {
++            case 0x00: t = CELL_PAMF_STREAM_TYPE_PSMF_ATRAC3PLUS; break;
++            /* 0x20 (user data) also reports PSMF_LPCM on the real library */
++            case 0x10: case 0x20: t = CELL_PAMF_STREAM_TYPE_PSMF_LPCM; break;
++            default: return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
++            }
++        } else {
++            return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
++        }
++        break;
++    default:
++        return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
++    }
++
++    if (type) *type = t;
++    if (ch)   *ch   = c;
++    return CELL_OK;
+ }
+ 
+-static u64 be64(const void* p)
++/* Does stream type `type` satisfy the requested (possibly pseudo) type? */
++static int pamf_same_type(u8 type, u8 req)
+ {
+-    const u8* b = (const u8*)p;
+-    return ((u64)be32(b) << 32) | be32(b + 4);
++    switch (req) {
++    case CELL_PAMF_STREAM_TYPE_VIDEO:
++        return type == CELL_PAMF_STREAM_TYPE_AVC || type == CELL_PAMF_STREAM_TYPE_M2V;
++    case CELL_PAMF_STREAM_TYPE_AUDIO:
++        return type == CELL_PAMF_STREAM_TYPE_ATRAC3PLUS || type == CELL_PAMF_STREAM_TYPE_AC3 ||
++               type == CELL_PAMF_STREAM_TYPE_PAMF_LPCM;
++    case CELL_PAMF_STREAM_TYPE_UNK:
++        return type == CELL_PAMF_STREAM_TYPE_PAMF_LPCM ||
++               type == CELL_PAMF_STREAM_TYPE_PSMF_ATRAC3PLUS;
++    default:
++        return type == req;
++    }
+ }
+ 
+-static u16 be16(const void* p)
++static s32 stream_type_of(const u8* s, u8* type, u8* ch)
+ {
+-    const u8* b = (const u8*)p;
+-    return ((u16)b[0] << 8) | b[1];
++    return pamf_stream_to_type(s[ST_CODING], s[ST_STREAM_ID], s[ST_PRIVATE_ID], type, ch);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * Raw-type to SDK-type conversion
++ * Header validation
+  * -----------------------------------------------------------------------*/
+-static s32 raw_type_to_sdk(u8 rawType)
+-{
+-    switch (rawType) {
+-    case PAMF_RAW_TYPE_AVC:        return CELL_PAMF_STREAM_TYPE_AVC;
+-    case PAMF_RAW_TYPE_M2V:        return CELL_PAMF_STREAM_TYPE_M2V;
+-    case PAMF_RAW_TYPE_ATRAC3PLUS: return CELL_PAMF_STREAM_TYPE_ATRAC3PLUS;
+-    case PAMF_RAW_TYPE_AC3:        return CELL_PAMF_STREAM_TYPE_AC3;
+-    case PAMF_RAW_TYPE_LPCM:       return CELL_PAMF_STREAM_TYPE_PAMF_LPCM;
+-    case PAMF_RAW_TYPE_USERDATA:   return CELL_PAMF_STREAM_TYPE_USER_DATA;
+-    default:                       return -1;
++
++static s32 pamf_check_magic(const u8* h, u16* version)
++{
++    if (be32(h + PAMF_OFF_MAGIC) != CELL_PAMF_MAGIC)
++        return (s32)CELL_PAMF_ERROR_UNKNOWN_TYPE;
++    switch (be32(h + PAMF_OFF_VERSION)) {
++    case CELL_PAMF_VERSION_0040: if (version) *version = 40; return CELL_OK;
++    case CELL_PAMF_VERSION_0041: if (version) *version = 41; return CELL_OK;
++    default: return (s32)CELL_PAMF_ERROR_UNSUPPORTED_VERSION;
++    }
++}
++
++/* cellPamfGetStreamOffsetAndSize: magic, version and the two section sizes.
++ * The elementary stream data starts at header_size. */
++static s32 pamf_sizes(const u8* h, u64 fileSize, u64* headerSize, u64* dataSize)
++{
++    s32 rc = pamf_check_magic(h, NULL);
++    if (rc != CELL_OK)
++        return rc;
++    const u64 hs = (u64)be32(h + PAMF_OFF_HEADER_SIZE) * PAMF_UNIT;
++    const u64 ds = (u64)be32(h + PAMF_OFF_DATA_SIZE) * PAMF_UNIT;
++    if (hs == 0 || (fileSize != 0 && hs + ds != fileSize))
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    if (headerSize) *headerSize = hs;
++    if (dataSize)   *dataSize = ds;
++    return CELL_OK;
++}
++
++/* Full validation (CELL_PAMF_ATTRIBUTE_VERIFY_ON, cellPamfVerify): the real
++ * library's checks in its order, so a title gets the same verdict. Offsets
++ * from the header start stand in for its absolute addresses (0 = unset is
++ * still unambiguous: nothing it compares can sit at offset 0). `limit` is
++ * how much of `h` may be read at all -- the real library trusts header_size,
++ * a host buffer can't. */
++static s32 pamf_verify(const u8* h, u32 limit, u64 fileSize, u32 attribute, u16* version)
++{
++    if (limit < PAMF_OFF_SEQ)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    s32 rc = pamf_check_magic(h, version);
++    if (rc != CELL_OK)
++        return rc;
++
++    const u64 hs = (u64)be32(h + PAMF_OFF_HEADER_SIZE) * PAMF_UNIT;
++    const u64 ds = (u64)be32(h + PAMF_OFF_DATA_SIZE) * PAMF_UNIT;
++    if (hs == 0 || (fileSize != 0 && hs + ds != fileSize))
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    const u32 marks_off = be32(h + PAMF_OFF_MARKS_OFFSET);
++    const u32 marks_size = be32(h + PAMF_OFF_MARKS_SIZE);
++    const u32 unk_off = be32(h + PAMF_OFF_UNK_OFFSET);
++    const u32 unk_size = be32(h + PAMF_OFF_UNK_SIZE);
++
++    /* Optional sections: offset and size both set or both zero, inside the header */
++    if (marks_off == 0 ? marks_size != 0
++                       : (marks_size == 0 || hs < (u64)marks_off + marks_size))
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    if (unk_off == 0 ? unk_size != 0
++                     : (unk_size == 0 || hs < (u64)unk_off + unk_size))
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    if (unk_off < (u64)marks_off + marks_size)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    if (limit < PAMF_OFF_STREAMS)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    /* Sequence info */
++    const u32 seq_size = be32(h + PAMF_OFF_SEQ);
++    if (PAMF_OFF_SEQ + 4 + (u64)seq_size > hs)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    const u64 start = pts_of(h + PAMF_OFF_SEQ_START_HI, h + PAMF_OFF_SEQ_START_LO);
++    const u64 end   = pts_of(h + PAMF_OFF_SEQ_END_HI, h + PAMF_OFF_SEQ_END_LO);
++    if (end > PTS_MAX || start >= end)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    if (h[PAMF_OFF_SEQ_GP_NUM] != 1)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    /* Grouping period. Its end pts is taken with the START high half -- a
++     * real-library bug, harmless since the high halves are always 0. */
++    const u32 gp_size = be32(h + PAMF_OFF_GP);
++    if (PAMF_OFF_GP + 4 + (u64)gp_size > hs)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    const u64 gp_start = pts_of(h + PAMF_OFF_GP_START_HI, h + PAMF_OFF_GP_START_LO);
++    const u64 gp_end   = pts_of(h + PAMF_OFF_GP_START_HI, h + PAMF_OFF_GP_END_LO);
++    if (gp_end > PTS_MAX || gp_start >= gp_end || gp_start != start)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    if (h[PAMF_OFF_GP_GROUP_NUM] != 1)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    /* Group */
++    const u32 group_size = be32(h + PAMF_OFF_GROUP);
++    if (PAMF_OFF_GROUP + 4 + (u64)group_size > hs)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    const u32 stream_num = h[PAMF_OFF_GROUP_STREAM_NUM];
++    if (stream_num == 0)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    if (PAMF_OFF_STREAMS + stream_num * PAMF_STREAM_SIZE > limit)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    /* Streams: known type, one channel per type, EP tables contiguous and in
++     * stream order, EP pts valid and rpnOffsets ascending within the data. */
++    u16 used[10] = { 0 };
++    u32 eps_start = 0, next_eps = 0;
++
++    for (u32 i = 0; i < stream_num; i++) {
++        const u8* s = h + PAMF_OFF_STREAMS + i * PAMF_STREAM_SIZE;
++        u8 type, ch;
++        if (stream_type_of(s, &type, &ch) != CELL_OK)
++            return (s32)CELL_PAMF_ERROR_UNKNOWN_STREAM;
++        if (used[type] & (1u << ch))
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++        used[type] |= (u16)(1u << ch);
++
++        const u32 ep_off = be32(s + ST_EP_OFFSET);
++        const u32 ep_num = be32(s + ST_EP_NUM);
++        if (ep_num == 0 ? ep_off != 0
++                        : (ep_off == 0 || ep_off + (u64)ep_num * PAMF_EP_SIZE > hs))
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++        if (ep_off == 0 || (attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER))
++            continue;
++        if (ep_off + (u64)ep_num * PAMF_EP_SIZE > limit)
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++        if (eps_start == 0)
++            eps_start = next_eps = ep_off;
++        else if (next_eps != ep_off)
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++        u64 prev_rpn = 0;
++        for (u32 e = 0; e < ep_num; e++) {
++            const u8* ep = h + ep_off + e * PAMF_EP_SIZE;
++            const u64 rpn = (u64)be32(ep + 8) * PAMF_UNIT;
++            if (pts_of(ep + 2, ep + 4) > PTS_MAX || rpn > ds || rpn < prev_rpn)
++                return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++            prev_rpn = rpn;
++        }
++        next_eps += ep_num * PAMF_EP_SIZE;
+     }
++
++    /* Nested section sizes must fit their parents. Arithmetic deliberately as
++     * the real library does it: the left sides wrap at 32 bits, and a
++     * too-small parent wraps the right side huge (the check then passes). */
++    if ((u32)(group_size + 4) > (u64)gp_size - PAMF_GP_HEAD + 4 ||
++        (u32)(gp_size + 4) > (u64)seq_size - PAMF_SEQ_HEAD + 4)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    if (be32(h + PAMF_OFF_SEQ_TOTAL_NUM) != stream_num)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    /* What follows the stream headers: EP tables, else marks, else unk. */
++    if (eps_start == 0)
++        eps_start = marks_off ? marks_off : unk_off;
++    if (eps_start != 0 && PAMF_OFF_GP + 4 + (u64)gp_size != eps_start)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    if (next_eps != 0 && marks_off == 0) {
++        if (unk_off != 0 && unk_off != next_eps)
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    } else if (next_eps != 0 && marks_off != next_eps) {
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    } else if (marks_off != 0 && !(attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER)) {
++        if ((u64)marks_off + 8 > limit)
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++        const u32 msize = be32(h + marks_off);
++        if (msize + 4 != marks_size)
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++        /* marks count read at +6 (not +4) -- as the real library does */
++        if (2u + be16(h + marks_off + 6) * 0x28u != msize)
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    }
++
++    return CELL_OK;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+  * Reader state lives HOST-side, keyed by the guest EA.
+  *
+- * The title allocates a CellPamfReader and passes its address in. Our
+- * CellPamfReader is a HOST-layout struct -- an 8-byte void* first member, 32
+- * bytes total -- while the guest's is 28 bytes with a 4-byte pointer. So we
+- * cannot simply translate the pointer and write through it: that stores four
+- * bytes past the end of the caller's struct, and the pamfAddr field would hold
+- * a 64-bit host pointer the guest could never use. Key off the EA instead and
+- * never write the guest's copy; the title treats the reader as opaque.
++ * The title's CellPamfReader is 128 opaque bytes to it; we never write them
++ * and keep the state here instead, keyed off the object's address. The header
++ * itself stays where it is: in guest memory for cellPamfReaderInitialize (as
++ * on the real library, which keeps a pointer), or in a host buffer we own for
++ * pamf_reader_init_host.
+  *
+- * ponytail: linear scan over 8 slots. A title juggling more PAMF readers than
+- * that wants a hash; nothing has needed even two.
++ * There is no reader finalise call, so a guest reader's slot is only reused
++ * when the same object is initialised again, or evicted (oldest guest reader
++ * first) once all slots are taken -- titles keep readers on the stack, so the
++ * same few addresses come round again.
+  * -----------------------------------------------------------------------*/
+-#define PAMF_MAX_READERS 8
+-static struct { u32 ea; int in_use; CellPamfReader r; } s_readers[PAMF_MAX_READERS];
++#define PAMF_MAX_READERS 16
++
++typedef struct pamf_state {
++    u32       ea;          /* guest EA of the CellPamfReader: the key */
++    int       in_use;
++    u32       seq;         /* initialisation order, for eviction */
++    const u8* hdr;         /* host view of the header */
++    u8*       owned;       /* == hdr when the header is ours to free */
++    u32       hdr_ea;      /* guest EA of the header (0 when host-owned) */
++    u32       limit;       /* bytes of hdr that may be read */
++    u32       attribute;
++    u16       version;     /* 40/41, set by verification */
++    u64       headerSize;  /* set by verification, as on the real library */
++    u64       dataSize;
++    s32       cur;         /* current stream index, -1 = none */
++} pamf_state;
++
++static pamf_state s_readers[PAMF_MAX_READERS];
++static u32 s_seq;
++static SRWLOCK s_lock = SRWLOCK_INIT;   /* cellSail sets readers up from its own threads */
++
++static void slots_lock(void)   { AcquireSRWLockExclusive(&s_lock); }
++static void slots_unlock(void) { ReleaseSRWLockExclusive(&s_lock); }
++
++static void slot_clear(pamf_state* st)
++{
++    free(st->owned);
++    memset(st, 0, sizeof(*st));
++}
+ 
+-static CellPamfReader* pamf_host(CellPamfReader* guest_ea)
++static pamf_state* slot_find(u32 ea)
+ {
+-    u32 ea = (u32)(uintptr_t)guest_ea;
+-    if (!ea)
+-        return NULL;
+     for (int i = 0; i < PAMF_MAX_READERS; i++)
+         if (s_readers[i].in_use && s_readers[i].ea == ea)
+-            return &s_readers[i].r;
+-    for (int i = 0; i < PAMF_MAX_READERS; i++)
+-        if (!s_readers[i].in_use) {
+-            s_readers[i].in_use = 1;
+-            s_readers[i].ea = ea;
+-            memset(&s_readers[i].r, 0, sizeof(s_readers[i].r));
+-            return &s_readers[i].r;
+-        }
++            return &s_readers[i];
+     return NULL;
+ }
+ 
+-/* --------------------------------------------------------------------------- 
+- * Reader lifecycle
+- * -----------------------------------------------------------------------*/
++/* The slot for `ea`, emptied (its owned header freed) and ready to fill. */
++static pamf_state* slot_claim(u32 ea)
++{
++    slots_lock();
++    pamf_state* st = slot_find(ea);
++    if (!st) {
++        pamf_state* oldest_guest = NULL;
++        pamf_state* oldest = NULL;
++        for (int i = 0; i < PAMF_MAX_READERS && !st; i++) {
++            pamf_state* c = &s_readers[i];
++            if (!c->in_use) { st = c; break; }
++            if (!c->owned && (!oldest_guest || c->seq < oldest_guest->seq)) oldest_guest = c;
++            if (!oldest || c->seq < oldest->seq) oldest = c;
++        }
++        if (!st) {
++            st = oldest_guest ? oldest_guest : oldest;
++            printf("[cellPamf] reader slots full: evicting reader 0x%08X\n", st->ea);
++        }
++    }
++    slot_clear(st);
++    st->in_use = 1;
++    st->ea = ea;
++    st->seq = ++s_seq;
++    st->cur = -1;
++    slots_unlock();
++    return st;
++}
++
++static void slot_release(pamf_state* st)
++{
++    slots_lock();
++    slot_clear(st);
++    slots_unlock();
++}
++
++static pamf_state* pamf_get(const CellPamfReader* reader)
++{
++    const u32 ea = ea_of(reader);
++    if (!ea)
++        return NULL;
++    slots_lock();
++    pamf_state* st = slot_find(ea);
++    slots_unlock();
++    return st;
++}
+ 
+-s32 cellPamfReaderInitialize(CellPamfReader* reader, void* pamfAddr,
+-                              u32 pamfSize, u32 attribute)
++static u32 st_stream_num(const pamf_state* st)
+ {
+-    reader = pamf_host(reader);
+-    (void)attribute;
++    return st->hdr[PAMF_OFF_GP_GROUP_NUM] ? st->hdr[PAMF_OFF_GROUP_STREAM_NUM] : 0;
++}
+ 
+-    printf("[cellPamf] ReaderInitialize(addr=%p, size=%u)\n", pamfAddr, pamfSize);
++static const u8* st_stream(const pamf_state* st, u32 i)
++{
++    return st->hdr + PAMF_OFF_STREAMS + i * PAMF_STREAM_SIZE;
++}
+ 
+-    if (!reader || !pamfAddr || pamfSize < PAMF_MIN_HEADER_SIZE)
+-        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++static const u8* st_cur(const pamf_state* st)
++{
++    return st->cur >= 0 ? st_stream(st, (u32)st->cur) : NULL;
++}
+ 
+-    pamfAddr = GUEST_PTR(pamfAddr, void*);
+-    const u8* base = (const u8*)pamfAddr;
++/* The current stream's packed EP table, NULL if it has none or the table is
++ * not inside the readable header. */
++static const u8* st_eps(const pamf_state* st, u32* ep_off)
++{
++    const u8* s = st_cur(st);
++    if (!s)
++        return NULL;
++    const u32 off = be32(s + ST_EP_OFFSET), num = be32(s + ST_EP_NUM);
++    if (num == 0 || off == 0 || off + (u64)num * PAMF_EP_SIZE > st->limit)
++        return NULL;
++    if (ep_off) *ep_off = off;
++    return st->hdr + off;
++}
+ 
+-    /* Verify magic */
+-    u32 magic = be32(base + PAMF_OFF_MAGIC);
+-    if (magic != CELL_PAMF_MAGIC) {
+-        printf("[cellPamf] Invalid PAMF magic: 0x%08X\n", magic);
+-        return (s32)CELL_PAMF_ERROR_INVALID_HEADER;
+-    }
++static u32 st_ep_num(const pamf_state* st)
++{
++    const u8* s = st_cur(st);
++    return s ? be32(s + ST_EP_NUM) : 0;
++}
++
++/* How much of a guest-resident header may be read: its header_size, but never
++ * less than the fixed part plus a full stream table (the real library reads
++ * those without looking at header_size), and never past the 4 GB guest space. */
++static u32 guest_span(u32 ea)
++{
++    u64 span = (u64)vm_read32(ea + PAMF_OFF_HEADER_SIZE) * PAMF_UNIT;
++    if (span < PAMF_MAX_FIXED)
++        span = PAMF_MAX_FIXED;
++    const u64 room = 0x100000000ull - ea;
++    if (span > room)
++        span = room;
++    return span > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)span;
++}
+ 
+-    reader->pamfAddr = pamfAddr;
+-    reader->pamfSize = pamfSize;
+-    reader->dataOffset = be32(base + PAMF_OFF_DATA_OFFSET);
+-    reader->dataSize = be32(base + PAMF_OFF_DATA_SIZE);
+-    reader->streamTableOffset = be32(base + PAMF_OFF_STREAM_TABLE);
+-    reader->numStreams = (u8)be16(base + PAMF_OFF_NUM_STREAMS);
+-    reader->currentStream = 0;
+-    reader->currentEP = 0;
+-
+-    u32 muxRate = be32(base + PAMF_OFF_MUX_RATE);
+-
+-    printf("[cellPamf] PAMF v%08X: %u streams, dataOffset=0x%X, dataSize=%u, "
+-           "streamTableOff=0x%X, muxRate=%u\n",
+-           be32(base + PAMF_OFF_VERSION),
+-           reader->numStreams, reader->dataOffset, reader->dataSize,
+-           reader->streamTableOffset, muxRate);
+-
+-    /* Log each stream descriptor */
+-    for (u32 i = 0; i < reader->numStreams; i++) {
+-        const u8* desc = base + reader->streamTableOffset + i * PAMF_STREAM_DESC_SIZE;
+-        u8 rawType = desc[0];
+-        u8 channel = desc[1];
+-        s32 sdkType = raw_type_to_sdk(rawType);
+-        printf("[cellPamf]   stream[%u]: rawType=%u (sdk=%d) channel=%u\n",
+-               i, rawType, sdkType, channel);
++/* Common to both initialisers once hdr/limit are set. */
++static s32 pamf_open(pamf_state* st, u64 fileSize, u32 attribute)
++{
++    st->attribute = attribute;
++    if (st->limit < PAMF_OFF_STREAMS)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    if (attribute & CELL_PAMF_ATTRIBUTE_VERIFY_ON) {
++        s32 rc = pamf_verify(st->hdr, st->limit, fileSize, attribute, &st->version);
++        if (rc != CELL_OK)
++            return rc;
++        st->headerSize = (u64)be32(st->hdr + PAMF_OFF_HEADER_SIZE) * PAMF_UNIT;
++        st->dataSize   = (u64)be32(st->hdr + PAMF_OFF_DATA_SIZE) * PAMF_UNIT;
+     }
+ 
++    if (st->hdr[PAMF_OFF_SEQ_GP_NUM] == 0)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    const u32 n = st_stream_num(st);
++    if (PAMF_OFF_STREAMS + n * PAMF_STREAM_SIZE > st->limit)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++    if (n)
++        st->cur = 0;   /* the real library selects stream 0 */
+     return CELL_OK;
+ }
+ 
+-s32 cellPamfReaderGetPresentationStartTime(CellPamfReader* reader, u64* startTime)
++static const char* type_name(u8 type)
++{
++    static const char* const names[] = { "avc", "m2v", "at3p", "lpcm", "ac3", "user",
++                                         "psmf-avc", "psmf-at3p", "psmf-lpcm", "psmf-user" };
++    return type < 10 ? names[type] : "?";
++}
++
++/* The one line per initialise: streams and time range. */
++static void pamf_log_open(const pamf_state* st, s32 rc)
++{
++    if (rc != CELL_OK) {
++        printf("[cellPamf] init reader 0x%08X (%s header): error 0x%08X\n",
++               st->ea, st->owned ? "host" : "guest", (u32)rc);
++        return;
++    }
++    char list[160];
++    size_t len = 0;
++    list[0] = '\0';
++    const u32 n = st_stream_num(st);
++    for (u32 i = 0; i < n && len + 16 < sizeof(list); i++) {
++        u8 type = 0xFF, ch = 0;
++        stream_type_of(st_stream(st, i), &type, &ch);
++        len += (size_t)snprintf(list + len, sizeof(list) - len, "%s%s/%u",
++                                i ? " " : "", type_name(type), ch);
++    }
++    const u8* h = st->hdr;
++    printf("[cellPamf] init reader 0x%08X (%s header): %u streams [%s] pts %llu..%llu, "
++           "header 0x%llX\n",
++           st->ea, st->owned ? "host" : "guest", n, list,
++           (unsigned long long)pts_of(h + PAMF_OFF_SEQ_START_HI, h + PAMF_OFF_SEQ_START_LO),
++           (unsigned long long)pts_of(h + PAMF_OFF_SEQ_END_HI, h + PAMF_OFF_SEQ_END_LO),
++           (unsigned long long)be32(h + PAMF_OFF_HEADER_SIZE) * PAMF_UNIT);
++}
++
++/* ---------------------------------------------------------------------------
++ * Host-side entry points
++ * -----------------------------------------------------------------------*/
++
++s32 pamf_reader_init_host(u32 reader_ea, void* hdr, u32 size)
++{
++    if (!reader_ea || !hdr) {
++        free(hdr);
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    }
++    pamf_state* st = slot_claim(reader_ea);
++    st->owned = (u8*)hdr;
++    st->hdr = st->owned;
++    st->limit = size;
++
++    /* A buffer shorter than the header_size it declares holds no EP tables:
++     * treat it as a minimum header, which is what the attribute means. */
++    u32 attribute = CELL_PAMF_ATTRIBUTE_VERIFY_ON;
++    if (size > PAMF_OFF_HEADER_SIZE + 4 &&
++        (u64)be32(st->hdr + PAMF_OFF_HEADER_SIZE) * PAMF_UNIT > size)
++        attribute |= CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER;
++
++    const s32 rc = pamf_open(st, 0, attribute);
++    pamf_log_open(st, rc);
++    if (rc != CELL_OK)
++        slot_release(st);
++    return rc;
++}
++
++void pamf_reader_release(u32 reader_ea)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader || !startTime)
++    if (!reader_ea)
++        return;
++    slots_lock();
++    pamf_state* st = slot_find(reader_ea);
++    if (st)
++        slot_clear(st);
++    slots_unlock();
++}
++
++/* ---------------------------------------------------------------------------
++ * Header queries (no reader)
++ * -----------------------------------------------------------------------*/
++
++s32 cellPamfGetStreamOffsetAndSize(const void* pAddr, u64 fileSize, u64* pOffset, u64* pSize)
++{
++    const u32 ea = ea_of(pAddr);
++    if (!ea)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    u64 hs, ds;
++    s32 rc = pamf_sizes(vm_ptr8(ea), fileSize, &hs, &ds);
++    if (rc != CELL_OK)
++        return rc;
++    if (pOffset) vm_write64(ea_of(pOffset), hs);
++    if (pSize)   vm_write64(ea_of(pSize), ds);
++    return CELL_OK;
++}
+ 
+-    const u8* base = (const u8*)reader->pamfAddr;
+-    vm_write64((u32)(uintptr_t)startTime, (u64)be32(base + PAMF_OFF_PRESENT_START));
++s32 cellPamfGetHeaderSize(const void* pAddr, u64 fileSize, u64* pSize)
++{
++    return cellPamfGetStreamOffsetAndSize(pAddr, fileSize, pSize, NULL);
++}
++
++s32 cellPamfGetHeaderSize2(const void* pAddr, u64 fileSize, u32 attribute, u64* pSize)
++{
++    const u32 ea = ea_of(pAddr);
++    if (!ea)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const u8* h = vm_ptr8(ea);
++    u64 hs;
++    s32 rc = pamf_sizes(h, fileSize, &hs, NULL);
++    if (rc != CELL_OK)
++        return rc;
++    if (attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER) {
++        /* Everything up to the end of the sequence info: no EP tables */
++        const u64 min = PAMF_OFF_SEQ + 4 + (u64)be32(h + PAMF_OFF_SEQ);
++        if (min > hs)
++            return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++        hs = min;
++    }
++    if (pSize)
++        vm_write64(ea_of(pSize), hs);
+     return CELL_OK;
+ }
+ 
+-s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, u64* endTime)
++s32 cellPamfVerify(const void* pAddr, u64 fileSize)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader || !endTime)
++    const u32 ea = ea_of(pAddr);
++    if (!ea)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    return pamf_verify(vm_ptr8(ea), guest_span(ea), fileSize,
++                       CELL_PAMF_ATTRIBUTE_VERIFY_ON, NULL);
++}
+ 
+-    const u8* base = (const u8*)reader->pamfAddr;
+-    vm_write64((u32)(uintptr_t)endTime, (u64)be32(base + PAMF_OFF_PRESENT_END));
++/* ---------------------------------------------------------------------------
++ * Reader lifecycle
++ * -----------------------------------------------------------------------*/
++
++s32 cellPamfReaderInitialize(CellPamfReader* reader, const void* pamfAddr,
++                             u64 fileSize, u32 attribute)
++{
++    const u32 rea = ea_of(reader), hea = ea_of(pamfAddr);
++    if (!rea || !hea)   /* the real library doesn't check either */
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++
++    pamf_state* st = slot_claim(rea);
++    st->hdr = vm_ptr8(hea);
++    st->hdr_ea = hea;
++    st->limit = guest_span(hea);
++
++    const s32 rc = pamf_open(st, fileSize, attribute);
++    pamf_log_open(st, rc);
++    if (rc != CELL_OK)
++        slot_release(st);
++    return rc;
++}
++
++s32 cellPamfReaderGetPresentationStartTime(CellPamfReader* reader, CellCodecTimeStamp* pTimeStamp)
++{
++    pamf_state* st = pamf_get(reader);
++    if (!st || !pTimeStamp)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    vm_write32(ea_of(pTimeStamp) + 0, be16(st->hdr + PAMF_OFF_SEQ_START_HI));
++    vm_write32(ea_of(pTimeStamp) + 4, be32(st->hdr + PAMF_OFF_SEQ_START_LO));
++    return CELL_OK;
++}
++
++s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, CellCodecTimeStamp* pTimeStamp)
++{
++    pamf_state* st = pamf_get(reader);
++    if (!st || !pTimeStamp)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    vm_write32(ea_of(pTimeStamp) + 0, be16(st->hdr + PAMF_OFF_SEQ_END_HI));
++    vm_write32(ea_of(pTimeStamp) + 4, be32(st->hdr + PAMF_OFF_SEQ_END_LO));
+     return CELL_OK;
+ }
+ 
+ u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader)
++    pamf_state* st = pamf_get(reader);
++    if (!st)
+         return 0;
+-
+-    const u8* base = (const u8*)reader->pamfAddr;
+-    return be32(base + PAMF_OFF_MUX_RATE);
++    return be32(st->hdr + PAMF_OFF_SEQ_MUX_RATE) & 0x003FFFFF;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -222,285 +768,487 @@ u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader)
+ 
+ s32 cellPamfReaderGetNumberOfStreams(CellPamfReader* reader)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader)
++    pamf_state* st = pamf_get(reader);
++    if (!st)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
+-
+-    return reader->numStreams;
++    return (s32)st_stream_num(st);
+ }
+ 
+-/* Get pointer to raw stream descriptor bytes by absolute index */
+-static const u8* get_stream_desc_raw(CellPamfReader* reader, u32 index)
++s32 cellPamfReaderGetNumberOfSpecificStreams(CellPamfReader* reader, u8 streamType)
+ {
+-    if (!reader || index >= reader->numStreams)
+-        return NULL;
+-
+-    const u8* base = (const u8*)reader->pamfAddr;
+-    return base + reader->streamTableOffset + index * PAMF_STREAM_DESC_SIZE;
++    pamf_state* st = pamf_get(reader);
++    if (!st)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const u32 n = st_stream_num(st);
++    s32 found = 0;
++    for (u32 i = 0; i < n; i++) {
++        u8 type;
++        if (stream_type_of(st_stream(st, i), &type, NULL) == CELL_OK)
++            found += pamf_same_type(type, streamType);
++    }
++    return found;
+ }
+ 
+-/* Get SDK stream type for a given absolute stream index */
+-static s32 get_stream_sdk_type(CellPamfReader* reader, u32 index)
++s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u8 streamIndex)
+ {
+-    const u8* desc = get_stream_desc_raw(reader, index);
+-    if (!desc) return -1;
+-    return raw_type_to_sdk(desc[0]);
++    pamf_state* st = pamf_get(reader);
++    if (!st || streamIndex >= st_stream_num(st))
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    st->cur = streamIndex;
++    return CELL_OK;
+ }
+ 
+-s32 cellPamfReaderGetNumberOfSpecificStreams(CellPamfReader* reader, u8 streamType)
++/* Returns the selected stream's index on success. The real library scans
++ * with the wrong stride (only stream 0 is ever matched properly); this does
++ * the intended scan, which agrees with it wherever it worked. */
++s32 cellPamfReaderSetStreamWithTypeAndChannel(CellPamfReader* reader, u8 streamType, u8 ch)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader)
++    pamf_state* st = pamf_get(reader);
++    u8 coding, sid, psid;
++    if (!st || pamf_type_to_stream(streamType, ch, &coding, &sid, &psid) != CELL_OK)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
+ 
+-    s32 count = 0;
+-    for (u32 i = 0; i < reader->numStreams; i++) {
+-        if (get_stream_sdk_type(reader, i) == (s32)streamType)
+-            count++;
++    const u32 n = st_stream_num(st);
++    for (u32 i = 0; i < n; i++) {
++        const u8* s = st_stream(st, i);
++        if (s[ST_CODING] == coding && s[ST_STREAM_ID] == sid && s[ST_PRIVATE_ID] == psid) {
++            st->cur = (s32)i;
++            return (s32)i;
++        }
+     }
+-    return count;
++    return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
+ }
+ 
+-s32 cellPamfReaderSetStreamWithType(CellPamfReader* reader, u8 streamType, u32 streamIndex)
++/* Selects the streamIndex-th stream matching streamType (pseudo types
++ * allowed) and returns its overall index. */
++s32 cellPamfReaderSetStreamWithTypeAndIndex(CellPamfReader* reader, u8 streamType, u8 streamIndex)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader)
++    pamf_state* st = pamf_get(reader);
++    if (!st)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const u32 n = st_stream_num(st);
++    if (streamIndex >= n)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
+ 
+     u32 found = 0;
+-    for (u32 i = 0; i < reader->numStreams; i++) {
+-        if (get_stream_sdk_type(reader, i) == (s32)streamType) {
+-            if (found == streamIndex) {
+-                reader->currentStream = (u8)i;
+-                return CELL_OK;
+-            }
+-            found++;
++    for (u32 i = 0; i < n; i++) {
++        u8 type;
++        if (stream_type_of(st_stream(st, i), &type, NULL) != CELL_OK)
++            continue;
++        found += (u32)pamf_same_type(type, streamType);
++        if (found > streamIndex) {
++            st->cur = (s32)i;
++            return (s32)i;
+         }
+     }
+     return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
+ }
+ 
+-s32 cellPamfReaderSetStreamWithTypeAndChannel(CellPamfReader* reader, u8 streamType, u32 channel)
++/* Not an SDK export (an earlier name here); same as SetStreamWithTypeAndIndex. */
++s32 cellPamfReaderSetStreamWithType(CellPamfReader* reader, u8 streamType, u8 streamIndex)
+ {
+-    /* Forward the GUEST pointer untouched: cellPamfReaderSetStreamWithType
+-     * resolves it itself, and pamf_host keys on the guest EA -- handing it an
+-     * already-resolved host pointer would key a second, empty slot. */
+-    return cellPamfReaderSetStreamWithType(reader, streamType, channel);
++    return cellPamfReaderSetStreamWithTypeAndIndex(reader, streamType, streamIndex);
+ }
+ 
+-s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u32 streamIndex)
++s32 cellPamfReaderGetStreamIndex(CellPamfReader* reader)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader)
++    pamf_state* st = pamf_get(reader);
++    if (!st)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    return st->cur;
++}
+ 
+-    if (streamIndex >= reader->numStreams)
+-        return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
+-
+-    reader->currentStream = (u8)streamIndex;
++s32 cellPamfReaderGetStreamTypeAndChannel(CellPamfReader* reader, u8* pType, u8* pCh)
++{
++    pamf_state* st = pamf_get(reader);
++    const u8* s = st ? st_cur(st) : NULL;
++    if (!s)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    u8 type, ch;
++    s32 rc = stream_type_of(s, &type, &ch);
++    if (rc != CELL_OK)
++        return rc;
++    if (pType) vm_write8(ea_of(pType), type);
++    if (pCh)   vm_write8(ea_of(pCh), ch);
+     return CELL_OK;
+ }
+ 
+-/* ---------------------------------------------------------------------------
+- * Sample rate / channel lookup helpers for audio descriptors
+- * -----------------------------------------------------------------------*/
+-static u32 audio_sample_rate(u8 code)
++static void es_filter_write(u32 ea, u8 sid, u8 psid, int avc)
+ {
+-    switch (code) {
+-    case 1: return 44100;
+-    case 2: return 48000;
+-    default: return 48000;
+-    }
++    vm_write32(ea + 0, sid);
++    vm_write32(ea + 4, psid);
++    vm_write32(ea + 8, avc ? 1u : 0u);
++    vm_write32(ea + 12, 0);
+ }
+ 
+-static u8 audio_channels(u8 code)
++s32 cellPamfReaderGetEsFilterId(CellPamfReader* reader, CellCodecEsFilterId* pEsFilterId)
+ {
+-    switch (code) {
+-    case 1: return 1;
+-    case 2: return 2;
+-    case 6: return 6;
+-    case 8: return 8;
+-    default: return 2;
+-    }
++    pamf_state* st = pamf_get(reader);
++    const u8* s = st ? st_cur(st) : NULL;
++    if (!s || !pEsFilterId)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    es_filter_write(ea_of(pEsFilterId), s[ST_STREAM_ID], s[ST_PRIVATE_ID],
++                    s[ST_CODING] == CELL_PAMF_CODEC_TYPE_AVC);
++    return CELL_OK;
+ }
+ 
+-static u8 lpcm_bits(u8 code)
++s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 ch, CellCodecEsFilterId* pEsFilterId)
+ {
+-    switch (code) {
+-    case 1: return 16;
+-    case 2: return 24;
+-    default: return 16;
+-    }
++    u8 sid, psid;
++    if (!pEsFilterId || pamf_type_to_stream(streamType, ch, NULL, &sid, &psid) != CELL_OK)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    es_filter_write(ea_of(pEsFilterId), sid, psid, streamType == CELL_PAMF_STREAM_TYPE_AVC);
++    return CELL_OK;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * Stream info extraction — reads real codec parameters from descriptors
++ * Stream info -- the 32 codec-specific bytes at +16 of the stream header,
++ * unpacked into the SDK struct for the stream's type:
+  *
+- * Stream descriptor layout (24 bytes, big-endian):
+- *   Byte  0:    stream type (raw: 1=AVC, 2=M2V, 3=ATRAC3+, 4=AC3, 5=LPCM)
+- *   Byte  1:    channel index
+- *   For AVC (type 1):
+- *     Byte  2:  profileIdc (66=baseline, 77=main, 100=high)
+- *     Byte  3:  levelIdc
+- *     Byte  4:  frameMbsOnlyFlag (bit 7), videoSignalInfoFlag (bit 6)
+- *     Byte  5:  frameRateCode (upper nibble), aspectRatioIdc (lower nibble)
+- *     Bytes 6-7:   sarWidth  (be16)
+- *     Bytes 8-9:   sarHeight (be16)
+- *     Bytes 14-15:  horizontalSize (be16)
+- *     Bytes 16-17:  verticalSize   (be16)
+- *     Bytes 18-19:  frameCropLeft/Right
+- *     Bytes 20-21:  frameCropTop/Bottom
+- *   For ATRAC3+ (type 3) / AC3 (type 4):
+- *     Byte 10:  channel configuration
+- *     Byte 12:  sample rate code
+- *   For LPCM (type 5):
+- *     Byte 10:  channel configuration
+- *     Byte 11:  bits-per-sample code
+- *     Byte 12:  sample rate code
++ * AVC:  +0 profileIdc  +1 levelIdc  +2 flags (b7 frameMbsOnly, b6 videoSignalInfo,
++ *       b0-3 frameRateInfo+1)  +3 aspectRatioIdc  +4/+6 sarWidth/Height (only
++ *       meaningful when aspectRatioIdc == 255)  +9/+11 width/height in 16-px
++ *       units  +12..+19 frame crop L/R/T/B (u16)  +20 b5-7 videoFormat,
++ *       b4 fullRange  +21..+23 colour/transfer/matrix  +24 b7 entropy,
++ *       b6 deblocking, b4-5 minNumSlicePerPicture, b0-1 nfwIdc  +25 maxMeanBitrate
++ * M2V:  +0 profile/level (0x44 -> MP@HL, 0x48 -> MP@ML)  +2 flags (b7
++ *       progressive, b6 videoSignalInfo, b0-3 frameRateInfo)  +3 aspect
++ *       +4/+6 sar  +9/+11 size in 16-px units  +12/+14 exact size
++ *       +20..+23 as AVC
++ * Audio: +2 channels  +3 sampling-frequency code  +4 b6-7 LPCM bit-length code
+  * -----------------------------------------------------------------------*/
+ 
++#define AVC_AT(f) (out + offsetof(CellPamfAvcInfo, f))
++#define M2V_AT(f) (out + offsetof(CellPamfM2vInfo, f))
++
+ s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader || !info)
++    pamf_state* st = pamf_get(reader);
++    const u8* s = st ? st_cur(st) : NULL;
++    if (!s || !info)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
+ 
+-    info = GUEST_PTR(info, void*);
+-    /* ponytail: the CellPamf*Info structs below are filled host-endian.
+-     * Their u8 fields are already right; the u16/u32 ones (horizontalSize,
+-     * samplingFreq, ...) still need a swap if a title ever reads them. */
+-    const u8* desc = get_stream_desc_raw(reader, reader->currentStream);
+-    if (!desc)
+-        return (s32)CELL_PAMF_ERROR_STREAM_NOT_FOUND;
+-
+-    s32 sdkType = raw_type_to_sdk(desc[0]);
+-
+-    switch (sdkType) {
+-    case CELL_PAMF_STREAM_TYPE_AVC:
+-        if (infoSize >= sizeof(CellPamfAvcInfo)) {
+-            CellPamfAvcInfo* avc = (CellPamfAvcInfo*)info;
+-            memset(avc, 0, sizeof(*avc));
+-            avc->profileIdc            = desc[2];
+-            avc->levelIdc              = desc[3];
+-            avc->frameMbsOnlyFlag      = (desc[4] >> 7) & 1;
+-            avc->videoSignalInfoFlag   = (desc[4] >> 6) & 1;
+-            avc->frameRateCode         = (desc[5] >> 4) & 0x0F;
+-            avc->aspectRatioIdc        = desc[5] & 0x0F;
+-            avc->sarWidth              = be16(desc + 6);
+-            avc->sarHeight             = be16(desc + 8);
+-            avc->horizontalSize        = be16(desc + 14);
+-            avc->verticalSize          = be16(desc + 16);
+-            avc->frameCropLeftOffset   = desc[18];
+-            avc->frameCropRightOffset  = desc[19];
+-            avc->frameCropTopOffset    = desc[20];
+-            avc->frameCropBottomOffset = desc[21];
+-
+-            printf("[cellPamf] AVC info: profile=%u level=%u %ux%u "
+-                   "frameRate=%u aspect=%u\n",
+-                   avc->profileIdc, avc->levelIdc,
+-                   avc->horizontalSize, avc->verticalSize,
+-                   avc->frameRateCode, avc->aspectRatioIdc);
++    u8 type;
++    if (stream_type_of(s, &type, NULL) != CELL_OK)
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
++
++    const u8* d = s + ST_INFO;
++    u8 out[0x20];
++    u32 n;
++    memset(out, 0, sizeof(out));
++
++    switch (type) {
++    case CELL_PAMF_STREAM_TYPE_AVC: {
++        n = sizeof(CellPamfAvcInfo);
++        if (infoSize < n)
++            return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++        *AVC_AT(profileIdc)          = d[0];
++        *AVC_AT(levelIdc)            = d[1];
++        *AVC_AT(frameMbsOnlyFlag)    = (d[2] >> 7) & 1;
++        *AVC_AT(videoSignalInfoFlag) = (d[2] >> 6) & 1;
++        *AVC_AT(frameRateInfo)       = (u8)((d[2] & 0x0F) - 1);
++        *AVC_AT(aspectRatioIdc)      = d[3];
++        if (d[3] == 0xFF) {
++            put16(AVC_AT(sarWidth), be16(d + 4));
++            put16(AVC_AT(sarHeight), be16(d + 6));
++        }
++        put16(AVC_AT(horizontalSize), d[9] * 16u);
++        put16(AVC_AT(verticalSize), d[11] * 16u);
++        put16(AVC_AT(frameCropLeftOffset), be16(d + 12));
++        put16(AVC_AT(frameCropRightOffset), be16(d + 14));
++        put16(AVC_AT(frameCropTopOffset), be16(d + 16));
++        put16(AVC_AT(frameCropBottomOffset), be16(d + 18));
++        if (d[2] & 0x40) {
++            *AVC_AT(videoFormat)             = d[20] >> 5;
++            *AVC_AT(videoFullRangeFlag)      = (d[20] >> 4) & 1;
++            *AVC_AT(colourPrimaries)         = d[21];
++            *AVC_AT(transferCharacteristics) = d[22];
++            *AVC_AT(matrixCoefficients)      = d[23];
+         }
++        *AVC_AT(entropyCodingModeFlag)    = (d[24] >> 7) & 1;
++        *AVC_AT(deblockingFilterFlag)     = (d[24] >> 6) & 1;
++        *AVC_AT(minNumSlicePerPictureIdc) = (d[24] >> 4) & 3;
++        *AVC_AT(nfwIdc)                   = d[24] & 3;
++        *AVC_AT(maxMeanBitrate)           = d[25];
+         break;
++    }
+ 
+-    case CELL_PAMF_STREAM_TYPE_ATRAC3PLUS:
+-        if (infoSize >= sizeof(CellPamfAtrac3plusInfo)) {
+-            CellPamfAtrac3plusInfo* at3 = (CellPamfAtrac3plusInfo*)info;
+-            memset(at3, 0, sizeof(*at3));
+-            at3->numberOfChannels  = audio_channels(desc[10]);
+-            at3->samplingFrequency = audio_sample_rate(desc[12]);
+-
+-            printf("[cellPamf] ATRAC3+ info: %u ch, %u Hz\n",
+-                   at3->numberOfChannels, at3->samplingFrequency);
++    case CELL_PAMF_STREAM_TYPE_M2V: {
++        n = sizeof(CellPamfM2vInfo);
++        if (infoSize < n)
++            return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++        *M2V_AT(profileAndLevelIndication) = d[0] == 0x44 ? CELL_PAMF_M2V_MP_HL
++                                           : d[0] == 0x48 ? CELL_PAMF_M2V_MP_ML
++                                           : CELL_PAMF_M2V_UNKNOWN;
++        *M2V_AT(progressiveSequence) = (d[2] >> 7) & 1;
++        *M2V_AT(videoSignalInfoFlag) = (d[2] >> 6) & 1;
++        *M2V_AT(frameRateInfo)       = d[2] & 0x0F;
++        *M2V_AT(aspectRatioIdc)      = d[3];
++        if (d[3] == 0xFF) {
++            put16(M2V_AT(sarWidth), be16(d + 4));
++            put16(M2V_AT(sarHeight), be16(d + 6));
++        }
++        put16(M2V_AT(horizontalSize), d[9] * 16u);
++        put16(M2V_AT(verticalSize), d[11] * 16u);
++        put16(M2V_AT(horizontalSizeValue), be16(d + 12));
++        put16(M2V_AT(verticalSizeValue), be16(d + 14));
++        if (d[2] & 0x40) {
++            *M2V_AT(videoFormat)             = d[20] >> 5;
++            *M2V_AT(videoFullRangeFlag)      = (d[20] >> 4) & 1;
++            *M2V_AT(colourPrimaries)         = d[21];
++            *M2V_AT(transferCharacteristics) = d[22];
++            *M2V_AT(matrixCoefficients)      = d[23];
+         }
+         break;
++    }
+ 
++    case CELL_PAMF_STREAM_TYPE_ATRAC3PLUS:
++    case CELL_PAMF_STREAM_TYPE_AC3:
+     case CELL_PAMF_STREAM_TYPE_PAMF_LPCM:
+-        if (infoSize >= sizeof(CellPamfLpcmInfo)) {
+-            CellPamfLpcmInfo* lpcm = (CellPamfLpcmInfo*)info;
+-            memset(lpcm, 0, sizeof(*lpcm));
+-            lpcm->numberOfChannels  = audio_channels(desc[10]);
+-            lpcm->bitsPerSample     = lpcm_bits(desc[11]);
+-            lpcm->samplingFrequency = audio_sample_rate(desc[12]);
+-
+-            printf("[cellPamf] LPCM info: %u ch, %u Hz, %u bits\n",
+-                   lpcm->numberOfChannels, lpcm->samplingFrequency,
+-                   lpcm->bitsPerSample);
+-        }
++        /* All three are 8 bytes: freq code u32 @0, channels u8 @4, and for
++         * LPCM the bit-length code u16 @6. */
++        n = sizeof(CellPamfLpcmInfo);
++        if (infoSize < n)
++            return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++        put32(out + offsetof(CellPamfLpcmInfo, samplingFrequency), d[3] & 0x0F);
++        out[offsetof(CellPamfLpcmInfo, numberOfChannels)] = d[2] & 0x0F;
++        if (type == CELL_PAMF_STREAM_TYPE_PAMF_LPCM)
++            put16(out + offsetof(CellPamfLpcmInfo, bitsPerSample), d[4] >> 6);
+         break;
+ 
+-    case CELL_PAMF_STREAM_TYPE_AC3:
+-        if (infoSize >= sizeof(CellPamfAc3Info)) {
+-            CellPamfAc3Info* ac3 = (CellPamfAc3Info*)info;
+-            memset(ac3, 0, sizeof(*ac3));
+-            ac3->numberOfChannels  = audio_channels(desc[10]);
+-            ac3->samplingFrequency = audio_sample_rate(desc[12]);
+-
+-            printf("[cellPamf] AC3 info: %u ch, %u Hz\n",
+-                   ac3->numberOfChannels, ac3->samplingFrequency);
+-        }
++    /* PSMF streams (never produced by the PAMF tools) read the 48-byte entry
++     * with the PSMF stream-header layout, as the real library does. */
++    case CELL_PAMF_STREAM_TYPE_PSMF_AVC:
++        n = 4;
++        if (infoSize < n)
++            return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++        put16(out + 0, s[12] * 16u);
++        put16(out + 2, s[13] * 16u);
+         break;
+ 
++    case CELL_PAMF_STREAM_TYPE_PSMF_ATRAC3PLUS:
++    case CELL_PAMF_STREAM_TYPE_PSMF_LPCM:
++        n = 2;
++        if (infoSize < n)
++            return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++        out[0] = s[14];
++        out[1] = s[15] & 0x0F;
++        break;
++
++    case CELL_PAMF_STREAM_TYPE_USER_DATA:
++    case CELL_PAMF_STREAM_TYPE_PSMF_USER_DATA:
++        /* User-data streams have no info struct */
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++
+     default:
+-        return (s32)CELL_PAMF_ERROR_NOT_AVAILABLE;
++        return (s32)CELL_PAMF_ERROR_INVALID_PAMF;
+     }
+ 
++    vm_memcpy_to(ea_of(info), out, n);
+     return CELL_OK;
+ }
+ 
+-s32 cellPamfReaderGetStreamIndex(CellPamfReader* reader)
++#undef AVC_AT
++#undef M2V_AT
++
++/* ---------------------------------------------------------------------------
++ * Entry point navigation
++ * -----------------------------------------------------------------------*/
++
++/* Unpack one 12-byte EP into a guest CellPamfEp. */
++static void ep_write(u32 ea, const u8* e)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader)
+-        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const u16 v0 = be16(e);
++    vm_write32(ea + 0, (u32)(v0 >> 14) + 1);                         /* indexN */
++    vm_write32(ea + 4, (u32)(v0 & 0x1FFF) * PAMF_UNIT + PAMF_UNIT);  /* nThRefPictureOffset */
++    vm_write32(ea + 8, be16(e + 2));                                 /* pts.upper */
++    vm_write32(ea + 12, be32(e + 4));                                /* pts.lower */
++    vm_write64(ea + 16, (u64)be32(e + 8) * PAMF_UNIT);               /* rpnOffset */
++}
++
++/* Index of the last EP at or before the time stamp, 0 if none is. */
++static u32 ep_find(const u8* eps, u32 num, u32 ts_ea)
++{
++    const u64 want = vm_read64(ts_ea);   /* {upper, lower} == one big-endian u64 */
++    u32 i = num - 1;
++    for (; i >= 1; i--)
++        if (pts_of(eps + i * PAMF_EP_SIZE + 2, eps + i * PAMF_EP_SIZE + 4) <= want)
++            break;
++    return i;
++}
++
++/* Iterators carry pCur, a guest EA of the packed EP, as on the real library.
++ * A host-owned header has no guest EA: there pCur is the EP's offset in the
++ * header and reserved[0] names the reader slot (index + 1). Titles treat the
++ * iterator as opaque. */
++static void it_write(u32 it, const pamf_state* st, u32 index, u32 num, u32 ep_off)
++{
++    vm_write8(it + 0, 1);   /* isPamf */
++    vm_write8(it + 1, st->owned ? (u8)(st - s_readers + 1) : 0);
++    vm_write16(it + 2, 0);
++    vm_write32(it + 4, index);
++    vm_write32(it + 8, num);
++    vm_write32(it + 12, st->owned ? ep_off : st->hdr_ea + ep_off);
++}
++
++static const u8* it_resolve(u32 it, u32 pcur)
++{
++    const u8 tag = vm_read8(it + 1);
++    if (!tag)
++        return pcur ? vm_ptr8(pcur) : NULL;
++    if (tag > PAMF_MAX_READERS)
++        return NULL;
++    const pamf_state* st = &s_readers[tag - 1];
++    if (!st->in_use || !st->owned || (u64)pcur + PAMF_EP_SIZE > st->limit)
++        return NULL;
++    return st->owned + pcur;
++}
+ 
+-    return reader->currentStream;
++u32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader)
++{
++    pamf_state* st = pamf_get(reader);
++    return st ? st_ep_num(st) : 0;
+ }
+ 
+-s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
+-                                     void* esFilterId)
++s32 cellPamfReaderGetEpIteratorWithIndex(CellPamfReader* reader, u32 epIndex,
++                                         CellPamfEpIterator* pIt)
+ {
+-    (void)streamType; (void)streamIndex;
+-    if (!esFilterId)
++    pamf_state* st = pamf_get(reader);
++    if (!st || !pIt)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const u32 num = st_ep_num(st);
++    if (epIndex >= num)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    u32 off;
++    if ((st->attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER) || !st_eps(st, &off))
++        return (s32)CELL_PAMF_ERROR_NOT_AVAILABLE;
++    it_write(ea_of(pIt), st, epIndex, num, off + epIndex * PAMF_EP_SIZE);
++    return CELL_OK;
++}
+ 
+-    /* Set filter ID bytes (type + index) */
+-    u8* id = (u8*)esFilterId;
+-    id[0] = streamType;
+-    id[1] = streamIndex;
++s32 cellPamfReaderGetEpIteratorWithTimeStamp(CellPamfReader* reader,
++                                             CellCodecTimeStamp* pTimeStamp,
++                                             CellPamfEpIterator* pIt)
++{
++    pamf_state* st = pamf_get(reader);
++    if (!st || !pTimeStamp || !pIt)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    if (st->attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER)
++        return (s32)CELL_PAMF_ERROR_NOT_AVAILABLE;
++
++    const u32 num = st_ep_num(st);
++    vm_write8(ea_of(pIt) + 0, 1);
++    vm_write32(ea_of(pIt) + 8, num);
++    if (num == 0)
++        return (s32)CELL_PAMF_ERROR_EP_NOT_FOUND;
++    u32 off;
++    const u8* eps = st_eps(st, &off);
++    if (!eps)
++        return (s32)CELL_PAMF_ERROR_NOT_AVAILABLE;
++
++    const u32 i = ep_find(eps, num, ea_of(pTimeStamp));
++    it_write(ea_of(pIt), st, i, num, off + i * PAMF_EP_SIZE);
+     return CELL_OK;
+ }
+ 
+-/* ---------------------------------------------------------------------------
+- * Entry point navigation
+- * -----------------------------------------------------------------------*/
++s32 cellPamfEpIteratorGetEp(CellPamfEpIterator* pIt, CellPamfEp* pEp)
++{
++    if (!pIt || !pEp)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const u8* e = it_resolve(ea_of(pIt), vm_read32(ea_of(pIt) + 12));
++    if (!e)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    ep_write(ea_of(pEp), e);
++    return CELL_OK;
++}
+ 
+-s32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader, s32* numEp)
++/* Moves by up to `steps`, clamped to the table, and returns the steps taken. */
++s32 cellPamfEpIteratorMove(CellPamfEpIterator* pIt, s32 steps, CellPamfEp* pEp)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader || !numEp)
++    if (!pIt)
++        return 0;
++    const u32 it = ea_of(pIt);
++    const u32 index = vm_read32(it + 4), num = vm_read32(it + 8);
++
++    u32 next = index + (u32)steps;
++    if ((s32)next < 0) {
++        steps = -(s32)index;
++        next = 0;
++    } else if (next >= num) {
++        steps = (s32)(num - index) - 1;
++        next = index + (u32)steps;
++    }
++
++    const u32 pcur = vm_read32(it + 12) + (u32)steps * PAMF_EP_SIZE;
++    vm_write32(it + 4, next);
++    vm_write32(it + 12, pcur);
++    if (pEp) {
++        const u8* e = it_resolve(it, pcur);
++        if (e)
++            ep_write(ea_of(pEp), e);
++    }
++    return steps;
++}
++
++/* Undocumented. The real library finds the EP but never writes it; only
++ * nextRpnOffset is stored (when epSize says the struct has room), and that
++ * one unscaled -- reproduced as is. */
++s32 cellPamfReaderGetEpWithTimeStamp(CellPamfReader* reader, CellCodecTimeStamp* pTimeStamp,
++                                     CellPamfEpUnk* pEp, u32 epSize)
++{
++    pamf_state* st = pamf_get(reader);
++    if (!st || !pTimeStamp || !pEp)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    if (st->attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER)
++        return (s32)CELL_PAMF_ERROR_NOT_AVAILABLE;
+ 
+-    const u8* base = (const u8*)reader->pamfAddr;
+-    vm_write32((u32)(uintptr_t)numEp, be32(base + PAMF_OFF_EP_COUNT));
++    const u32 num = st_ep_num(st);
++    if (num == 0)
++        return (s32)CELL_PAMF_ERROR_EP_NOT_FOUND;
++    const u8* eps = st_eps(st, NULL);
++    if (!eps)
++        return (s32)CELL_PAMF_ERROR_NOT_AVAILABLE;
++
++    const u32 i = ep_find(eps, num, ea_of(pTimeStamp));
++    const u64 next = i < num - 1 ? be32(eps + (i + 1) * PAMF_EP_SIZE + 8) : st->dataSize;
++    if (epSize == sizeof(CellPamfEpUnk))
++        vm_write64(ea_of(pEp) + offsetof(CellPamfEpUnk, nextRpnOffset), next);
+     return CELL_OK;
+ }
+ 
+-s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep)
++s32 cellPamfReaderGetEpWithIndex(CellPamfReader* reader, u32 epIndex,
++                                 CellPamfEpUnk* pEp, u32 epSize)
+ {
+-    reader = pamf_host(reader);
+-    if (!reader || !ep)
++    pamf_state* st = pamf_get(reader);
++    if (!st || !pEp)
+         return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const u32 num = st_ep_num(st);
++    if (epIndex >= num)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    const u8* eps;
++    if ((st->attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER) || !(eps = st_eps(st, NULL)))
++        return (s32)CELL_PAMF_ERROR_NOT_AVAILABLE;
+ 
+-    const u8* base = (const u8*)reader->pamfAddr;
+-    u32 epCount = be32(base + PAMF_OFF_EP_COUNT);
+-    if (epIndex >= epCount)
+-        return (s32)CELL_PAMF_ERROR_EP_NOT_FOUND;
++    const u8* e = eps + epIndex * PAMF_EP_SIZE;
++    ep_write(ea_of(pEp), e);
++    const u64 next = epIndex < num - 1 ? (u64)be32(e + PAMF_EP_SIZE + 8) * PAMF_UNIT
++                                       : st->dataSize;
++    if (epSize == sizeof(CellPamfEpUnk))
++        vm_write64(ea_of(pEp) + offsetof(CellPamfEpUnk, nextRpnOffset), next);
++    return CELL_OK;
++}
+ 
+-    /* EP table entries are at epOffset, each 8 bytes (pts + offset) */
+-    u32 epTableOff = be32(base + PAMF_OFF_EP_OFFSET);
+-    const u8* epData = base + epTableOff + epIndex * 8;
+-    vm_write32((u32)(uintptr_t)ep + 0, be32(epData));
+-    vm_write32((u32)(uintptr_t)ep + 4, be32(epData + 4));
++/* Not an SDK export (an earlier name here): one EP of the current stream. */
++s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep)
++{
++    pamf_state* st = pamf_get(reader);
++    if (!st || !ep)
++        return (s32)CELL_PAMF_ERROR_INVALID_ARG;
++    if (epIndex >= st_ep_num(st))
++        return (s32)CELL_PAMF_ERROR_EP_NOT_FOUND;
++    const u8* eps;
++    if ((st->attribute & CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER) || !(eps = st_eps(st, NULL)))
++        return (s32)CELL_PAMF_ERROR_NOT_AVAILABLE;
++    ep_write(ea_of(ep), eps + epIndex * PAMF_EP_SIZE);
+     return CELL_OK;
+ }
+diff --git a/libs/codec/cellPamf.h b/libs/codec/cellPamf.h
+index acf393cabcd0244598b67161d9fcb06142fc88de..c2a868b62ae8ad4b49ca245bc7a4101241997329 100644
+--- a/libs/codec/cellPamf.h
++++ b/libs/codec/cellPamf.h
+@@ -1,9 +1,11 @@
+ /*
+  * ps3recomp - cellPamf HLE
+  *
+- * PAMF (PlayStation AV Media File) container parser. PAMF files contain
+- * multiplexed H.264/MPEG2 video and AAC/ATRAC3+ audio streams used
+- * for PS3 game cutscenes and FMVs.
++ * PAMF (PlayStation AV Media File) container header reader. PAMF files
++ * carry an MPEG-2 program stream (AVC/M2V video, ATRAC3plus/LPCM/AC3 audio,
++ * user data) behind a header describing each elementary stream; the reader
++ * answers stream/codec/entry-point queries for cellDmux/cellVdec/cellAdec
++ * set-up. Constants and info-struct layouts follow the SDK.
+  */
+ 
+ #ifndef PS3RECOMP_CELL_PAMF_H
+@@ -19,124 +21,238 @@ extern "C" {
+ /* ---------------------------------------------------------------------------
+  * Error codes
+  * -----------------------------------------------------------------------*/
+-#define CELL_PAMF_ERROR_INVALID_ARG          0x80610301
+-#define CELL_PAMF_ERROR_INVALID_HEADER       0x80610302
+-#define CELL_PAMF_ERROR_STREAM_NOT_FOUND     0x80610303
+-#define CELL_PAMF_ERROR_EP_NOT_FOUND         0x80610304
+-#define CELL_PAMF_ERROR_NOT_AVAILABLE        0x80610305
++#define CELL_PAMF_ERROR_STREAM_NOT_FOUND     0x80610501
++#define CELL_PAMF_ERROR_INVALID_PAMF         0x80610502
++#define CELL_PAMF_ERROR_INVALID_ARG          0x80610503
++#define CELL_PAMF_ERROR_UNKNOWN_TYPE         0x80610504
++#define CELL_PAMF_ERROR_UNSUPPORTED_VERSION  0x80610505
++#define CELL_PAMF_ERROR_UNKNOWN_STREAM       0x80610506
++#define CELL_PAMF_ERROR_EP_NOT_FOUND         0x80610507
++#define CELL_PAMF_ERROR_NOT_AVAILABLE        0x80610508
++/* Old name used before the SDK codes were checked; same meaning. */
++#define CELL_PAMF_ERROR_INVALID_HEADER       CELL_PAMF_ERROR_INVALID_PAMF
++
++/* cellPamfReaderInitialize / cellPamfGetHeaderSize2 attribute flags */
++#define CELL_PAMF_ATTRIBUTE_VERIFY_ON        1   /* validate the whole header */
++#define CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER   2   /* header loaded without EP tables */
+ 
+ /* ---------------------------------------------------------------------------
+- * Stream types
++ * Stream types (SDK values -- what the API takes and returns)
+  * -----------------------------------------------------------------------*/
+-#define CELL_PAMF_STREAM_TYPE_AVC            0   /* H.264/AVC video */
+-#define CELL_PAMF_STREAM_TYPE_M2V            1   /* MPEG-2 video */
+-#define CELL_PAMF_STREAM_TYPE_ATRAC3PLUS     2   /* ATRAC3plus audio */
+-#define CELL_PAMF_STREAM_TYPE_PAMF_LPCM      3   /* LPCM audio */
+-#define CELL_PAMF_STREAM_TYPE_AC3            4   /* AC3 audio */
+-#define CELL_PAMF_STREAM_TYPE_USER_DATA      5   /* User data */
+-
+-/* Codec type constants */
+-#define CELL_PAMF_CODEC_TYPE_AVC             0x1B
++#define CELL_PAMF_STREAM_TYPE_AVC              0   /* H.264/AVC video */
++#define CELL_PAMF_STREAM_TYPE_M2V              1   /* MPEG-2 video */
++#define CELL_PAMF_STREAM_TYPE_ATRAC3PLUS       2   /* ATRAC3plus audio */
++#define CELL_PAMF_STREAM_TYPE_PAMF_LPCM        3   /* LPCM audio */
++#define CELL_PAMF_STREAM_TYPE_AC3              4   /* AC3 audio */
++#define CELL_PAMF_STREAM_TYPE_USER_DATA        5   /* User data */
++#define CELL_PAMF_STREAM_TYPE_PSMF_AVC         6
++#define CELL_PAMF_STREAM_TYPE_PSMF_ATRAC3PLUS  7
++#define CELL_PAMF_STREAM_TYPE_PSMF_LPCM        8
++#define CELL_PAMF_STREAM_TYPE_PSMF_USER_DATA   9
++/* Query-only pseudo types (GetNumberOfSpecificStreams /
++ * SetStreamWithTypeAndIndex): VIDEO = AVC or M2V, AUDIO = ATRAC3plus, AC3 or
++ * LPCM. UNK matches LPCM or PSMF ATRAC3plus on the real library; its purpose
++ * is unknown. There is no "all streams" type -- GetNumberOfStreams is that. */
++#define CELL_PAMF_STREAM_TYPE_VIDEO           20
++#define CELL_PAMF_STREAM_TYPE_AUDIO           21
++#define CELL_PAMF_STREAM_TYPE_UNK             22
++
++/* stream_coding_type byte in the on-disc stream header */
+ #define CELL_PAMF_CODEC_TYPE_M2V             0x02
+-#define CELL_PAMF_CODEC_TYPE_ATRAC3PLUS      0xDC
++#define CELL_PAMF_CODEC_TYPE_AVC             0x1B
+ #define CELL_PAMF_CODEC_TYPE_LPCM            0x80
+ #define CELL_PAMF_CODEC_TYPE_AC3             0x81
++#define CELL_PAMF_CODEC_TYPE_ATRAC3PLUS      0xDC
++#define CELL_PAMF_CODEC_TYPE_USER_DATA       0xDD
++#define CELL_PAMF_CODEC_TYPE_PSMF            0xFF
++
++/* Info-struct value codes (the API reports codes, not Hz / bits) */
++#define CELL_PAMF_FS_48kHz                   1
++#define CELL_PAMF_BIT_LENGTH_16              1
++#define CELL_PAMF_BIT_LENGTH_24              3
++#define CELL_PAMF_M2V_MP_ML                  1
++#define CELL_PAMF_M2V_MP_H14                 2
++#define CELL_PAMF_M2V_MP_HL                  3
++#define CELL_PAMF_M2V_UNKNOWN                255
+ 
+ /* ---------------------------------------------------------------------------
+- * PAMF header magic
++ * PAMF header magic / versions ("PAMF", then "0040" or "0041" in ASCII)
+  * -----------------------------------------------------------------------*/
+ #define CELL_PAMF_MAGIC         0x50414D46   /* "PAMF" */
+-#define CELL_PAMF_VERSION       0x00040100   /* v4.1.0 */
++#define CELL_PAMF_VERSION_0040  0x30303430   /* "0040" */
++#define CELL_PAMF_VERSION_0041  0x30303431   /* "0041" */
+ 
+ /* ---------------------------------------------------------------------------
+  * Types
++ *
++ * Every struct below describes GUEST memory: multi-byte fields are
++ * big-endian there, and the C layouts (natural alignment) reproduce the SDK
++ * offsets and sizes. The HLE writes them byte-wise at those offsets.
+  * -----------------------------------------------------------------------*/
+ 
++/* The title's reader object (128 bytes in guest memory). Opaque here: the
++ * HLE keeps the reader state host-side, keyed by this object's address. */
+ typedef struct CellPamfReader {
+-    void* pamfAddr;       /* base address of PAMF data */
+-    u32   pamfSize;       /* total size */
+-    u32   dataOffset;     /* offset to mux data */
+-    u32   dataSize;       /* mux data size */
+-    u32   streamTableOffset; /* offset to stream descriptor table */
+-    u8    numStreams;      /* number of streams */
+-    u8    currentStream;  /* current stream index */
+-    u8    reserved[2];
+-    u32   currentEP;      /* current entry point */
++    u32 opaque[32];
+ } CellPamfReader;
+ 
+-typedef struct CellPamfAvcInfo {
++/* 90 kHz timestamp split in two big-endian words */
++typedef struct CellCodecTimeStamp {
++    u32 upper;
++    u32 lower;
++} CellCodecTimeStamp;
++
++typedef struct CellCodecEsFilterId {
++    u32 filterIdMajor;        /* PES stream_id */
++    u32 filterIdMinor;        /* private_stream_id (0xBD streams) */
++    u32 supplementalInfo1;    /* 1 for AVC */
++    u32 supplementalInfo2;
++} CellCodecEsFilterId;
++
++typedef struct CellPamfEp {         /* 0x18 bytes */
++    u32 indexN;
++    u32 nThRefPictureOffset;
++    CellCodecTimeStamp pts;
++    u64 rpnOffset;                  /* byte offset into the stream data */
++} CellPamfEp;
++
++typedef struct CellPamfEpUnk {      /* 0x20: GetEpWithIndex/TimeStamp output */
++    CellPamfEp ep;
++    u64 nextRpnOffset;
++} CellPamfEpUnk;
++
++typedef struct CellPamfEpIterator { /* 0x10 bytes */
++    u8  isPamf;
++    u8  reserved[3];
++    u32 index;
++    u32 num;
++    u32 pCur;                       /* guest EA of the current packed EP */
++} CellPamfEpIterator;
++
++typedef struct CellPamfAvcInfo {    /* 0x20 bytes */
+     u8   profileIdc;
+     u8   levelIdc;
+-    u16  horizontalSize;
+-    u16  verticalSize;
+-    u8   frameCropLeftOffset;
+-    u8   frameCropRightOffset;
+-    u8   frameCropTopOffset;
+-    u8   frameCropBottomOffset;
+     u8   frameMbsOnlyFlag;
+     u8   videoSignalInfoFlag;
+-    u8   frameRateCode;
++    u8   frameRateInfo;
+     u8   aspectRatioIdc;
+     u16  sarWidth;
+     u16  sarHeight;
++    u16  horizontalSize;
++    u16  verticalSize;
++    u16  frameCropLeftOffset;
++    u16  frameCropRightOffset;
++    u16  frameCropTopOffset;
++    u16  frameCropBottomOffset;
++    u8   videoFormat;
++    u8   videoFullRangeFlag;
++    u8   colourPrimaries;
++    u8   transferCharacteristics;
++    u8   matrixCoefficients;
++    u8   entropyCodingModeFlag;
++    u8   deblockingFilterFlag;
++    u8   minNumSlicePerPictureIdc;
++    u8   nfwIdc;
++    u8   maxMeanBitrate;
+ } CellPamfAvcInfo;
+ 
+-typedef struct CellPamfAtrac3plusInfo {
+-    u32 samplingFrequency;
++typedef struct CellPamfM2vInfo {    /* 0x18 bytes */
++    u8   profileAndLevelIndication;
++    u8   progressiveSequence;
++    u8   videoSignalInfoFlag;
++    u8   frameRateInfo;
++    u8   aspectRatioIdc;
++    u16  sarWidth;
++    u16  sarHeight;
++    u16  horizontalSize;
++    u16  verticalSize;
++    u16  horizontalSizeValue;
++    u16  verticalSizeValue;
++    u8   videoFormat;
++    u8   videoFullRangeFlag;
++    u8   colourPrimaries;
++    u8   transferCharacteristics;
++    u8   matrixCoefficients;
++} CellPamfM2vInfo;
++
++typedef struct CellPamfAtrac3plusInfo {  /* 8 bytes */
++    u32 samplingFrequency;          /* CELL_PAMF_FS_* code */
+     u8  numberOfChannels;
+ } CellPamfAtrac3plusInfo;
+ 
+-typedef struct CellPamfLpcmInfo {
+-    u32 samplingFrequency;
++typedef struct CellPamfLpcmInfo {   /* 8 bytes */
++    u32 samplingFrequency;          /* CELL_PAMF_FS_* code */
+     u8  numberOfChannels;
+-    u8  bitsPerSample;
++    u16 bitsPerSample;              /* CELL_PAMF_BIT_LENGTH_* code */
+ } CellPamfLpcmInfo;
+ 
+-typedef struct CellPamfAc3Info {
++typedef struct CellPamfAc3Info {    /* 8 bytes */
+     u32 samplingFrequency;
+     u8  numberOfChannels;
+ } CellPamfAc3Info;
+ 
+-typedef struct CellPamfEp {
+-    u32 pts;              /* presentation timestamp (90kHz) */
+-    u32 rpnOffset;        /* byte offset from data start */
+-} CellPamfEp;
+-
+-typedef struct CellPamfStreamInfo {
+-    u8  streamType;
+-    u8  streamIndex;
+-    u8  streamId;
+-    u8  reserved;
+-} CellPamfStreamInfo;
+-
+ /* ---------------------------------------------------------------------------
+- * Functions
++ * Functions (guest API; every pointer argument is a guest EA)
+  * -----------------------------------------------------------------------*/
+ 
++/* Header queries */
++s32 cellPamfGetHeaderSize(const void* pAddr, u64 fileSize, u64* pSize);
++s32 cellPamfGetHeaderSize2(const void* pAddr, u64 fileSize, u32 attribute, u64* pSize);
++s32 cellPamfGetStreamOffsetAndSize(const void* pAddr, u64 fileSize,
++                                   u64* pOffset, u64* pSize);
++s32 cellPamfVerify(const void* pAddr, u64 fileSize);
++
+ /* Reader lifecycle */
+-s32 cellPamfReaderInitialize(CellPamfReader* reader, void* pamfAddr,
+-                              u32 pamfSize, u32 attribute);
+-s32 cellPamfReaderGetPresentationStartTime(CellPamfReader* reader, u64* startTime);
+-s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, u64* endTime);
++s32 cellPamfReaderInitialize(CellPamfReader* reader, const void* pamfAddr,
++                             u64 fileSize, u32 attribute);
++s32 cellPamfReaderGetPresentationStartTime(CellPamfReader* reader, CellCodecTimeStamp* pTimeStamp);
++s32 cellPamfReaderGetPresentationEndTime(CellPamfReader* reader, CellCodecTimeStamp* pTimeStamp);
+ u32 cellPamfReaderGetMuxRateBound(CellPamfReader* reader);
+ 
+ /* Stream queries */
+ s32 cellPamfReaderGetNumberOfStreams(CellPamfReader* reader);
+ s32 cellPamfReaderGetNumberOfSpecificStreams(CellPamfReader* reader, u8 streamType);
+-s32 cellPamfReaderSetStreamWithType(CellPamfReader* reader, u8 streamType, u32 streamIndex);
+-s32 cellPamfReaderSetStreamWithTypeAndChannel(CellPamfReader* reader, u8 streamType, u32 channel);
+-s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u32 streamIndex);
+-s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize);
++s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u8 streamIndex);
++s32 cellPamfReaderSetStreamWithTypeAndChannel(CellPamfReader* reader, u8 streamType, u8 ch);
++s32 cellPamfReaderSetStreamWithTypeAndIndex(CellPamfReader* reader, u8 streamType, u8 streamIndex);
++s32 cellPamfReaderSetStreamWithType(CellPamfReader* reader, u8 streamType, u8 streamIndex);
+ s32 cellPamfReaderGetStreamIndex(CellPamfReader* reader);
+-
+-/* Stream type queries */
+-s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 streamIndex,
+-                                     void* esFilterId);
++s32 cellPamfReaderGetStreamTypeAndChannel(CellPamfReader* reader, u8* pType, u8* pCh);
++s32 cellPamfReaderGetEsFilterId(CellPamfReader* reader, CellCodecEsFilterId* pEsFilterId);
++s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize);
++s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 ch, CellCodecEsFilterId* pEsFilterId);
+ 
+ /* Entry point navigation */
+-s32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader, s32* numEp);
++u32 cellPamfReaderGetNumberOfEp(CellPamfReader* reader);
++s32 cellPamfReaderGetEpIteratorWithIndex(CellPamfReader* reader, u32 epIndex,
++                                         CellPamfEpIterator* pIt);
++s32 cellPamfReaderGetEpIteratorWithTimeStamp(CellPamfReader* reader,
++                                             CellCodecTimeStamp* pTimeStamp,
++                                             CellPamfEpIterator* pIt);
++s32 cellPamfEpIteratorGetEp(CellPamfEpIterator* pIt, CellPamfEp* pEp);
++s32 cellPamfEpIteratorMove(CellPamfEpIterator* pIt, s32 steps, CellPamfEp* pEp);
++s32 cellPamfReaderGetEpWithTimeStamp(CellPamfReader* reader, CellCodecTimeStamp* pTimeStamp,
++                                     CellPamfEpUnk* pEp, u32 epSize);
++s32 cellPamfReaderGetEpWithIndex(CellPamfReader* reader, u32 epIndex,
++                                 CellPamfEpUnk* pEp, u32 epSize);
+ s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep);
+ 
++/* ---------------------------------------------------------------------------
++ * Host-side entry points (not guest imports)
++ * -----------------------------------------------------------------------*/
++
++/* Initialise the reader keyed by guest EA `reader_ea` from a HOST copy of a
++ * PAMF header (e.g. read from disc by cellSail). The reader takes ownership of
++ * `hdr` (malloc'd by the caller) and frees it on pamf_reader_release or on
++ * re-initialisation -- also when this call fails. The header is fully
++ * verified (CELL_PAMF_ATTRIBUTE_VERIFY_ON, fileSize unknown); `size` is the
++ * number of valid bytes at `hdr`, and a header shorter than its header_size
++ * field is accepted as a minimum header (no EP tables). After this the
++ * cellPamfReader* calls work on `reader_ea` as for a guest-initialised
++ * reader. Returns CELL_OK or a CELL_PAMF_ERROR_*. */
++s32 pamf_reader_init_host(u32 reader_ea, void* hdr, u32 size);
++void pamf_reader_release(u32 reader_ea);   /* frees the slot + owned header */
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/codec/tests/CMakeLists.txt b/libs/codec/tests/CMakeLists.txt
+index f3f8670d7d3d9e9844d92605223fdb18cce74499..e54bd6922a89d651cd986360b1c5479fee18b92d 100644
+--- a/libs/codec/tests/CMakeLists.txt
++++ b/libs/codec/tests/CMakeLists.txt
+@@ -10,6 +10,11 @@ target_include_directories(test_vdec_stub PRIVATE "${PROJECT_SOURCE_DIR}/include
+ target_link_libraries(test_vdec_stub PRIVATE ${VDEC_TEST_LIBS})
+ add_test(NAME vdec_stub COMMAND test_vdec_stub stub)
+ 
++# cellPamf against a synthetic header in the real on-disc layout.
++add_executable(test_cellPamf test_cellPamf.c)
++target_include_directories(test_cellPamf PRIVATE "${PROJECT_SOURCE_DIR}/include")
++add_test(NAME pamf_reader COMMAND test_cellPamf)
++
+ if(NOT PS3RECOMP_FFMPEG_RUNTIME)
+     return()
+ endif()
+diff --git a/libs/codec/tests/test_cellPamf.c b/libs/codec/tests/test_cellPamf.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..6561b5e3aee52064540ecb8a74d6aff4a9f62a97
+--- /dev/null
++++ b/libs/codec/tests/test_cellPamf.c
+@@ -0,0 +1,444 @@
++/*
++ * ps3recomp -- cellPamf against a synthetic PAMF header
++ *
++ * Builds a header in the real on-disc layout (AVC + M2V + ATRAC3plus + LPCM,
++ * with an EP table on the AVC stream) in a fake guest memory and drives the
++ * guest API over it: size queries, verification (and that broken headers are
++ * caught), stream selection by index/type/channel including the VIDEO/AUDIO
++ * pseudo types, every info struct byte by byte, EP iterators, and the
++ * host-owned reader that cellSail uses.
++ *
++ * With a file argument it instead loads that .pam's header and prints what
++ * the reader makes of it (no game data ships with the repo).
++ *
++ * Build (from the repo root; no runtime lib needed):
++ *   clang-cl /O2 -w /Iinclude libs/codec/tests/test_cellPamf.c
++ *   test_cellPamf.exe [file.pam]
++ */
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++uint8_t* vm_base;
++#include "../cellPamf.c"
++
++/* The guest-memory accessors' hooks into the PPU/SPU runtime; inert here. */
++int g_resv_store_active;
++uint32_t g_ww_lo, g_ww_hi;
++void ppu_resv_break_store(uint64_t ea) { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w) { (void)a; (void)v; (void)w; }
++int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
++void spu_lockline_lock(void) {}
++void spu_lockline_unlock(void) {}
++void spu_lockline_lock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
++void spu_lockline_unlock_ea(uint32_t ea, uint32_t len) { (void)ea; (void)len; }
++void spu_coh_notify_write(uint32_t a) { (void)a; }
++
++#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c); exit(1); } } while (0)
++#define CHECK_RC(e, want) do { s32 _r = (s32)(e); if (_r != (s32)(want)) { \
++    printf("FAIL %s:%d: %s = 0x%08X, want 0x%08X\n", __FILE__, __LINE__, #e, (u32)_r, (u32)(want)); \
++    exit(1); } } while (0)
++
++enum {
++    MEM = 16u << 20,
++    G_HDR = 0x10000,      /* PAMF header */
++    G_RDR = 0x1000,       /* CellPamfReader objects, 0x80 apart */
++    G_OUT = 0x2000,       /* out-params */
++    G_IT  = 0x2100,       /* CellPamfEpIterator */
++    G_TS  = 0x2200,       /* CellCodecTimeStamp */
++    G_EP  = 0x2300,       /* CellPamfEp / CellPamfEpUnk */
++    G_BIG = 0x100000,     /* a real file's header */
++};
++
++#define RDR(n) ((CellPamfReader*)(uintptr_t)(G_RDR + (n) * 0x80))
++#define GP(ea) ((void*)(uintptr_t)(ea))
++
++static u8* g(u32 ea) { return vm_base + ea; }
++static void w16(u32 ea, u32 v) { put16(g(ea), v); }
++static void w32(u32 ea, u32 v) { put32(g(ea), v); }
++
++/* Stream headers start at 0x88; layout per cellPamf.c. */
++#define NSTREAMS   4
++#define END_STREAMS (0x88 + NSTREAMS * 48)   /* 0x148: EP tables follow */
++#define NEPS       3
++#define START_PTS  90000u
++#define END_PTS    (START_PTS + 900000u)
++#define DATA_UNITS 0x10u
++
++static void stream(u32 i, u8 coding, u8 sid, u8 psid, u32 ep_off, u32 ep_num)
++{
++    const u32 s = G_HDR + 0x88 + i * 48;
++    g(s)[0] = coding;
++    g(s)[4] = sid;
++    g(s)[5] = psid;
++    w16(s + 6, 0x2108);
++    w32(s + 8, ep_off);
++    w32(s + 12, ep_num);
++}
++
++static void build_header(void)
++{
++    memset(g(G_HDR), 0, 0x800);
++    memcpy(g(G_HDR), "PAMF0041", 8);
++    w32(G_HDR + 0x08, 1);                     /* header 0x800 bytes */
++    w32(G_HDR + 0x0C, DATA_UNITS);            /* data 0x8000 bytes */
++    w32(G_HDR + 0x50, END_STREAMS - 0x54);    /* seq info size */
++    w32(G_HDR + 0x58, START_PTS);
++    w32(G_HDR + 0x5E, END_PTS);
++    w32(G_HDR + 0x62, 0x1D4C0);               /* mux rate */
++    w32(G_HDR + 0x66, 90000);
++    w32(G_HDR + 0x6A, NSTREAMS);
++    g(G_HDR + 0x6F)[0] = 1;                   /* grouping periods */
++    w32(G_HDR + 0x70, END_STREAMS - 0x74);
++    w32(G_HDR + 0x76, START_PTS);
++    w32(G_HDR + 0x7C, END_PTS);
++    g(G_HDR + 0x81)[0] = 1;                   /* groups */
++    w32(G_HDR + 0x82, END_STREAMS - 0x86);
++    g(G_HDR + 0x87)[0] = NSTREAMS;
++
++    /* 0: AVC ch0, with the EP table */
++    stream(0, 0x1B, 0xE0, 0x00, END_STREAMS, NEPS);
++    u8* d = g(G_HDR + 0x88 + 16);
++    d[0] = 100; d[1] = 41; d[2] = 0x80 | 0x40 | 0x04; d[3] = 1;
++    d[9] = 1920 / 16; d[11] = 1088 / 16;
++    put16(d + 18, 8);                         /* crop bottom */
++    d[20] = 0xA0 | 0x10; d[21] = 1; d[22] = 1; d[23] = 1;
++    d[24] = 0x80 | 0x40 | 0x10 | 0x01; d[25] = 0x20;
++
++    /* 1: M2V ch1 */
++    stream(1, 0x02, 0xE1, 0x00, 0, 0);
++    d = g(G_HDR + 0x88 + 48 + 16);
++    d[0] = 0x48; d[2] = 0xC4; d[3] = 0xFF;
++    put16(d + 4, 10); put16(d + 6, 11);
++    d[9] = 720 / 16; d[11] = 480 / 16;
++    put16(d + 12, 720); put16(d + 14, 480);
++    d[20] = 0xA0; d[21] = 6; d[22] = 6; d[23] = 6;
++
++    /* 2: ATRAC3plus ch0, 3: LPCM ch0 (6 ch, 48 kHz, 16-bit) */
++    stream(2, 0xDC, 0xBD, 0x00, 0, 0);
++    d = g(G_HDR + 0x88 + 2 * 48 + 16);
++    d[2] = 2; d[3] = 1;
++    stream(3, 0x80, 0xBD, 0x40, 0, 0);
++    d = g(G_HDR + 0x88 + 3 * 48 + 16);
++    d[2] = 6; d[3] = 1; d[4] = 0x40;
++
++    /* EPs at +0, +0.5 s, +1 s; rpnOffset 0/4/8 units */
++    for (u32 i = 0; i < NEPS; i++) {
++        const u32 e = G_HDR + END_STREAMS + i * 12;
++        w16(e, i ? (1u << 14) | 3u : 0);
++        w32(e + 4, START_PTS + i * 45000);
++        w32(e + 8, i * 4);
++    }
++}
++
++#define FILE_SIZE ((0x800ull) + DATA_UNITS * 0x800ull)
++
++static void test_header_queries(void)
++{
++    CHECK_RC(cellPamfGetHeaderSize(GP(G_HDR), FILE_SIZE, GP(G_OUT)), CELL_OK);
++    CHECK(vm_read64(G_OUT) == 0x800);
++    CHECK_RC(cellPamfGetHeaderSize2(GP(G_HDR), 0, CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER, GP(G_OUT)), CELL_OK);
++    CHECK(vm_read64(G_OUT) == END_STREAMS);
++    CHECK_RC(cellPamfGetStreamOffsetAndSize(GP(G_HDR), FILE_SIZE, GP(G_OUT), GP(G_OUT + 8)), CELL_OK);
++    CHECK(vm_read64(G_OUT) == 0x800 && vm_read64(G_OUT + 8) == DATA_UNITS * 0x800u);
++    CHECK_RC(cellPamfGetHeaderSize(GP(G_HDR), FILE_SIZE + 1, GP(G_OUT)), CELL_PAMF_ERROR_INVALID_PAMF);
++
++    CHECK_RC(cellPamfVerify(GP(G_HDR), FILE_SIZE), CELL_OK);
++    CHECK_RC(cellPamfVerify(GP(G_HDR), 0), CELL_OK);
++
++    /* Each corruption is caught with the real library's code, then undone. */
++    struct { u32 off; u8 val; s32 want; } bad[] = {
++        { 0x00, 'X',  (s32)CELL_PAMF_ERROR_UNKNOWN_TYPE },
++        { 0x07, '9',  (s32)CELL_PAMF_ERROR_UNSUPPORTED_VERSION },
++        { 0x6F, 2,    (s32)CELL_PAMF_ERROR_INVALID_PAMF },          /* grouping periods */
++        { 0x87, 0,    (s32)CELL_PAMF_ERROR_INVALID_PAMF },          /* no streams */
++        { 0x6D, 3,    (s32)CELL_PAMF_ERROR_INVALID_PAMF },          /* total_stream_num */
++        { 0x88 + 48, 0x55, (s32)CELL_PAMF_ERROR_UNKNOWN_STREAM },   /* coding type */
++        { 0x88 + 48 + 4, 0xE0, (s32)CELL_PAMF_ERROR_INVALID_PAMF }, /* M2V reuses ch0... */
++        { END_STREAMS + 12 + 11, 9, (s32)CELL_PAMF_ERROR_INVALID_PAMF }, /* rpn not ascending */
++        { 0x58, 0xFF, (s32)CELL_PAMF_ERROR_INVALID_PAMF },          /* start pts past end */
++    };
++    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
++        const u8 keep = g(G_HDR + bad[i].off)[0];
++        g(G_HDR + bad[i].off)[0] = bad[i].val;
++        s32 rc = cellPamfVerify(GP(G_HDR), FILE_SIZE);
++        if (bad[i].off == 0x88 + 48 + 4) {
++            /* ...but as AVC/M2V are different types, ch0 twice is fine */
++            CHECK_RC(rc, CELL_OK);
++        } else {
++            CHECK_RC(rc, bad[i].want);
++        }
++        g(G_HDR + bad[i].off)[0] = keep;
++    }
++    /* Two LPCM streams on one channel is the real duplicate */
++    g(G_HDR + 0x88 + 2 * 48)[0] = 0x80; g(G_HDR + 0x88 + 2 * 48 + 5)[0] = 0x40;
++    CHECK_RC(cellPamfVerify(GP(G_HDR), FILE_SIZE), CELL_PAMF_ERROR_INVALID_PAMF);
++    g(G_HDR + 0x88 + 2 * 48)[0] = 0xDC; g(G_HDR + 0x88 + 2 * 48 + 5)[0] = 0x00;
++    CHECK_RC(cellPamfVerify(GP(G_HDR), FILE_SIZE), CELL_OK);
++}
++
++static void test_streams(CellPamfReader* r)
++{
++    CHECK_RC(cellPamfReaderGetNumberOfStreams(r), NSTREAMS);
++    CHECK_RC(cellPamfReaderGetNumberOfSpecificStreams(r, CELL_PAMF_STREAM_TYPE_VIDEO), 2);
++    CHECK_RC(cellPamfReaderGetNumberOfSpecificStreams(r, CELL_PAMF_STREAM_TYPE_AUDIO), 2);
++    CHECK_RC(cellPamfReaderGetNumberOfSpecificStreams(r, CELL_PAMF_STREAM_TYPE_UNK), 1);
++    CHECK_RC(cellPamfReaderGetNumberOfSpecificStreams(r, CELL_PAMF_STREAM_TYPE_AVC), 1);
++    CHECK_RC(cellPamfReaderGetNumberOfSpecificStreams(r, CELL_PAMF_STREAM_TYPE_PAMF_LPCM), 1);
++    CHECK_RC(cellPamfReaderGetNumberOfSpecificStreams(r, CELL_PAMF_STREAM_TYPE_USER_DATA), 0);
++
++    CHECK_RC(cellPamfReaderGetPresentationStartTime(r, GP(G_TS)), CELL_OK);
++    CHECK(vm_read32(G_TS) == 0 && vm_read32(G_TS + 4) == START_PTS);
++    CHECK_RC(cellPamfReaderGetPresentationEndTime(r, GP(G_TS)), CELL_OK);
++    CHECK(vm_read32(G_TS) == 0 && vm_read32(G_TS + 4) == END_PTS);
++    CHECK(cellPamfReaderGetMuxRateBound(r) == 0x1D4C0);
++
++    /* Stream 0 is selected on initialise */
++    CHECK_RC(cellPamfReaderGetStreamIndex(r), 0);
++    vm_write16(G_OUT, 0xFFFF);
++    CHECK_RC(cellPamfReaderGetStreamTypeAndChannel(r, GP(G_OUT), GP(G_OUT + 1)), CELL_OK);
++    CHECK(vm_read8(G_OUT) == CELL_PAMF_STREAM_TYPE_AVC && vm_read8(G_OUT + 1) == 0);
++
++    /* AVC info, byte for byte */
++    u8* o = g(G_OUT);
++    memset(o, 0xEE, 0x40);
++    CHECK_RC(cellPamfReaderGetStreamInfo(r, GP(G_OUT), 0x1F), CELL_PAMF_ERROR_INVALID_ARG);
++    CHECK_RC(cellPamfReaderGetStreamInfo(r, GP(G_OUT), 0x20), CELL_OK);
++    static const u8 avc[0x20] = {
++        100, 41, 1, 1, 3, 1, 0, 0, 0, 0,   /* sar 0 unless aspect 255 */
++        0x07, 0x80, 0x04, 0x40,            /* 1920 x 1088 */
++        0, 0, 0, 0, 0, 0, 0, 8,            /* crop L R T B */
++        5, 1, 1, 1, 1,                     /* format, fullRange, colour/transfer/matrix */
++        1, 1, 1, 1, 0x20,                  /* entropy, deblock, minSlice, nfw, bitrate */
++    };
++    CHECK(memcmp(o, avc, 0x20) == 0);
++    CHECK(o[0x20] == 0xEE);
++
++    /* By type and index, pseudo types included; returns the overall index */
++    CHECK_RC(cellPamfReaderSetStreamWithTypeAndIndex(r, CELL_PAMF_STREAM_TYPE_AUDIO, 1), 3);
++    CHECK_RC(cellPamfReaderGetStreamIndex(r), 3);
++    memset(o, 0xEE, 0x40);
++    CHECK_RC(cellPamfReaderGetStreamInfo(r, GP(G_OUT), 7), CELL_PAMF_ERROR_INVALID_ARG);
++    CHECK_RC(cellPamfReaderGetStreamInfo(r, GP(G_OUT), 8), CELL_OK);
++    static const u8 lpcm[8] = { 0, 0, 0, CELL_PAMF_FS_48kHz, 6, 0, 0, CELL_PAMF_BIT_LENGTH_16 };
++    CHECK(memcmp(o, lpcm, 8) == 0 && o[8] == 0xEE);
++
++    CHECK_RC(cellPamfReaderSetStreamWithTypeAndIndex(r, CELL_PAMF_STREAM_TYPE_AUDIO, 0), 2);
++    CHECK_RC(cellPamfReaderGetStreamInfo(r, GP(G_OUT), 8), CELL_OK);
++    static const u8 at3[8] = { 0, 0, 0, 1, 2, 0, 0, 0 };
++    CHECK(memcmp(o, at3, 8) == 0);
++    CHECK_RC(cellPamfReaderGetEsFilterId(r, GP(G_OUT)), CELL_OK);
++    CHECK(vm_read32(G_OUT) == 0xBD && vm_read32(G_OUT + 4) == 0 &&
++          vm_read32(G_OUT + 8) == 0 && vm_read32(G_OUT + 12) == 0);
++
++    CHECK_RC(cellPamfReaderSetStreamWithTypeAndIndex(r, CELL_PAMF_STREAM_TYPE_VIDEO, 2),
++             CELL_PAMF_ERROR_STREAM_NOT_FOUND);
++    CHECK_RC(cellPamfReaderSetStreamWithTypeAndIndex(r, CELL_PAMF_STREAM_TYPE_AUDIO, 4),
++             CELL_PAMF_ERROR_INVALID_ARG);
++    CHECK_RC(cellPamfReaderGetStreamIndex(r), 2);   /* unchanged by failures */
++
++    /* By type and channel */
++    CHECK_RC(cellPamfReaderSetStreamWithTypeAndChannel(r, CELL_PAMF_STREAM_TYPE_M2V, 1), 1);
++    CHECK_RC(cellPamfReaderSetStreamWithTypeAndChannel(r, CELL_PAMF_STREAM_TYPE_M2V, 0),
++             CELL_PAMF_ERROR_STREAM_NOT_FOUND);
++    CHECK_RC(cellPamfReaderSetStreamWithTypeAndChannel(r, 42, 0), CELL_PAMF_ERROR_INVALID_ARG);
++    CHECK_RC(cellPamfReaderGetStreamTypeAndChannel(r, GP(G_OUT), GP(G_OUT + 1)), CELL_OK);
++    CHECK(vm_read8(G_OUT) == CELL_PAMF_STREAM_TYPE_M2V && vm_read8(G_OUT + 1) == 1);
++    memset(o, 0xEE, 0x40);
++    CHECK_RC(cellPamfReaderGetStreamInfo(r, GP(G_OUT), 0x18), CELL_OK);
++    static const u8 m2v[0x18] = {
++        CELL_PAMF_M2V_MP_ML, 1, 1, 4, 0xFF, 0, 0, 10, 0, 11,
++        0x02, 0xD0, 0x01, 0xE0, 0x02, 0xD0, 0x01, 0xE0,   /* 720x480 twice */
++        5, 0, 6, 6, 6, 0,
++    };
++    CHECK(memcmp(o, m2v, 0x18) == 0 && o[0x18] == 0xEE);
++
++    CHECK_RC(cellPamfReaderSetStreamWithIndex(r, NSTREAMS), CELL_PAMF_ERROR_INVALID_ARG);
++    CHECK_RC(cellPamfReaderSetStreamWithIndex(r, 3), CELL_OK);
++    CHECK_RC(cellPamfReaderGetEsFilterId(r, GP(G_OUT)), CELL_OK);
++    CHECK(vm_read32(G_OUT) == 0xBD && vm_read32(G_OUT + 4) == 0x40);
++
++    CHECK_RC(cellPamfStreamTypeToEsFilterId(CELL_PAMF_STREAM_TYPE_AVC, 2, GP(G_OUT)), CELL_OK);
++    CHECK(vm_read32(G_OUT) == 0xE2 && vm_read32(G_OUT + 4) == 0 && vm_read32(G_OUT + 8) == 1);
++    CHECK_RC(cellPamfStreamTypeToEsFilterId(CELL_PAMF_STREAM_TYPE_PAMF_LPCM, 1, GP(G_OUT)), CELL_OK);
++    CHECK(vm_read32(G_OUT) == 0xBD && vm_read32(G_OUT + 4) == 0x41 && vm_read32(G_OUT + 8) == 0);
++    CHECK_RC(cellPamfStreamTypeToEsFilterId(CELL_PAMF_STREAM_TYPE_VIDEO, 0, GP(G_OUT)),
++             CELL_PAMF_ERROR_INVALID_ARG);
++}
++
++static void check_ep(u32 ea, u32 indexN, u32 nth, u32 pts, u64 rpn)
++{
++    CHECK(vm_read32(ea) == indexN && vm_read32(ea + 4) == nth);
++    CHECK(vm_read32(ea + 8) == 0 && vm_read32(ea + 12) == pts);
++    CHECK(vm_read64(ea + 16) == rpn);
++}
++
++static void test_eps(CellPamfReader* r)
++{
++    CHECK_RC(cellPamfReaderSetStreamWithIndex(r, 1), CELL_OK);
++    CHECK(cellPamfReaderGetNumberOfEp(r) == 0);
++    CHECK_RC(cellPamfReaderSetStreamWithIndex(r, 0), CELL_OK);
++    CHECK(cellPamfReaderGetNumberOfEp(r) == NEPS);
++
++    CHECK_RC(cellPamfReaderGetEpIteratorWithIndex(r, NEPS, GP(G_IT)), CELL_PAMF_ERROR_INVALID_ARG);
++    CHECK_RC(cellPamfReaderGetEpIteratorWithIndex(r, 1, GP(G_IT)), CELL_OK);
++    CHECK(vm_read32(G_IT + 4) == 1 && vm_read32(G_IT + 8) == NEPS);
++    CHECK_RC(cellPamfEpIteratorGetEp(GP(G_IT), GP(G_EP)), CELL_OK);
++    check_ep(G_EP, 2, 4 * 0x800, START_PTS + 45000, 4 * 0x800);
++
++    CHECK_RC(cellPamfEpIteratorMove(GP(G_IT), 5, GP(G_EP)), 1);       /* clamped to the last */
++    check_ep(G_EP, 2, 4 * 0x800, START_PTS + 90000, 8 * 0x800);
++    CHECK_RC(cellPamfEpIteratorMove(GP(G_IT), -9, GP(G_EP)), -2);     /* clamped to the first */
++    check_ep(G_EP, 1, 0x800, START_PTS, 0);
++
++    vm_write32(G_TS, 0); vm_write32(G_TS + 4, START_PTS + 60000);
++    CHECK_RC(cellPamfReaderGetEpIteratorWithTimeStamp(r, GP(G_TS), GP(G_IT)), CELL_OK);
++    CHECK(vm_read32(G_IT + 4) == 1);
++    vm_write32(G_TS + 4, 1);   /* before the first EP: still EP 0 */
++    CHECK_RC(cellPamfReaderGetEpIteratorWithTimeStamp(r, GP(G_TS), GP(G_IT)), CELL_OK);
++    CHECK(vm_read32(G_IT + 4) == 0);
++
++    vm_write64(G_EP + 0x18, 0);
++    CHECK_RC(cellPamfReaderGetEpWithIndex(r, 0, GP(G_EP), 0x20), CELL_OK);
++    check_ep(G_EP, 1, 0x800, START_PTS, 0);
++    CHECK(vm_read64(G_EP + 0x18) == 4 * 0x800);
++    CHECK_RC(cellPamfReaderGetEpWithIndex(r, 2, GP(G_EP), 0x20), CELL_OK);
++    CHECK(vm_read64(G_EP + 0x18) == DATA_UNITS * 0x800u);   /* last: the data size */
++}
++
++static void test_host_reader(void)
++{
++    const u32 key = G_RDR + 0x400;
++    u8* copy = (u8*)malloc(0x800);
++    memcpy(copy, g(G_HDR), 0x800);
++    CHECK_RC(pamf_reader_init_host(key, copy, 0x800), CELL_OK);
++    test_streams((CellPamfReader*)(uintptr_t)key);
++    test_eps((CellPamfReader*)(uintptr_t)key);
++
++    /* The header really is the host copy: change the guest one under it */
++    g(G_HDR + 0x87)[0] = 1;
++    CHECK_RC(cellPamfReaderGetNumberOfStreams((CellPamfReader*)(uintptr_t)key), NSTREAMS);
++    g(G_HDR + 0x87)[0] = NSTREAMS;
++
++    pamf_reader_release(key);
++    CHECK_RC(cellPamfReaderGetNumberOfStreams((CellPamfReader*)(uintptr_t)key),
++             CELL_PAMF_ERROR_INVALID_ARG);
++
++    /* Only the part up to the EP tables: a minimum header */
++    copy = (u8*)malloc(END_STREAMS);
++    memcpy(copy, g(G_HDR), END_STREAMS);
++    CHECK_RC(pamf_reader_init_host(key, copy, END_STREAMS), CELL_OK);
++    CHECK_RC(cellPamfReaderGetNumberOfStreams((CellPamfReader*)(uintptr_t)key), NSTREAMS);
++    CHECK_RC(cellPamfReaderGetEpIteratorWithIndex((CellPamfReader*)(uintptr_t)key, 0, GP(G_IT)),
++             CELL_PAMF_ERROR_NOT_AVAILABLE);
++
++    /* Re-initialising frees the previous header; a bad one is refused (and freed) */
++    copy = (u8*)malloc(0x800);
++    memcpy(copy, g(G_HDR), 0x800);
++    copy[0] = 'X';
++    CHECK_RC(pamf_reader_init_host(key, copy, 0x800), CELL_PAMF_ERROR_UNKNOWN_TYPE);
++    CHECK_RC(cellPamfReaderGetNumberOfStreams((CellPamfReader*)(uintptr_t)key),
++             CELL_PAMF_ERROR_INVALID_ARG);
++    CHECK_RC(pamf_reader_init_host(key, NULL, 0), CELL_PAMF_ERROR_INVALID_ARG);
++}
++
++static void test_slots(void)
++{
++    /* A host reader survives a flood of guest readers (oldest guest evicted) */
++    const u32 key = G_RDR + 0x400;
++    u8* copy = (u8*)malloc(0x800);
++    memcpy(copy, g(G_HDR), 0x800);
++    CHECK_RC(pamf_reader_init_host(key, copy, 0x800), CELL_OK);
++    for (u32 i = 0; i < 3 * PAMF_MAX_READERS; i++)
++        CHECK_RC(cellPamfReaderInitialize((CellPamfReader*)(uintptr_t)(0x200000 + i * 0x80),
++                                          GP(G_HDR), 0, 0), CELL_OK);
++    CHECK_RC(cellPamfReaderGetNumberOfStreams((CellPamfReader*)(uintptr_t)key), NSTREAMS);
++    pamf_reader_release(key);
++}
++
++static int dump_file(const char* path)
++{
++    FILE* f = fopen(path, "rb");
++    if (!f) { printf("cannot open %s\n", path); return 1; }
++    fseek(f, 0, SEEK_END);
++    const u64 size = (u64)ftell(f);
++    fseek(f, 0, SEEK_SET);
++    const size_t n = fread(g(G_BIG), 1, 0x80000, f);
++    fclose(f);
++    if (n < 0x100) { printf("%s: too short\n", path); return 1; }
++
++    CHECK_RC(cellPamfGetHeaderSize(GP(G_BIG), size, GP(G_OUT)), CELL_OK);
++    printf("%s: %llu bytes, header 0x%llX, verify %08X\n", path, (unsigned long long)size,
++           (unsigned long long)vm_read64(G_OUT), (u32)cellPamfVerify(GP(G_BIG), size));
++    CellPamfReader* r = RDR(7);
++    CHECK_RC(cellPamfReaderInitialize(r, GP(G_BIG), size, CELL_PAMF_ATTRIBUTE_VERIFY_ON), CELL_OK);
++    cellPamfReaderGetPresentationStartTime(r, GP(G_TS));
++    const u32 start = vm_read32(G_TS + 4);
++    cellPamfReaderGetPresentationEndTime(r, GP(G_TS));
++    printf("  pts %u..%u (%.2f s), mux rate bound %u\n", start, vm_read32(G_TS + 4),
++           (vm_read32(G_TS + 4) - start) / 90000.0, cellPamfReaderGetMuxRateBound(r));
++    const s32 ns = cellPamfReaderGetNumberOfStreams(r);
++    for (s32 i = 0; i < ns; i++) {
++        cellPamfReaderSetStreamWithIndex(r, (u8)i);
++        cellPamfReaderGetStreamTypeAndChannel(r, GP(G_OUT), GP(G_OUT + 1));
++        const u8 type = vm_read8(G_OUT), ch = vm_read8(G_OUT + 1);
++        cellPamfReaderGetEsFilterId(r, GP(G_OUT));
++        printf("  stream %d: type %u (%s) ch %u, es %02X/%02X, %u EPs:", i, type,
++               type_name(type), ch, vm_read32(G_OUT), vm_read32(G_OUT + 4),
++               cellPamfReaderGetNumberOfEp(r));
++        memset(g(G_OUT), 0, 0x20);
++        const s32 rc = cellPamfReaderGetStreamInfo(r, GP(G_OUT), 0x20);
++        if (rc != CELL_OK) { printf(" info %08X\n", (u32)rc); continue; }
++        const u8* o = g(G_OUT);
++        if (type == CELL_PAMF_STREAM_TYPE_AVC || type == CELL_PAMF_STREAM_TYPE_M2V) {
++            const size_t off = type == CELL_PAMF_STREAM_TYPE_AVC
++                ? offsetof(CellPamfAvcInfo, horizontalSize) : offsetof(CellPamfM2vInfo, horizontalSize);
++            printf(" %ux%u, frameRateInfo %u, profile/level 0x%02X\n", (u32)be16(o + off),
++                   (u32)be16(o + off + 2),
++                   (u32)(type == CELL_PAMF_STREAM_TYPE_AVC ? o[4] : o[3]), (u32)o[0]);
++        } else {
++            printf(" fs code %u, %u ch, bit-length code %u\n", be32(o), (u32)o[4],
++                   (u32)be16(o + 6));
++        }
++    }
++    return 0;
++}
++
++int main(int argc, char** argv)
++{
++    vm_base = (uint8_t*)calloc(1, MEM);
++    CHECK(vm_base != NULL);
++    if (argc > 1)
++        return dump_file(argv[1]);
++
++    build_header();
++    test_header_queries();
++
++    CellPamfReader* r = RDR(0);
++    CHECK_RC(cellPamfReaderGetNumberOfStreams(r), CELL_PAMF_ERROR_INVALID_ARG);   /* not initialised */
++    CHECK_RC(cellPamfReaderInitialize(r, GP(G_HDR), FILE_SIZE, CELL_PAMF_ATTRIBUTE_VERIFY_ON), CELL_OK);
++    test_streams(r);
++    test_eps(r);
++
++    /* Verification failures reach the caller; without VERIFY_ON nothing is checked */
++    g(G_HDR)[0] = 'X';
++    CHECK_RC(cellPamfReaderInitialize(RDR(1), GP(G_HDR), 0, CELL_PAMF_ATTRIBUTE_VERIFY_ON),
++             CELL_PAMF_ERROR_UNKNOWN_TYPE);
++    CHECK_RC(cellPamfReaderInitialize(RDR(1), GP(G_HDR), 0, 0), CELL_OK);
++    g(G_HDR)[0] = 'P';
++
++    /* Minimum header: streams work, EPs don't */
++    CHECK_RC(cellPamfReaderInitialize(RDR(2), GP(G_HDR), 0,
++                                      CELL_PAMF_ATTRIBUTE_VERIFY_ON | CELL_PAMF_ATTRIBUTE_MINIMUM_HEADER),
++             CELL_OK);
++    CHECK_RC(cellPamfReaderGetNumberOfSpecificStreams(RDR(2), CELL_PAMF_STREAM_TYPE_VIDEO), 2);
++    CHECK(cellPamfReaderGetNumberOfEp(RDR(2)) == NEPS);
++    CHECK_RC(cellPamfReaderGetEpIteratorWithIndex(RDR(2), 0, GP(G_IT)), CELL_PAMF_ERROR_NOT_AVAILABLE);
++
++    test_host_reader();
++    test_slots();
++
++    printf("test_cellPamf: ok\n");
++    return 0;
++}

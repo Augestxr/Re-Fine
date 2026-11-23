@@ -1,0 +1,184 @@
+Re:Fine 0112: diagnostico PAMF_TRACE en cellPamf, apagado por defecto.
+
+Con PAMF_TRACE=1, una linea por llamada del juego a las 8 funciones que usa F: argumentos,
+retorno y lo escrito en memoria del juego. El log de RPCS3 no trae esas salidas.
+
+diff --git a/libs/codec/cellPamf.c b/libs/codec/cellPamf.c
+index a2813cb..a00d851 100644
+--- a/libs/codec/cellPamf.c
++++ b/libs/codec/cellPamf.c
+@@ -661,7 +661,7 @@ void pamf_reader_release(u32 reader_ea)
+  * Header queries (no reader)
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellPamfGetStreamOffsetAndSize(const void* pAddr, u64 fileSize, u64* pOffset, u64* pSize)
++static s32 pamf_impl_GetStreamOffsetAndSize(const void* pAddr, u64 fileSize, u64* pOffset, u64* pSize)
+ {
+     const u32 ea = ea_of(pAddr);
+     if (!ea)
+@@ -680,7 +680,7 @@ s32 cellPamfGetHeaderSize(const void* pAddr, u64 fileSize, u64* pSize)
+     return cellPamfGetStreamOffsetAndSize(pAddr, fileSize, pSize, NULL);
+ }
+ 
+-s32 cellPamfGetHeaderSize2(const void* pAddr, u64 fileSize, u32 attribute, u64* pSize)
++static s32 pamf_impl_GetHeaderSize2(const void* pAddr, u64 fileSize, u32 attribute, u64* pSize)
+ {
+     const u32 ea = ea_of(pAddr);
+     if (!ea)
+@@ -715,8 +715,8 @@ s32 cellPamfVerify(const void* pAddr, u64 fileSize)
+  * Reader lifecycle
+  * -----------------------------------------------------------------------*/
+ 
+-s32 cellPamfReaderInitialize(CellPamfReader* reader, const void* pamfAddr,
+-                             u64 fileSize, u32 attribute)
++static s32 pamf_impl_ReaderInitialize(CellPamfReader* reader, const void* pamfAddr,
++                                     u64 fileSize, u32 attribute)
+ {
+     const u32 rea = ea_of(reader), hea = ea_of(pamfAddr);
+     if (!rea || !hea)   /* the real library doesn't check either */
+@@ -789,7 +789,7 @@ s32 cellPamfReaderGetNumberOfSpecificStreams(CellPamfReader* reader, u8 streamTy
+     return found;
+ }
+ 
+-s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u8 streamIndex)
++static s32 pamf_impl_ReaderSetStreamWithIndex(CellPamfReader* reader, u8 streamIndex)
+ {
+     pamf_state* st = pamf_get(reader);
+     if (!st || streamIndex >= st_stream_num(st))
+@@ -821,7 +821,7 @@ s32 cellPamfReaderSetStreamWithTypeAndChannel(CellPamfReader* reader, u8 streamT
+ 
+ /* Selects the streamIndex-th stream matching streamType (pseudo types
+  * allowed) and returns its overall index. */
+-s32 cellPamfReaderSetStreamWithTypeAndIndex(CellPamfReader* reader, u8 streamType, u8 streamIndex)
++static s32 pamf_impl_ReaderSetStreamWithTypeAndIndex(CellPamfReader* reader, u8 streamType, u8 streamIndex)
+ {
+     pamf_state* st = pamf_get(reader);
+     if (!st)
+@@ -858,7 +858,7 @@ s32 cellPamfReaderGetStreamIndex(CellPamfReader* reader)
+     return st->cur;
+ }
+ 
+-s32 cellPamfReaderGetStreamTypeAndChannel(CellPamfReader* reader, u8* pType, u8* pCh)
++static s32 pamf_impl_ReaderGetStreamTypeAndChannel(CellPamfReader* reader, u8* pType, u8* pCh)
+ {
+     pamf_state* st = pamf_get(reader);
+     const u8* s = st ? st_cur(st) : NULL;
+@@ -892,7 +892,7 @@ s32 cellPamfReaderGetEsFilterId(CellPamfReader* reader, CellCodecEsFilterId* pEs
+     return CELL_OK;
+ }
+ 
+-s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 ch, CellCodecEsFilterId* pEsFilterId)
++static s32 pamf_impl_StreamTypeToEsFilterId(u8 streamType, u8 ch, CellCodecEsFilterId* pEsFilterId)
+ {
+     u8 sid, psid;
+     if (!pEsFilterId || pamf_type_to_stream(streamType, ch, NULL, &sid, &psid) != CELL_OK)
+@@ -921,7 +921,7 @@ s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 ch, CellCodecEsFilterId* pE
+ #define AVC_AT(f) (out + offsetof(CellPamfAvcInfo, f))
+ #define M2V_AT(f) (out + offsetof(CellPamfM2vInfo, f))
+ 
+-s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize)
++static s32 pamf_impl_ReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize)
+ {
+     pamf_state* st = pamf_get(reader);
+     const u8* s = st ? st_cur(st) : NULL;
+@@ -1252,3 +1252,100 @@ s32 cellPamfReaderGetEp(CellPamfReader* reader, u32 epIndex, CellPamfEp* ep)
+     ep_write(ea_of(ep), eps + epIndex * PAMF_EP_SIZE);
+     return CELL_OK;
+ }
++
++/* ---------------------------------------------------------------------------
++ * PAMF_TRACE=1: one stderr line per guest call of the functions F uses, with
++ * arguments, return code and what was written to guest memory. Off by default.
++ * -----------------------------------------------------------------------*/
++static int pamf_trace_on(void)
++{
++    static int on = -1;
++    if (on < 0)
++        on = getenv("PAMF_TRACE") != NULL;
++    return on;
++}
++
++s32 cellPamfGetStreamOffsetAndSize(const void* pAddr, u64 fileSize, u64* pOffset, u64* pSize)
++{
++    const s32 rc = pamf_impl_GetStreamOffsetAndSize(pAddr, fileSize, pOffset, pSize);
++    if (pamf_trace_on())
++        fprintf(stderr, "[pamf] GetStreamOffsetAndSize(pAddr=0x%08X, fileSize=0x%llX, pOffset=0x%08X, pSize=0x%08X) -> 0x%08X offset=0x%llX size=0x%llX\n",
++                ea_of(pAddr), (unsigned long long)fileSize, ea_of(pOffset), ea_of(pSize), (u32)rc,
++                pOffset ? (unsigned long long)vm_read64(ea_of(pOffset)) : 0ull,
++                pSize ? (unsigned long long)vm_read64(ea_of(pSize)) : 0ull);
++    return rc;
++}
++
++s32 cellPamfGetHeaderSize2(const void* pAddr, u64 fileSize, u32 attribute, u64* pSize)
++{
++    const s32 rc = pamf_impl_GetHeaderSize2(pAddr, fileSize, attribute, pSize);
++    if (pamf_trace_on())
++        fprintf(stderr, "[pamf] GetHeaderSize2(pAddr=0x%08X, fileSize=0x%llX, attribute=0x%X, pSize=0x%08X) -> 0x%08X size=0x%llX\n",
++                ea_of(pAddr), (unsigned long long)fileSize, attribute, ea_of(pSize), (u32)rc,
++                pSize ? (unsigned long long)vm_read64(ea_of(pSize)) : 0ull);
++    return rc;
++}
++
++s32 cellPamfReaderInitialize(CellPamfReader* reader, const void* pamfAddr,
++                             u64 fileSize, u32 attribute)
++{
++    const s32 rc = pamf_impl_ReaderInitialize(reader, pamfAddr, fileSize, attribute);
++    if (pamf_trace_on())
++        fprintf(stderr, "[pamf] ReaderInitialize(pSelf=0x%08X, pAddr=0x%08X, fileSize=0x%llX, attribute=0x%X) -> 0x%08X\n",
++                ea_of(reader), ea_of(pamfAddr), (unsigned long long)fileSize, attribute, (u32)rc);
++    return rc;
++}
++
++s32 cellPamfReaderSetStreamWithIndex(CellPamfReader* reader, u8 streamIndex)
++{
++    const s32 rc = pamf_impl_ReaderSetStreamWithIndex(reader, streamIndex);
++    if (pamf_trace_on())
++        fprintf(stderr, "[pamf] ReaderSetStreamWithIndex(pSelf=0x%08X, streamIndex=%u) -> 0x%08X\n",
++                ea_of(reader), streamIndex, (u32)rc);
++    return rc;
++}
++
++s32 cellPamfReaderSetStreamWithTypeAndIndex(CellPamfReader* reader, u8 streamType, u8 streamIndex)
++{
++    const s32 rc = pamf_impl_ReaderSetStreamWithTypeAndIndex(reader, streamType, streamIndex);
++    if (pamf_trace_on())
++        fprintf(stderr, "[pamf] ReaderSetStreamWithTypeAndIndex(pSelf=0x%08X, streamType=%u, streamIndex=%u) -> 0x%08X\n",
++                ea_of(reader), streamType, streamIndex, (u32)rc);
++    return rc;
++}
++
++s32 cellPamfReaderGetStreamTypeAndChannel(CellPamfReader* reader, u8* pType, u8* pCh)
++{
++    const s32 rc = pamf_impl_ReaderGetStreamTypeAndChannel(reader, pType, pCh);
++    if (pamf_trace_on())
++        fprintf(stderr, "[pamf] ReaderGetStreamTypeAndChannel(pSelf=0x%08X, pType=0x%08X, pCh=0x%08X) -> 0x%08X type=%u ch=%u\n",
++                ea_of(reader), ea_of(pType), ea_of(pCh), (u32)rc,
++                pType ? vm_read8(ea_of(pType)) : 0u, pCh ? vm_read8(ea_of(pCh)) : 0u);
++    return rc;
++}
++
++s32 cellPamfStreamTypeToEsFilterId(u8 streamType, u8 ch, CellCodecEsFilterId* pEsFilterId)
++{
++    const s32 rc = pamf_impl_StreamTypeToEsFilterId(streamType, ch, pEsFilterId);
++    if (pamf_trace_on() && pEsFilterId) {
++        const u32 e = ea_of(pEsFilterId);
++        fprintf(stderr, "[pamf] StreamTypeToEsFilterId(type=%u, ch=%u, pEsFilterId=0x%08X) -> 0x%08X id=%02X/%02X/%X/%X\n",
++                streamType, ch, e, (u32)rc, vm_read32(e), vm_read32(e + 4), vm_read32(e + 8), vm_read32(e + 12));
++    }
++    return rc;
++}
++
++s32 cellPamfReaderGetStreamInfo(CellPamfReader* reader, void* info, u32 infoSize)
++{
++    const s32 rc = pamf_impl_ReaderGetStreamInfo(reader, info, infoSize);
++    if (pamf_trace_on() && info) {
++        char hex[0x20 * 2 + 1];
++        const u32 n = infoSize < 0x20 ? infoSize : 0x20;
++        for (u32 i = 0; i < n; i++)
++            snprintf(hex + i * 2, 3, "%02X", vm_read8(ea_of(info) + i));
++        hex[n * 2] = '\0';
++        fprintf(stderr, "[pamf] ReaderGetStreamInfo(pSelf=0x%08X, pInfo=0x%08X, size=%u) -> 0x%08X info=%s\n",
++                ea_of(reader), ea_of(info), infoSize, (u32)rc, hex);
++    }
++    return rc;
++}

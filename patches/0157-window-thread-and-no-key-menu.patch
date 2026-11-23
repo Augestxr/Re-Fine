@@ -1,0 +1,139 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -413,13 +413,17 @@ typedef struct {
+     HWND hwnd;
+     u32  width;
+     u32  height;
+-    int  window_closed;
++    volatile int window_closed;
+     /* Re:Fine 0151. width and height are the screen the guest believes in, and never
+      * change. The display target is rw x rh, offscreen surfaces go by rs, and the
+      * swap chain follows the window (win_w x win_h, WM_SIZE asks in want_w x want_h). */
+     u32  rw, rh;
+     float rs;
+     u32  win_w, win_h, want_w, want_h;
++    /* Re:Fine 0157: WM_SIZE runs on the window's thread; the size asked for goes to
++     * frame_clock as one word (w << 16 | h), so both halves always come together. */
++    volatile LONG want_wh;
++    volatile int  window_gone;      /* the window's message loop ended */
+ 
+     /* D3D12 core */
+     ID3D12Device*              device;
+@@ -824,17 +828,66 @@ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         PostQuitMessage(0);
+         return 0;
+     case WM_SIZE:
+-        /* Re:Fine 0151: render_frame resizes the swap chain, with the GPU idle. This
+-         * runs on frame_clock, the thread of render_frame. */
+-        if (wp != SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp)) {
+-            s_d3d.want_w = LOWORD(lp);
+-            s_d3d.want_h = HIWORD(lp);
+-        }
++        /* Re:Fine 0151: render_frame resizes the swap chain, with the GPU idle. Since
++         * 0157 this runs on the window's own thread; frame_clock reads the word. */
++        if (wp != SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp))
++            InterlockedExchange(&s_d3d.want_wh, (LONG)(((u32)LOWORD(lp) << 16) | HIWORD(lp)));
++        break;
++    case WM_SYSCOMMAND:
++        /* Re:Fine 0157: Alt (or F10) on its own, and Alt with a key that is no menu
++         * mnemonic, ask for SC_KEYMENU: Windows would put the window in menu mode until
++         * the next Alt, and beep. The window has no menu bar, so that request goes no
++         * further. Alt+Space still opens the system menu; Alt+F4 is SC_CLOSE and is
++         * not touched. */
++        if ((wp & 0xFFF0) == SC_KEYMENU && lp != ' ')
++            return 0;
+         break;
++    case WM_APP + 0x157:
++        /* Re:Fine 0157: DestroyWindow only works on the window's own thread. */
++        DestroyWindow(hwnd);
++        return 0;
+     }
+     return DefWindowProcA(hwnd, msg, wp, lp);
+ }
+ 
++/* Re:Fine 0157: the window and its message loop on a thread of their own. On the drain's
++ * thread (frame_clock), any modal loop of Windows inside DispatchMessage (moving or sizing
++ * the window, the system menu) stopped the drain and the present, and with them the game,
++ * which fences every pass on labels the drain writes. Here the loop blocks in GetMessage
++ * (no spin) and frame_clock never waits on it. The swap chain, made and presented on
++ * frame_clock, only needs this thread to keep handling messages, which it always does. */
++static HANDLE s_win_ready;
++static struct { u32 w, h; char title[128]; } s_win_args;
++static HWND create_window(u32 width, u32 height, const char* title);
++
++static DWORD WINAPI window_thread(LPVOID unused)
++{
++    (void)unused;
++    s_d3d.hwnd = create_window(s_win_args.w, s_win_args.h, s_win_args.title);
++    SetEvent(s_win_ready);
++    if (!s_d3d.hwnd) return 1;
++    MSG msg;
++    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
++        TranslateMessage(&msg);
++        DispatchMessageA(&msg);
++    }
++    s_d3d.window_gone = 1;
++    return 0;
++}
++
++static HWND create_window_thread(u32 width, u32 height, const char* title)
++{
++    s_win_args.w = width;
++    s_win_args.h = height;
++    snprintf(s_win_args.title, sizeof s_win_args.title, "%s", title ? title : "ps3recomp (D3D12)");
++    s_win_ready = CreateEventA(NULL, TRUE, FALSE, NULL);
++    HANDLE t = s_win_ready ? CreateThread(NULL, 0, window_thread, NULL, 0, NULL) : NULL;
++    if (!t) return NULL;
++    WaitForSingleObject(s_win_ready, INFINITE);
++    CloseHandle(t);
++    return s_d3d.hwnd;
++}
++
+ /* Re:Fine 0151: a surface side in guest pixels, as a resource. */
+ static u32 rs_dim(u32 v)
+ {
+@@ -5355,7 +5408,8 @@ static void present_blit(u32 fi)
+ /* Re:Fine 0151: the swap chain to the window's size. Called with the GPU idle. */
+ static void swap_chain_resize(void)
+ {
+-    const u32 w = s_d3d.want_w, h = s_d3d.want_h;
++    const u32 wh = (u32)s_d3d.want_wh;               /* Re:Fine 0157: one word from WM_SIZE */
++    const u32 w = wh >> 16, h = wh & 0xFFFF;
+     if (!w || (w == s_d3d.win_w && h == s_d3d.win_h)) return;
+     for (u32 i = 0; i < FRAME_COUNT; i++) {
+         s_d3d.swap_buffers[i]->lpVtbl->Release(s_d3d.swap_buffers[i]);
+@@ -8976,7 +9030,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+         snprintf(g_rsx_title_base, sizeof(g_rsx_title_base), "%s",
+                  title ? title : "ps3recomp");
+     }
+-    s_d3d.hwnd = create_window(width, height, title);
++    s_d3d.hwnd = create_window_thread(width, height, title);   /* Re:Fine 0157 */
+     if (!s_d3d.hwnd) {
+         printf("[D3D12] ERROR: Window creation failed\n");
+         return -1;
+@@ -9047,7 +9101,7 @@ void rsx_d3d12_backend_shutdown(void)
+     if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
+     if (s_d3d.device) s_d3d.device->lpVtbl->Release(s_d3d.device);
+ 
+-    if (s_d3d.hwnd) DestroyWindow(s_d3d.hwnd);
++    if (s_d3d.hwnd) PostMessageA(s_d3d.hwnd, WM_APP + 0x157, 0, 0);   /* Re:Fine 0157 */
+ 
+     rsx_set_backend(NULL);
+     s_d3d.initialized = 0;
+@@ -9057,13 +9111,8 @@ void rsx_d3d12_backend_shutdown(void)
+ 
+ int rsx_d3d12_backend_pump_messages(void)
+ {
+-    MSG msg;
+-    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+-        if (msg.message == WM_QUIT) return -1;
+-        TranslateMessage(&msg);
+-        DispatchMessageA(&msg);
+-    }
+-    return s_d3d.window_closed ? -1 : 0;
++    /* Re:Fine 0157: the messages are handled on the window's thread; this only reports. */
++    return (s_d3d.window_closed || s_d3d.window_gone) ? -1 : 0;
+ }
+ 
+ void rsx_d3d12_backend_present(void)

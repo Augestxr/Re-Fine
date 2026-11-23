@@ -1,0 +1,85 @@
+#!/bin/sh
+# pre-commit - Firewall de Re:Fine: nada del juego entra en git (CLAUDE.md).
+#
+# Rechaza el commit si algun archivo staged:
+#   - empieza por \x7FELF (ELF), SCE\0 (SELF/SPRX cifrado) o \0PSF (PARAM.SFO),
+#   - esta bajo game/, work/ o build/,
+#   - pesa mas de 5 MB,
+#   - tiene extension de formato del juego, de disco o de captura (farc, dsc, pam, pv*,
+#     bin, dds, txd, at3, png, jpg...), de volcado de Ghidra (gzf, rep), o
+#   - empieza por la firma de uno de esos formatos (FARC, PAMF, DDS, RIFF, OggS, PNG, JPEG, GIF).
+# Las imagenes propias (iconos del instalador hechos para el port) se aceptan solo bajo
+# tools/installer/art/, con la decision apuntada en docs/decisions.md.
+# Mira el contenido staged (el blob del indice), no el del arbol de trabajo.
+# Instalar con tools/install_hooks.ps1 (core.hooksPath = tools/hooks).
+
+max=5242880
+fail=0
+tmp=$(mktemp) || exit 1
+trap 'rm -f "$tmp"' EXIT
+
+git diff --cached --name-only --diff-filter=ACMRT -z > "$tmp"
+while IFS= read -r -d '' f; do
+    mode=$(git ls-files -s -- "$f" | cut -d' ' -f1)
+    [ "$mode" = "160000" ] && continue   # submodulo (external/ps3recomp): no es un blob
+
+    case "$f" in
+        game/*|work/*|build/*)
+            echo "pre-commit: RECHAZADO $f (ruta bajo game/, work/ o build/)" >&2
+            fail=1; continue ;;
+    esac
+
+    lower=$(printf '%s' "$f" | tr 'A-Z' 'a-z')
+    case "$lower" in
+        *npub31241*|*param.pfd|*secure.bin|*/hdd0/*|*/partida/*|*/partida_*|*/art_privado/*)
+            echo "pre-commit: RECHAZADO $f (partida guardada o arte privado del instalador)" >&2
+            fail=1; continue ;;
+    esac
+    case "$lower" in
+        tools/installer/art/*.ico|tools/installer/art/*.png|tools/installer/art/*.bmp) ;;
+        *.farc|*.dsc|*.pam|*.pamf|*.pvpp|*.pvsc|*.bin|*.dat|*.dds|*.txd|*.txi|*.bon|*.osd|*.osi|        *.at3|*.at9|*.vag|*.ogg|*.wav|*.mp3|*.mp4|*.m2v|*.cpk|*.awb|*.acb|*.sfo|*.self|*.sprx|*.prx|        *.elf|*.iso|*.pkg|*.edat|*.trp|*.sfm|*.png|*.jpg|*.jpeg|*.bmp|*.gif|*.webp|*.tga|        *.gzf|*.rep|*.gpr|*.xml.gz)
+            echo "pre-commit: RECHAZADO $f (formato del juego, de disco, de captura o de Ghidra)" >&2
+            fail=1; continue ;;
+    esac
+
+    size=$(git cat-file -s ":$f")
+    case "$f" in
+        docs/STATUS.md) lim=3584 ;;
+        CLAUDE.md) lim=8192 ;;
+        *) lim= ;;
+    esac
+    if [ -n "$lim" ] && [ "$size" -gt "$lim" ]; then
+        echo "pre-commit: RECHAZADO $f ($size B > $lim B): mueve detalle a docs/historial/" >&2
+        fail=1; continue
+    fi
+    if [ "$size" -gt "$max" ]; then
+        echo "pre-commit: RECHAZADO $f ($size bytes > 5 MB)" >&2
+        fail=1; continue
+    fi
+
+    magic=$(git cat-file blob ":$f" 2>/dev/null | head -c 4 | od -An -tx1 | tr -d ' \n')
+    case "$magic" in
+        7f454c46) what='cabecera ELF' ;;
+        53434500) what='cabecera SCE (SELF/SPRX)' ;;
+        00505346) what='cabecera PSF (PARAM.SFO)' ;;
+        46415243|46417263|46417243) what='firma FARC' ;;
+        50414d46) what='firma PAMF' ;;
+        44445320) what='firma DDS' ;;
+        52494646) what='firma RIFF (wav/at3)' ;;
+        4f676753) what='firma Ogg' ;;
+        89504e47) what='firma PNG' ;;
+        47494638) what='firma GIF' ;;
+        ffd8ff*) what='firma JPEG' ;;
+        *) what='' ;;
+    esac
+    if [ -n "$what" ]; then
+        echo "pre-commit: RECHAZADO $f ($what)" >&2
+        fail=1
+    fi
+done < "$tmp"
+
+if [ "$fail" -ne 0 ]; then
+    echo "pre-commit: commit cancelado: nada del juego va a git (CLAUDE.md, Firewall)." >&2
+    exit 1
+fi
+exit 0

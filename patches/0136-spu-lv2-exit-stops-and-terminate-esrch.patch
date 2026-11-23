@@ -1,0 +1,44 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 2f5b006..e022b42 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -319,6 +319,12 @@ void spu_stop(spu_context* ctx)
+     if (s_halt < 0) s_halt = getenv("YDKJ_STOP_HALT") ? 1 : 0;
+     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+     if (s_halt) spu_halt(ctx);
++    /* Re:Fine: the lv2 exit protocol (status in the out mailbox, stop 0x102 thread
++     * exit, 0x101 group exit) has no "after". Returning from inside a nested call
++     * leaves spu_drain_call with pc on the lifted entry holding the stop, and it
++     * resumes there forever. */
++    if ((ctx->stop_code == 0x101u || ctx->stop_code == 0x102u) && ctx->ch_out_mbox.count)
++        spu_halt(ctx);
+ }
+ 
+ /* SPU_FLOAT_RZ=1: SPU code runs with FPCR at round toward zero with flush-to-zero, so the
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 4f00fe1..703f97a 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1392,13 +1392,16 @@ static int64_t sys_spu_thread_group_terminate_handler(ppu_context* ctx)
+     uint32_t id     = (uint32_t)ctx->gpr[3];
+     int32_t  status = (int32_t)ctx->gpr[4];
+     spu_group_t* g = spu_find_group(id);
+-    if (g) {
+-        g->state = SPU_GROUP_STATE_STOPPED;
+-        g->cause = SPU_GROUP_CAUSE_TERMINATED;
+-        g->exit_status = status;
+-    }
+-    fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d\n", id, status);
++    fprintf(stderr, "[SPU] group_terminate id=0x%X status=%d%s\n", id, status, g ? "" : " -> CELL_ESRCH");
+     fflush(stderr);
++    if (!g) {
++        /* Re:Fine: as RPCS3; F passes a thread id here on its way out, and ignores the error. */
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005; /* CELL_ESRCH */
++        return -1;
++    }
++    g->state = SPU_GROUP_STATE_STOPPED;
++    g->cause = SPU_GROUP_CAUSE_TERMINATED;
++    g->exit_status = status;
+     ctx->gpr[3] = 0;
+     return 0;
+ }

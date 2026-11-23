@@ -1,0 +1,40 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -712,11 +712,15 @@ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
+ /* Re:Fine 0150, diagnostic only: FRAME_PROF (src/main.cpp). 0 = the guest left its
+  * flip wait, 1 = it read the vblank count. NULL unless asked for. */
+ void (*g_frame_prof_guest)(int) = NULL;
++/* Re:Fine 6d: the guest left its flip wait, once per frame, on its own thread. NULL with
++ * fps_target=30 (src/main.cpp). */
++void (*g_fps_guest_frame)(void) = NULL;
+ 
+ /* NID: 0x51C9D62B */
+ void cellGcmResetFlipStatus(void)
+ {
+     if (g_frame_prof_guest) g_frame_prof_guest(0);
++    if (g_fps_guest_frame) g_fps_guest_frame();
+     { static int n = 0;
+       static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
+       if (fd && PS3_LOG_FIRST(n, 12))
+@@ -891,6 +895,11 @@ void ppu_gcm_pump(void)
+ /* Back-compat: the old direct entry points now just mark a tick pending (so any
+  * caller other than the ticker still works) -- delivery stays on the main thread. */
+ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
++/* Re:Fine 6d: a beat of the frame pace with no vblank in it. cellGcmGetVBlankCount sums
++ * these, so the game's "two vblanks per frame" wait lasts 1/fps_target while its vblank
++ * handler stays at 59.94 Hz (docs/decisions.md, 6d). Never called with fps_target=30. */
++static volatile u32 s_pace_extra = 0;
++void cellGcmTickPace(void) { s_pace_extra++; }
+ /* Only deliver a flip completion when a flip is actually outstanding.
+  *
+  * Ticking unconditionally at 60 Hz fires the guest's flip handler even when
+@@ -4148,7 +4157,7 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
+ u32 cellGcmGetVBlankCount(void)
+ {
+     if (g_frame_prof_guest) g_frame_prof_guest(1);
+-    return *(volatile u32*)&s_vblank_count;
++    return *(volatile u32*)&s_vblank_count + s_pace_extra;
+ }
+ 
+ /* Return tile info for a given index */

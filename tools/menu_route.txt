@@ -1,0 +1,114 @@
+# menu_route.txt - el juego no ve lo que se pulsa con el menu del port abierto (tools\menu_input.ps1).
+# 1: en la lista de canciones; 2: en la pausa de la cancion, con "reanudar" elegido; 3: F1 en plena cancion.
+wait task+ 9TaskMovie
+sleep 1000
+until task+_12TaskAdvTitle s 2000
+mark title
+sleep 3000
+press s 100
+sleep 3000
+press n 100
+sleep 3000
+press n 100
+sleep 3000
+press n 100
+mark main_menu
+wait task+ 7SelMain
+wait task+ 10InfoWindow
+sleep 3000
+press n 100
+wait task- 10InfoWindow
+sleep 2000
+press n 100
+mark mode_select
+wait task+ 11SelFreeplay
+sleep 3000
+press n 100
+mark song_list
+wait task+ 5SelPv
+wait task+ 10InfoWindow
+sleep 3000
+press n 100
+wait task- 10InfoWindow
+sleep 2000
+mark in_list
+menu
+sleep 1200
+press n 100
+sleep 900
+press d 80
+sleep 400
+press d 80
+sleep 400
+press u 80
+sleep 400
+taps nd 4 150
+sleep 600
+menu
+sleep 1500
+speed
+mark out_list
+sleep 2500
+speed
+mark end_list
+sleep 1000
+press d 100
+sleep 1500
+press u 100
+sleep 1500
+until TaskPvGame n 2500
+mark song_load
+wait task+ 8SelStart
+sleep 2000
+press n 100
+mark song
+wait task- 8SelStart
+sleep 8000
+mark pause_open
+press s 100
+sleep 2500
+speed
+mark in_pause
+menu
+sleep 1200
+press n 100
+sleep 900
+press d 80
+sleep 400
+press d 80
+sleep 400
+press u 80
+sleep 400
+taps nd 4 150
+sleep 600
+menu
+sleep 1500
+speed
+mark out_pause
+sleep 2500
+speed
+mark end_pause
+press n 100
+sleep 5000
+speed
+mark in_song
+menu
+sleep 1200
+press n 100
+sleep 900
+press d 80
+sleep 400
+press d 80
+sleep 400
+press u 80
+sleep 400
+taps nd 4 150
+sleep 600
+menu
+sleep 1500
+speed
+mark out_song
+sleep 2500
+speed
+mark end_song
+close

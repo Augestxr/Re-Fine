@@ -1,0 +1,202 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -133,6 +133,9 @@ unsigned pad_raw_sources(void) { return (unsigned)s_raw_sources; }
+ 
+ /* Re:Fine 0173 (port_overlay.h): set by the port for the frames the game does not step. */
+ volatile long g_port_pad_hold;
++extern volatile long g_port_draw_tick;   /* libs/video: this guest frame runs the game's logic (a 30 Hz tick) */
++extern volatile long g_port_draw_ticks;  /* libs/video: how many 30 Hz ticks since boot */
++extern unsigned int ppu_active_lr(void);  /* runtime: the guest return address of the call being served */
+ 
+ /* Re:Fine 0172: one short vibration asked by the port (port_overlay.h), sent by the SDL thread to port 0.
+  * Packed in one 64-bit word with a sequence number, so a pulse is never read half written. */
+@@ -181,6 +184,29 @@ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+ static int s_data_fresh[PAD_MAX_HOST_PORTS];
+ /* Re:Fine 0185: the buttons seen down in any poll since the last read the game used (cellPadGetData). */
+ static volatile long s_btn_latch[PAD_MAX_HOST_PORTS];
++/* Re:Fine 0191 (docs/tiempo_real.md): no press is lost, whatever the frame rate. Every poll that sees a
++ * button go down queues it here with the time it happened; the game's reads take them in order, one per
++ * button and per read, and the read after that has it up: the game always sees a whole press, down and up,
++ * even when two presses of the same button fall between two of its reads (0185 merged them into one).
++ * The queue is only for a press the game has not seen yet: a button still held comes through the normal
++ * path. REFINE_PAD_LATCH=0 turns both off. */
++#define PAD_TAPS 8                                             /* presses of ONE button the queue can hold */
++static unsigned long long  s_tap_ms[PAD_MAX_HOST_PORTS][16][PAD_TAPS];
++static unsigned char       s_tap_n[PAD_MAX_HOST_PORTS][16];    /* presses of that button the game has not seen */
++static u16                 s_tap_prev[PAD_MAX_HOST_PORTS];     /* what the last poll saw down */
++static u16                 s_tap_gap[PAD_MAX_HOST_PORTS];      /* given in the last read: must read up in this one */
++/* Re:Fine 0191b: a queued press is given to the game **for one whole 30 Hz tick**, and the tick after it is
++ * free: it is down in every read of its tick and up in every read of the next, so a step that runs every frame
++ * and a step that runs on the ticks both see a whole press. One read was not enough (at 120 fps in real time
++ * the movie ignored START for its whole 100 s, work/run/c*-j*), and a hold in milliseconds was not either
++ * (with the packet held between ticks the reads that would let go never came). It is the shortest press the
++ * original can see, one frame of 30, and the queue hands out at most 15 a second per button, as the console
++ * does; the rest wait their turn. s_tap_tick = the tick its press owns, 0 = none; s_tap_free = the first tick
++ * another press of that button may own. */
++static long                s_tap_tick[PAD_MAX_HOST_PORTS][16];
++static long                s_tap_free[PAD_MAX_HOST_PORTS][16];
++static unsigned            s_tap_q, s_tap_sent, s_tap_held, s_tap_lost;
++static double              s_tap_lat_sum, s_tap_lat_max;       /* press -> the game's read, ms */
+ static int s_pad_log = -1;   /* REFINE_PAD_LOG=1: every change of port 0's buttons, as polled and as the game reads it */
+ 
+ #if PAD_BACKEND_SDL2
+@@ -1449,11 +1475,22 @@ static void pad_poll_backend(void)
+ #ifdef _WIN32
+     pad_poll_keyboard();
+ #endif
+-    if (s_pad_log < 0) s_pad_log = getenv("REFINE_PAD_LOG") != NULL;
++    if (s_pad_log < 0) { const char* e = getenv("REFINE_PAD_LOG"); s_pad_log = e ? (atoi(e) > 0 ? atoi(e) : 1) : 0; }
+     if (s_pad_log) { static u16 lb; if (s_host_state[0].buttons != lb) { lb = s_host_state[0].buttons;
+         fprintf(stderr, "[pad-poll] %llu ms buttons %04X%c", now, lb, 10); } }
+     for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)   /* 0185 */
+         if (s_host_state[_i].buttons) __atomic_fetch_or(&s_btn_latch[_i], (long)s_host_state[_i].buttons, __ATOMIC_RELAXED);
++    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++) {   /* 0191: one queue entry per button going down */
++        const u16 down = (u16)(s_host_state[_i].buttons & ~s_tap_prev[_i]);
++        s_tap_prev[_i] = s_host_state[_i].buttons;
++        if (!down) continue;
++        for (int b = 0; b < 16; b++) {
++            if (!(down & (1u << b))) continue;
++            if (s_tap_n[_i][b] >= PAD_TAPS) { s_tap_lost++; continue; }   /* 8 presses of one button unread */
++            s_tap_ms[_i][b][s_tap_n[_i][b]++] = now;
++            s_tap_q++;
++        }
++    }
+     pad_track_assign();
+     pad_unlock();
+ }
+@@ -1514,6 +1551,45 @@ s32 cellPadEnd(void)
+     return CELL_OK;
+ }
+ 
++/* Re:Fine 0191: a scripted press, queued where a real key's press is queued (src/evt.cpp, the route step
++ * "taps"). A scripted key is a time window that the per-frame poll may miss entirely when the window is
++ * shorter than a frame; a real key cannot be missed (GetAsyncKeyState keeps "pressed since the last call",
++ * 0185). So the speed test's own presses go in here: one press of each button of <letters>, timed now. */
++void cellPad_script_tap(const char* letters)
++{
++    static const struct { u16 btn; char letter; } tab[] = {
++        { CELL_PAD_CTRL_TRIANGLE, 'W' }, { CELL_PAD_CTRL_SQUARE, 'A' }, { CELL_PAD_CTRL_CROSS, 'S' },
++        { CELL_PAD_CTRL_CIRCLE, 'D' },   { CELL_PAD_CTRL_UP, 'I' },     { CELL_PAD_CTRL_LEFT, 'J' },
++        { CELL_PAD_CTRL_DOWN, 'K' },     { CELL_PAD_CTRL_RIGHT, 'L' },  { CELL_PAD_CTRL_UP, 'u' },
++        { CELL_PAD_CTRL_DOWN, 'd' },     { CELL_PAD_CTRL_LEFT, 'l' },   { CELL_PAD_CTRL_RIGHT, 'r' },
++        { CELL_PAD_CTRL_CROSS, 'n' },    { CELL_PAD_CTRL_CIRCLE, 'b' }, { CELL_PAD_CTRL_START, 's' },
++        { CELL_PAD_CTRL_START, 'e' },
++    };
++    u16 mask = 0;
++    for (const char* c = letters; *c; c++)
++        for (unsigned i = 0; i < sizeof tab / sizeof tab[0]; i++)
++            if (tab[i].letter == *c) mask |= tab[i].btn;
++    if (!mask) return;
++    const unsigned long long now = pad_now_ms();
++    pad_lock();
++    for (int b = 0; b < 16; b++) {
++        if (!(mask & (1u << b))) continue;
++        if (s_tap_n[0][b] >= PAD_TAPS) { s_tap_lost++; continue; }
++        s_tap_ms[0][b][s_tap_n[0][b]++] = now;
++        s_tap_q++;
++    }
++    pad_unlock();
++}
++
++/* Re:Fine 0191: what the queue has done so far, for tools\key_burst.ps1. */
++void cellPad_tap_stats(unsigned* queued, unsigned* given, unsigned* held, unsigned* dropped)
++{
++    if (queued) *queued = s_tap_q;
++    if (given) *given = s_tap_sent;
++    if (held) *held = s_tap_held;
++    if (dropped) *dropped = s_tap_lost;
++}
++
+ void cellPad_poll(void)
+ {
+     if (s_pad_initialized) {
+@@ -1936,8 +2012,59 @@ emit:
+         if (port_no < CELL_PAD_MAX_PORT_NUM) {
+             if (g_port_pad_hold && s_have_pkt[port_no]) *data = s_last_pkt[port_no];
+             else {
+-                const long lat = (s_latch && port_no < PAD_MAX_HOST_PORTS) ? __atomic_exchange_n(&s_btn_latch[port_no], 0, __ATOMIC_RELAXED) : 0;
++                /* 0191: the queued presses the game has not seen. One per button and per read, in order, and
++                 * never two in a row for the same button (the read between them has it up), so every press is
++                 * a whole edge for the game. A press still held when the game reads needs nothing: it is in
++                 * data already, and its queue entry goes. */
++                u16 lat16 = 0;
++                if (s_latch && port_no < PAD_MAX_HOST_PORTS) {
++                    const u16 cur = (u16)(data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |
++                                          (data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8));
++                    u16 give = 0, done = 0;
++                    pad_lock();
++                    for (int b = 0; b < 16; b++) {
++                        const u16 bit = (u16)(1u << b);
++                        if (s_tap_tick[port_no][b]) {          /* a press being given: its own tick */
++                            if (s_tap_tick[port_no][b] == g_port_draw_ticks + 1) { if (!(cur & bit)) give |= bit; continue; }
++                            s_tap_free[port_no][b] = g_port_draw_ticks + 2;   /* this tick up, then another may come */
++                            s_tap_tick[port_no][b] = 0;
++                            continue;
++                        }
++                        if (!s_tap_n[port_no][b]) continue;
++                        if (cur & bit) {                      /* the game sees it down right now */
++                            s_tap_held += s_tap_n[port_no][b];
++                            s_tap_n[port_no][b] = 0;
++                            continue;
++                        }
++                        if (g_port_draw_ticks + 1 < s_tap_free[port_no][b]) continue;   /* the tick of the gap */
++                        give |= bit;
++                        s_tap_tick[port_no][b] = g_port_draw_ticks + 1;
++                        const double ms = (double)(pad_now_ms() - s_tap_ms[port_no][b][0]);
++                        s_tap_lat_sum += ms; if (ms > s_tap_lat_max) s_tap_lat_max = ms;
++                        s_tap_sent++;
++                        for (int k = 1; k < s_tap_n[port_no][b]; k++) s_tap_ms[port_no][b][k - 1] = s_tap_ms[port_no][b][k];
++                        s_tap_n[port_no][b]--;
++                    }
++                    (void)done;
++                    pad_unlock();
++                    lat16 = give;
++                }
++                const long lat = (long)lat16;
+                 const u16 l1 = (u16)(lat & 0xFF), l2 = (u16)((lat >> 8) & 0xFF);
++                /* Re:Fine 0191c: a read whose buttons differ from the last packet the game got is a report
++                 * of its own, so it never goes out with len = 0, which the game ignores (see the note on
++                 * freshness above). Nearly half the game's reads came with len = 0 -- the poll hands each
++                 * sweep out once and the game reads oftener than the sweep -- and when every read inside a
++                 * press fell on len = 0 the press was lost: that is the "sometimes a key does not count" of
++                 * 2026-11-12, one run in three at 120 fps in the menus. A real pad reports on change as well. */
++                if (port_no < CELL_PAD_MAX_PORT_NUM && !data->len && s_have_pkt[port_no]) {
++                    const u16 was = (u16)(s_last_pkt[port_no].button[CELL_PAD_BTN_OFFSET_DIGITAL1] |
++                                          (s_last_pkt[port_no].button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8));
++                    const u16 now16 = (u16)((data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] | l1) |
++                                            ((data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] | l2) << 8));
++                    if (was != now16)
++                        data->len = s_last_pkt[port_no].len ? s_last_pkt[port_no].len : CELL_PAD_LEN_CHANGE_DEFAULT;
++                }
+                 if ((l1 & ~data->button[CELL_PAD_BTN_OFFSET_DIGITAL1]) | (l2 & ~data->button[CELL_PAD_BTN_OFFSET_DIGITAL2])) {
+                     data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= l1;
+                     data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= l2;
+@@ -1945,7 +2072,26 @@ emit:
+                 }
+                 if (s_pad_log > 0 && port_no == 0) { static u32 lg = ~0u;
+                     const u32 g = (u32)data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] | (u32)data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8;
+-                    if (data->len && g != lg) { lg = g; fprintf(stderr, "[pad-game] %llu ms buttons %04X len %d latched %04lX%c", pad_now_ms(), g, (int)data->len, lat, 10); } }
++                    if (data->len && g != lg) { lg = g; fprintf(stderr, "[pad-game] %llu ms buttons %04X len %d latched %04lX%c", pad_now_ms(), g, (int)data->len, lat, 10); }
++                    /* REFINE_PAD_LOG=2: who in the game reads the pad (its guest return address), once per
++                     * caller and with how many reads it made -- to find the task that turns the pad into the
++                     * "pressed now" flags the rest of the game uses (docs/tiempo_real.md). */
++                    /* REFINE_PAD_LOG=3: cada lectura del juego entre los segundos 17 y 22 de la corrida
++                     * (diagnostico de la pulsacion perdida, docs/tiempo_real.md). */
++                    if (s_pad_log > 2) { const unsigned long long rel = pad_now_ms() - s_key_t0;
++                        if (rel > 17000 && rel < 22000)
++                            fprintf(stderr, "[pad-read] %llu ms buttons %04X len %d hold %ld tick %ld%c",
++                                    rel, g, (int)data->len, g_port_pad_hold, g_port_draw_tick, 10); }
++                    if (s_pad_log > 1) { static unsigned int lrs[16]; static unsigned n_lr, cnt[16];
++                        const unsigned int lr = ppu_active_lr();
++                        unsigned k = 0; for (; k < n_lr; k++) if (lrs[k] == lr) break;
++                        if (k == n_lr && n_lr < 16) { lrs[n_lr] = lr; cnt[n_lr] = 0; n_lr++; }
++                        if (k < 16) { cnt[k]++;
++                            if (cnt[k] == 1 || cnt[k] % 2000 == 0)
++                                fprintf(stderr, "[pad-who] lr=0x%08X reads=%u tick=%ld%c", lr, cnt[k], g_port_draw_tick, 10); } }
++                    { static unsigned n; if (++n % 600 == 0)
++                        fprintf(stderr, "[pad-taps] queued %u, given to the game %u, read while held %u, dropped %u; press to read avg %.1f ms max %.1f ms%c",
++                                s_tap_q, s_tap_sent, s_tap_held, s_tap_lost, s_tap_sent ? s_tap_lat_sum / s_tap_sent : 0.0, s_tap_lat_max, 10); } }
+                 s_last_pkt[port_no] = *data; s_have_pkt[port_no] = 1;
+             }
+         }

@@ -1,0 +1,25 @@
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 96266731beba7c11196f52b47fe189738730d579..a681ce5cc8e00665a8593db4cf1d32fc90e8ad86 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1225,6 +1225,20 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+         fprintf(stderr, "[SPU] group_start id=0x%X (%d host threads running, %d instant)\n",
+                 id, spawned, instant);
+     }
++    /* Re:Fine patches/0102: a thread whose image is neither lifted (workload
++     * registry) nor interpreted ran NOTHING. Reporting CELL_OK for it was a false
++     * success: the group looked started and its PPU side waited forever on events
++     * the SPU never sent (Project DIVA F's synth2 mixer kept its mutex and the main
++     * thread blocked on it). Real lv2 never fails here, so say it loudly and fail
++     * the call instead of pretending. */
++    if (nofb > 0) {
++        g->state = SPU_GROUP_STATE_INITIALIZED;
++        fprintf(stderr, "[SPU] group_start id=0x%X FAILED: %d thread(s) have no lifted "
++                "image (not in the workload registry) -> CELL_ENOSYS\n", id, nofb);
++        fflush(stderr);
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)CELL_ENOSYS;
++        return (int64_t)(int32_t)CELL_ENOSYS;
++    }
+     fflush(stderr);
+     ctx->gpr[3] = 0;
+     return 0;

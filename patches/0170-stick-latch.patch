@@ -1,0 +1,42 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -856,6 +856,7 @@ typedef struct { int out, x, y, wait; Uint64 since; u8 lx, ly; } PadStick;
+  * since the last one -- two of them a few tens of ms apart are one flick counted twice. */
+ static volatile float s_view_x, s_view_y;
+ static int s_star_log = -1;
++static int s_stick_latch = -1;   /* Re:Fine 0170: REFINE_STICK_LATCH, lazily read, ON by default (=0 disables) */
+ void pad_set_stick(float dz, float hy, int rearm_ms)
+ {
+     if (dz >= 0) s_stick_dz = dz;
+@@ -869,6 +870,7 @@ static void pad_sdl3_stick(PadStick* st, int x, int y, u8* ox, u8* oy)
+ {
+     const float r = SDL_sqrtf((float)x * x + (float)y * y) / 32767.0f;
+     const Uint64 now = SDL_GetTicks();
++    if (s_stick_latch < 0) { const char* e = getenv("REFINE_STICK_LATCH"); s_stick_latch = !(e && atoi(e) == 0); }
+     if (st->out && (r < s_stick_dz || (long long)x * st->x + (long long)y * st->y < 0)) {
+         if (s_star_log >= 2)   /* Re:Fine 0169 */
+             fprintf(stderr, "[pad] stick in: (%+.2f, %+.2f) r=%.2f at %llu ms (%s)\n", x / 32767.0f, y / 32767.0f, r,
+@@ -890,8 +892,20 @@ static void pad_sdl3_stick(PadStick* st, int x, int y, u8* ox, u8* oy)
+         if (st->since && now - st->since >= s_stick_rearm_ms) st->wait = 0;
+     }
+     if (st->wait) { *ox = st->lx; *oy = st->ly; return; }
+-    *ox = st->out ? pad_sdl3_axis(x) : 128;
+-    *oy = st->out ? pad_sdl3_axis(y) : 128;
++    if (st->out && s_stick_latch) {
++        /* Re:Fine 0170: REFINE_STICK_LATCH=1. While the stick is out, F gets the direction of the first
++         * instant (st->x, st->y) and only the length follows the thumb, so the wobble of the angle at the
++         * rim cannot read as a new flick. A turn of more than 90 degrees was already taken above as coming
++         * back (the dot product), so it frees the latch and can count as a new one. By real position, not by
++         * frame: the same at any frame rate. */
++        const float n = SDL_sqrtf((float)st->x * st->x + (float)st->y * st->y);
++        const float m = r > 1.0f ? 1.0f : r;
++        *ox = pad_sdl3_axis((int)((float)st->x / n * m * 32767.0f));
++        *oy = pad_sdl3_axis((int)((float)st->y / n * m * 32767.0f));
++    } else {
++        *ox = st->out ? pad_sdl3_axis(x) : 128;
++        *oy = st->out ? pad_sdl3_axis(y) : 128;
++    }
+     st->lx = *ox; st->ly = *oy;
+ }
+ 

@@ -1,0 +1,65 @@
+Re:Fine 0117: D3D12, superficie en el offset 0 y constantes del FP en la clave.
+
+F guarda su escena HDR de 2048x1152 en el offset 0 de la memoria local, lejos de los display buffers, y
+la lee luego como textura. El backend usaba 0 para "pantalla" y "ninguna": la escena iba al backbuffer y
+el compuesto leia negro. rsx_fp_decompile clava las constantes inline en el HLSL, asi que entran en la
+clave del PSO (FP_CONSTBUF=1 vuelve a la clave por codigo). Evidencia en docs/STATUS.md (4i).
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 0d81cda..75905c6 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2469,7 +2469,11 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+         s_perf_pso_hashbytes += (int)usz;
+         static int consts_inline = -1;
+         if (consts_inline < 0) { const char* e = getenv("FP_CONSTBUF");
+-                                 consts_inline = (e && e[0] == '0') ? 1 : 0; }
++                                 /* Re:Fine 0117: rsx_fp_decompile bakes the inline constants
++                                  * into the HLSL, so they are part of the program. Keyed
++                                  * on the code alone, draws differing in them shared the
++                                  * first pipeline (PV600: 55 programs for 223). */
++                                 consts_inline = (e && e[0] == '1') ? 0 : 1; }
+         if (consts_inline) {
+             uhash = 2166136261u;
+             const u8* up = vm_base + off;
+@@ -3812,6 +3816,13 @@ static void rec_zeta(D3D12DrawRecord* dr)
+     dr->no_color = st->color_target == 0 && dr->zeta_off != 0;
+ }
+ 
++/* Re:Fine 0117: offset 0 of local memory is a surface like any other. Project DIVA
++ * F keeps its 2048x1152 HDR scene there, away from the display buffers, and reads
++ * it back as a texture. Here 0 means "the display" and "none", so the scene went
++ * to the backbuffer and the composite read nothing. Offsets have 31 bits (see
++ * TEXTURE_OFFSET), so this key cannot be a real one. */
++#define RT_OFF_ZERO 0xFFFFFFF0u
++
+ /* Which offscreen surface (if any) does the current RSX state render to?
+  * Returns 0 for a display buffer (backbuffer), else the surface's RAW RSX
+  * offset. RTs are keyed by raw offset -- a texture bound at the same raw
+@@ -3870,6 +3881,8 @@ static u32 current_rt_off(u32* out_w, u32* out_h, u32 out_mrt[3])
+     if (w < 16 || w > 2048 || h < 16 || h > 2048) { w = 0; h = 0; }
+     if (out_w) *out_w = w;
+     if (out_h) *out_h = h;
++    /* Before a title sets a surface every register is 0: that is not offset 0. */
++    if (!raw && w && st->color_target) return RT_OFF_ZERO;
+     return raw;
+ }
+ 
+@@ -3970,7 +3983,7 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+                   (want_fmt == DXGI_FORMAT_R32G32B32A32_FLOAT) ? 16u :
+                   (want_fmt == DXGI_FORMAT_R32_FLOAT) ? 4u : 4u;
+         u32 pitch = (w * bpp + 255) & ~255u;
+-        u32 src = cellGcmResolveOffset(off);
++        u32 src = cellGcmResolveOffset(off == RT_OFF_ZERO ? 0 : off);
+         if (vm_base && src != 0xFFFFFFFFu) {
+             D3D12_HEAP_PROPERTIES hu = {0}; hu.Type = D3D12_HEAP_TYPE_UPLOAD;
+             D3D12_RESOURCE_DESC bd = {0};
+@@ -7672,7 +7685,7 @@ static void d3d12_bind_texture(void* ud, u32 unit, const rsx_texture_state* tex)
+                 }
+             } }
+           s_d3d.cur_texs[unit].off = _r; }
+-        s_d3d.cur_texs[unit].raw = offset;
++        s_d3d.cur_texs[unit].raw = offset ? offset : RT_OFF_ZERO;
+         s_d3d.cur_texs[unit].w = width; s_d3d.cur_texs[unit].h = height;
+         s_d3d.cur_texs[unit].fmt = format;   /* full byte: LN(0x20)/UN(0x40) kept */
+         s_d3d.cur_texs[unit].ctrl1 = tex->control1;

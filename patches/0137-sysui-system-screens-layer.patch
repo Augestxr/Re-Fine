@@ -1,0 +1,1136 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index c0cf48459109cb0f1e112d42b7d6f0b47be10e94..5d360253b59c45aeb12a1d68f91d1c0bd38d0906 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -69,6 +69,8 @@ static double pad_clock(unsigned long long t0_ms)
+  * Internal state
+  * -----------------------------------------------------------------------*/
+ 
++#include "../system/sysui.h"
++
+ #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
+ 
+ typedef struct {
+@@ -1092,6 +1094,21 @@ skip_inject: ;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
+     }
++    /* A system screen holds the pad, after every source above has had its say:
++     * PAD_SCRIPT and PAD_FILE press its buttons the way a controller does. */
++    if (g_sysui_gate) {
++        const u16 mask = (u16)((data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8) |
++                               (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xFF));
++        if (sysui_pad_gate(port_no, mask, (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X],
++                           (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y])) {
++            data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = 0;
++            data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = 0;
++            for (int _i = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X; _i <= CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y; _i++)
++                data->button[_i] = 128;
++            for (int _i = CELL_PAD_BTN_OFFSET_PRESS_RIGHT; _i <= CELL_PAD_BTN_OFFSET_PRESS_R2; _i++)
++                data->button[_i] = 0;
++        }
++    }
+     }  /* end connected block */
+ 
+ emit:
+diff --git a/libs/system/sysui.c b/libs/system/sysui.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c55a0a8f7737231373d2cab9dfb2c5e96a7881c
+--- /dev/null
++++ b/libs/system/sysui.c
+@@ -0,0 +1,668 @@
++/*
++ * sysui - the system's own screens; see sysui.h.
++ *
++ * Behaviour follows what RPCS3 shows for F (cancion_1, con_datos_1/2), no code
++ * of it. Everything is plain Win32: GDI draws on a DIB only when something
++ * changed, and the backend copies that to a texture.
++ *
++ * Threads:
++ *   caller    a title thread, parked on s_cv in sysui_save_list/sysui_msg
++ *   pad       the title's thread in cellPadGetData, moves the cursor and answers
++ *   render    frame_clock, reads the model in sysui_draw
++ */
++#ifdef _WIN32
++
++#define COBJMACROS
++#include "sysui.h"
++#include "cellMsgDialog.h"
++
++#include <windows.h>
++#include <wincodec.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#pragma comment(lib, "user32")
++#pragma comment(lib, "gdi32")
++#pragma comment(lib, "ole32")
++#pragma comment(lib, "windowscodecs")
++#pragma comment(lib, "uuid")
++
++#define PAD_UP       0x0010u
++#define PAD_RIGHT    0x0020u
++#define PAD_DOWN     0x0040u
++#define PAD_LEFT     0x0080u
++#define PAD_CIRCLE   0x2000u
++#define PAD_CROSS    0x4000u
++#define PAD_ANALOG_THRESHOLD 64
++
++#define REPEAT_FIRST_MS 400
++#define REPEAT_NEXT_MS  120
++
++#define ICON_W 320
++#define ICON_H 176
++
++/* What is under the text. GDI leaves the alpha byte alone, so sysui_draw makes
++ * it from brightness: text stays solid and this dims the title's frame. */
++#define BACK_ALPHA 0xD8
++
++enum { KIND_NONE, KIND_LIST, KIND_MSG };
++
++typedef struct Icon { uint32_t* px; } Icon;
++
++typedef struct Screen {
++    int           kind;
++    /* KIND_MSG */
++    uint32_t      type;
++    wchar_t       text[SYSUI_MSG_MAX + 1];
++    int           bar_percent[2];
++    wchar_t       bar_text[2][256];
++    sysui_done_fn done;
++    void*         ctx;
++    ULONGLONG     close_at;     /* 0 = no close pending */
++    int           close_result;
++    /* KIND_LIST */
++    wchar_t       header[64];
++    const SysuiList* list;
++    Icon*         icons;
++    int           rows;
++    int           cursor;
++    int           top;
++    /* result */
++    int           answered;
++    int           result;
++} Screen;
++
++static SRWLOCK            s_lock = SRWLOCK_INIT;
++static CONDITION_VARIABLE s_cv   = CONDITION_VARIABLE_INIT;
++static Screen             s_sc;
++static int                s_quit;
++static uint16_t           s_held;       /* pad state last seen by the screen */
++static uint16_t           s_swallow;    /* still down from the press that answered */
++static uint16_t           s_rep_btn;
++static ULONGLONG          s_rep_at;
++static volatile long      s_gen;        /* bumped on any visible change */
++
++volatile long g_sysui_gate;
++volatile long g_sysui_visible;
++
++static void widen(const char* s, wchar_t* out, int n)
++{
++    if (!MultiByteToWideChar(CP_UTF8, 0, s ? s : "", -1, out, n)) out[0] = 0;
++    out[n - 1] = 0;
++}
++
++static void changed(void) { InterlockedIncrement(&s_gen); }
++
++/* --- screen lifetime (lock held) ------------------------------------------ */
++
++static void screen_show(int kind)
++{
++    /* The pad state from before the screen counts as held: a button down at
++     * open is not a press on the screen. It is taken from s_held in gate. */
++    s_sc.kind = kind;
++    s_sc.answered = 0;
++    s_rep_btn = 0;
++    changed();
++    InterlockedExchange(&g_sysui_visible, 1);
++    InterlockedExchange(&g_sysui_gate, 1);
++}
++
++static void screen_hide(void)
++{
++    s_sc.kind = KIND_NONE;
++    s_swallow = s_held;
++    InterlockedExchange(&g_sysui_visible, 0);
++    InterlockedExchange(&g_sysui_gate, s_swallow ? 1 : 0);
++    WakeAllConditionVariable(&s_cv);
++}
++
++/* Wait for the slot, for a blocking screen. Nonzero when quitting. */
++static int screen_acquire(void)
++{
++    while (s_sc.kind != KIND_NONE && !s_quit)
++        SleepConditionVariableSRW(&s_cv, &s_lock, INFINITE, 0);
++    return s_quit;
++}
++
++/* --- icons ---------------------------------------------------------------- */
++
++static uint32_t* icon_load(IWICImagingFactory* f, const char* path)
++{
++    wchar_t w[1100];
++    widen(path, w, 1100);
++    IWICBitmapDecoder* dec = NULL;
++    IWICBitmapFrameDecode* frame = NULL;
++    IWICBitmapScaler* sc = NULL;
++    IWICFormatConverter* conv = NULL;
++    uint32_t* px = NULL;
++    if (SUCCEEDED(IWICImagingFactory_CreateDecoderFromFilename(f, w, NULL, GENERIC_READ,
++                      WICDecodeMetadataCacheOnDemand, &dec)) &&
++        SUCCEEDED(IWICBitmapDecoder_GetFrame(dec, 0, &frame)) &&
++        SUCCEEDED(IWICImagingFactory_CreateBitmapScaler(f, &sc)) &&
++        SUCCEEDED(IWICBitmapScaler_Initialize(sc, (IWICBitmapSource*)frame, ICON_W, ICON_H,
++                      WICBitmapInterpolationModeFant)) &&
++        SUCCEEDED(IWICImagingFactory_CreateFormatConverter(f, &conv)) &&
++        SUCCEEDED(IWICFormatConverter_Initialize(conv, (IWICBitmapSource*)sc,
++                      &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, NULL, 0.0,
++                      WICBitmapPaletteTypeCustom))) {
++        px = (uint32_t*)malloc(ICON_W * ICON_H * 4);
++        if (px && FAILED(IWICFormatConverter_CopyPixels(conv, NULL, ICON_W * 4,
++                             ICON_W * ICON_H * 4, (BYTE*)px))) {
++            free(px);
++            px = NULL;
++        }
++    }
++    if (conv) IWICFormatConverter_Release(conv);
++    if (sc) IWICBitmapScaler_Release(sc);
++    if (frame) IWICBitmapFrameDecode_Release(frame);
++    if (dec) IWICBitmapDecoder_Release(dec);
++    if (!px) printf("[sysui] could not read icon '%s'\n", path);
++    return px;
++}
++
++/* Decoded on the title's thread, before the screen opens: the render thread
++ * must not stop for a file. */
++static Icon* icons_load(const SysuiList* l)
++{
++    Icon* ic = (Icon*)calloc(l->count ? l->count : 1, sizeof(Icon));
++    if (!ic || !l->count) return ic;
++    const HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    IWICImagingFactory* f = NULL;
++    if (SUCCEEDED(CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER,
++                                   &IID_IWICImagingFactory, (void**)&f))) {
++        for (int i = 0; i < l->count; i++)
++            if (l->items[i].icon_path[0]) ic[i].px = icon_load(f, l->items[i].icon_path);
++        IWICImagingFactory_Release(f);
++    }
++    if (SUCCEEDED(co)) CoUninitialize();
++    return ic;
++}
++
++/* --- blocking screens ----------------------------------------------------- */
++
++int sysui_save_list(const SysuiList* l)
++{
++    Icon* icons = icons_load(l);
++    AcquireSRWLockExclusive(&s_lock);
++    int r = SYSUI_SEL_BACK;
++    if (!screen_acquire()) {
++        memset(&s_sc, 0, sizeof s_sc);
++        widen(l->header, s_sc.header, 64);
++        s_sc.list = l;
++        s_sc.icons = icons;
++        s_sc.rows = l->count + (l->has_new ? 1 : 0);
++        s_sc.cursor = l->focus < 0 ? 0 : l->focus;
++        s_sc.result = SYSUI_SEL_BACK;
++        printf("[sysui] list '%s': %d saves, new=%d, focus=%d\n",
++               l->header, l->count, l->has_new, l->focus);
++        fflush(stdout);
++        screen_show(KIND_LIST);
++        while (!s_sc.answered && !s_quit)
++            SleepConditionVariableSRW(&s_cv, &s_lock, INFINITE, 0);
++        r = s_sc.answered ? s_sc.result : SYSUI_SEL_BACK;
++        if (s_sc.kind == KIND_LIST) screen_hide();
++        printf("[sysui] list -> %d\n", r);
++        fflush(stdout);
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++    for (int i = 0; i < l->count; i++) free(icons[i].px);
++    free(icons);
++    return r;
++}
++
++static void msg_init(uint32_t type, const char* utf8)
++{
++    memset(&s_sc, 0, sizeof s_sc);
++    s_sc.type = type;
++    widen(utf8, s_sc.text, SYSUI_MSG_MAX + 1);
++    s_sc.result = CELL_MSGDIALOG_BUTTON_NONE;
++    { char one[80]; snprintf(one, sizeof one, "%s", utf8 ? utf8 : "");
++      for (char* p = one; *p; p++) if (*p == '\n') *p = ' ';
++      printf("[sysui] dialog type=0x%X '%s'\n", type, one);
++      fflush(stdout); }
++    screen_show(KIND_MSG);
++}
++
++int sysui_msg(uint32_t type, const char* utf8)
++{
++    int r = CELL_MSGDIALOG_BUTTON_NONE;
++    AcquireSRWLockExclusive(&s_lock);
++    if (!screen_acquire()) {
++        msg_init(type, utf8);
++        while (!s_sc.answered && !s_quit)
++            SleepConditionVariableSRW(&s_cv, &s_lock, INFINITE, 0);
++        r = s_sc.answered ? s_sc.result : CELL_MSGDIALOG_BUTTON_NONE;
++        if (s_sc.kind == KIND_MSG) screen_hide();
++        printf("[sysui] dialog -> %d\n", r);
++        fflush(stdout);
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++    return r;
++}
++
++int sysui_msg_open(uint32_t type, const char* utf8, sysui_done_fn done, void* ctx)
++{
++    AcquireSRWLockExclusive(&s_lock);
++    const int busy = s_sc.kind != KIND_NONE;
++    if (!busy) {
++        msg_init(type, utf8);
++        s_sc.done = done;
++        s_sc.ctx = ctx;
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++    return busy;
++}
++
++/* Answer the open async dialog: to be called with the lock held. The callback
++ * runs after the unlock, through the two out parameters. */
++static void msg_answer(int button, sysui_done_fn* fn, void** ctx)
++{
++    *fn = s_sc.done;
++    *ctx = s_sc.ctx;
++    printf("[sysui] dialog -> %d\n", button);
++    fflush(stdout);
++    s_sc.answered = 1;
++    s_sc.result = button;
++    if (s_sc.done) screen_hide();
++    else WakeAllConditionVariable(&s_cv);   /* a blocking caller hides it */
++}
++
++int sysui_msg_close(unsigned delay_ms, int result)
++{
++    sysui_done_fn fn = NULL; void* ctx = NULL;
++    AcquireSRWLockExclusive(&s_lock);
++    const int none = s_sc.kind != KIND_MSG || s_sc.answered || !s_sc.done;
++    if (!none) {
++        if (delay_ms) {
++            s_sc.close_at = GetTickCount64() + delay_ms;
++            s_sc.close_result = result;
++        } else {
++            msg_answer(result, &fn, &ctx);
++        }
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++    if (fn) fn(result, ctx);
++    return none;
++}
++
++void sysui_msg_abort(void)
++{
++    AcquireSRWLockExclusive(&s_lock);
++    if (s_sc.kind == KIND_MSG && s_sc.done) {
++        s_sc.done = NULL;
++        screen_hide();
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++}
++
++int sysui_msg_is_open(void)
++{
++    AcquireSRWLockShared(&s_lock);
++    const int r = s_sc.kind == KIND_MSG && !s_sc.answered && s_sc.done;
++    ReleaseSRWLockShared(&s_lock);
++    return r;
++}
++
++int sysui_msg_progress(unsigned index, int percent_delta, int reset, const char* utf8)
++{
++    AcquireSRWLockExclusive(&s_lock);
++    const int none = s_sc.kind != KIND_MSG || index > 1;
++    if (!none) {
++        if (reset) s_sc.bar_percent[index] = 0;
++        if (percent_delta > 0) {
++            s_sc.bar_percent[index] += percent_delta;
++            if (s_sc.bar_percent[index] > 100) s_sc.bar_percent[index] = 100;
++        }
++        if (utf8) widen(utf8, s_sc.bar_text[index], 256);
++        changed();
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++    return none;
++}
++
++void sysui_quit(void)
++{
++    sysui_done_fn fn = NULL; void* ctx = NULL;
++    AcquireSRWLockExclusive(&s_lock);
++    s_quit = 1;
++    if (s_sc.kind == KIND_MSG && s_sc.done) msg_answer(CELL_MSGDIALOG_BUTTON_ESCAPE, &fn, &ctx);
++    WakeAllConditionVariable(&s_cv);
++    ReleaseSRWLockExclusive(&s_lock);
++    if (fn) fn(CELL_MSGDIALOG_BUTTON_ESCAPE, ctx);
++}
++
++/* --- pad ------------------------------------------------------------------ */
++
++static void list_move(int step)
++{
++    if (!s_sc.rows) return;
++    int c = s_sc.cursor + step;
++    if (c < 0) c = 0;
++    if (c >= s_sc.rows) c = s_sc.rows - 1;
++    if (c != s_sc.cursor) { s_sc.cursor = c; changed(); }
++}
++
++static int list_pick(void)
++{
++    const SysuiList* l = s_sc.list;
++    if (l->has_new) {
++        if (l->new_at_tail) return s_sc.cursor == l->count ? SYSUI_SEL_NEW : s_sc.cursor;
++        return s_sc.cursor == 0 ? SYSUI_SEL_NEW : s_sc.cursor - 1;
++    }
++    return s_sc.cursor;
++}
++
++int sysui_pad_gate(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly)
++{
++    (void)lx;
++    if (port != 0) return g_sysui_visible != 0;
++
++    /* The left stick moves too, like the d-pad. */
++    if (ly < 128 - PAD_ANALOG_THRESHOLD) mask |= PAD_UP;
++    if (ly > 127 + PAD_ANALOG_THRESHOLD) mask |= PAD_DOWN;
++
++    sysui_done_fn fn = NULL; void* ctx = NULL; int button = 0;
++    AcquireSRWLockExclusive(&s_lock);
++
++    const uint16_t down = (uint16_t)(mask & ~s_held);
++    s_held = mask;
++
++    if (s_sc.kind == KIND_MSG && !s_sc.answered) {
++        const int btn = s_sc.type & 0x30, no_cancel = s_sc.type & CELL_MSGDIALOG_TYPE_DISABLE_CANCEL_ON;
++        if (s_sc.close_at && GetTickCount64() >= s_sc.close_at) {
++            button = s_sc.close_result;
++            msg_answer(button, &fn, &ctx);
++        } else if (down & PAD_CROSS) {
++            if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO || btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK)
++                msg_answer(button = CELL_MSGDIALOG_BUTTON_YES, &fn, &ctx);   /* YES == OK */
++        } else if (down & PAD_CIRCLE) {
++            if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO)
++                msg_answer(button = CELL_MSGDIALOG_BUTTON_NO, &fn, &ctx);
++            else if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK && !no_cancel)
++                msg_answer(button = CELL_MSGDIALOG_BUTTON_ESCAPE, &fn, &ctx);
++        }
++    } else if (s_sc.kind == KIND_LIST && !s_sc.answered) {
++        int step = (down & PAD_UP) ? -1 : (down & PAD_DOWN) ? 1 : 0;
++        const ULONGLONG now = GetTickCount64();
++        if (step) {
++            s_rep_btn = (down & PAD_UP) ? PAD_UP : PAD_DOWN;
++            s_rep_at = now + REPEAT_FIRST_MS;
++        } else if (s_rep_btn && (mask & s_rep_btn) && now >= s_rep_at) {
++            step = s_rep_btn == PAD_UP ? -1 : 1;
++            s_rep_at = now + REPEAT_NEXT_MS;
++        }
++        if (step) list_move(step);
++        if ((down & PAD_CROSS) && s_sc.rows) {
++            s_sc.result = list_pick();
++            s_sc.answered = 1;
++            WakeAllConditionVariable(&s_cv);
++        } else if (down & PAD_CIRCLE) {
++            s_sc.result = SYSUI_SEL_BACK;
++            s_sc.answered = 1;
++            WakeAllConditionVariable(&s_cv);
++        }
++    }
++
++    /* After a screen, stay closed until what answered it is let go; otherwise
++     * the title would take the same press for its own. */
++    int idle = 1;
++    if (s_sc.kind == KIND_NONE) {
++        s_swallow &= mask;
++        idle = s_swallow != 0;
++        if (!idle) InterlockedExchange(&g_sysui_gate, 0);
++    }
++    ReleaseSRWLockExclusive(&s_lock);
++    if (fn) fn(button, ctx);
++    return idle;
++}
++
++/* --- drawing -------------------------------------------------------------- */
++
++static HDC      s_dc;
++static HBITMAP  s_bmp;
++static uint32_t* s_px;
++static unsigned s_w, s_h;
++static long     s_drawn_gen = -1;
++
++/* Sizes are for 720 lines, scaled to the output. */
++static int S(int v) { return MulDiv(v, (int)s_h, 720); }
++
++static HFONT font(int px, int weight)
++{
++    return CreateFontW(-S(px), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
++                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
++                       DEFAULT_PITCH, L"Segoe UI");
++}
++
++static void text(const wchar_t* t, int x, int y, int w, int h, int px, int weight,
++                 COLORREF c, UINT fmt)
++{
++    HFONT f = font(px, weight);
++    HGDIOBJ old = SelectObject(s_dc, f);
++    SetTextColor(s_dc, c);
++    RECT r = { x, y, x + w, y + h };
++    DrawTextW(s_dc, t, -1, &r, fmt | DT_NOPREFIX);
++    SelectObject(s_dc, old);
++    DeleteObject(f);
++}
++
++static void rect(int x, int y, int w, int h, COLORREF c)
++{
++    HBRUSH b = CreateSolidBrush(c);
++    RECT r = { x, y, x + w, y + h };
++    FillRect(s_dc, &r, b);
++    DeleteObject(b);
++}
++
++/* The face buttons, drawn: no font carries them with the right colours. */
++static void glyph(int is_cross, int cx, int cy, int size)
++{
++    const int r = S(size) / 2, t = S(3) > 1 ? S(3) : 2;
++    HPEN pen = CreatePen(PS_SOLID, t, is_cross ? RGB(120, 170, 255) : RGB(255, 90, 90));
++    HGDIOBJ op = SelectObject(s_dc, pen), ob = SelectObject(s_dc, GetStockObject(NULL_BRUSH));
++    if (is_cross) {
++        MoveToEx(s_dc, cx - r, cy - r, NULL); LineTo(s_dc, cx + r, cy + r);
++        MoveToEx(s_dc, cx + r, cy - r, NULL); LineTo(s_dc, cx - r, cy + r);
++    } else {
++        Ellipse(s_dc, cx - r, cy - r, cx + r, cy + r);
++    }
++    SelectObject(s_dc, op);
++    SelectObject(s_dc, ob);
++    DeleteObject(pen);
++}
++
++/* One or two "<glyph> word" pairs, centred on x. */
++static void legend(int cx, int cy, const wchar_t* cross, const wchar_t* circle)
++{
++    const int gap = S(44);
++    const int pairs = (cross ? 1 : 0) + (circle ? 1 : 0);
++    int x = cx - (pairs == 2 ? S(150) : S(70));
++    if (cross) {
++        glyph(1, x, cy, 22);
++        text(cross, x + S(20), cy - S(16), S(120), S(32), 22, FW_NORMAL, RGB(255, 255, 255),
++             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
++        x += S(120) + gap;
++    }
++    if (circle) {
++        glyph(0, x, cy, 22);
++        text(circle, x + S(20), cy - S(16), S(120), S(32), 22, FW_NORMAL, RGB(255, 255, 255),
++             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
++    }
++}
++
++/* Frame lines of a system screen, above and below the content. */
++static void bands(int top, int bottom)
++{
++    const int mx = S(90), t = S(2) > 1 ? S(2) : 1;
++    rect(mx, top, s_w - mx * 2, t, RGB(230, 230, 230));
++    rect(mx, bottom, s_w - mx * 2, t, RGB(230, 230, 230));
++}
++
++static void draw_msg(void)
++{
++    const int btn = s_sc.type & 0x30;
++    const int bars = (s_sc.type & CELL_MSGDIALOG_TYPE_PROGRESSBAR_SINGLE) ? 1 :
++                     (s_sc.type & CELL_MSGDIALOG_TYPE_PROGRESSBAR_DOUBLE) ? 2 : 0;
++    const int top = S(200), bottom = S(500);
++    bands(top, bottom);
++
++    int y = top + S(24);
++    RECT calc = { 0, 0, (LONG)s_w - S(240), 0 };
++    { HFONT f = font(26, FW_NORMAL); HGDIOBJ o = SelectObject(s_dc, f);
++      DrawTextW(s_dc, s_sc.text, -1, &calc, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_CALCRECT);
++      SelectObject(s_dc, o); DeleteObject(f); }
++    const int room = bottom - top - S(bars ? 170 : 110);
++    if (calc.bottom < room) y += (room - calc.bottom) / 2;
++    text(s_sc.text, S(120), y, s_w - S(240), room, 26, FW_NORMAL, RGB(255, 255, 255),
++         DT_CENTER | DT_WORDBREAK);
++
++    for (int i = 0; i < bars; i++) {
++        const int bx = S(240), bw = s_w - S(480), by = bottom - S(120) + i * S(46);
++        if (s_sc.bar_text[i][0])
++            text(s_sc.bar_text[i], bx, by - S(26), bw, S(24), 18, FW_NORMAL, RGB(220, 220, 220),
++                 DT_LEFT | DT_SINGLELINE);
++        rect(bx, by, bw, S(10), RGB(70, 70, 70));
++        rect(bx, by, bw * s_sc.bar_percent[i] / 100, S(10), RGB(235, 235, 235));
++    }
++
++    const int cy = bottom - S(38);
++    if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO) legend(s_w / 2, cy, L"Yes", L"No");
++    else if (btn == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK) legend(s_w / 2, cy, L"OK", NULL);
++}
++
++static void draw_icon(const uint32_t* px, int x, int y, int w, int h)
++{
++    BITMAPINFO bi = {0};
++    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
++    bi.bmiHeader.biWidth = ICON_W;
++    bi.bmiHeader.biHeight = -ICON_H;
++    bi.bmiHeader.biPlanes = 1;
++    bi.bmiHeader.biBitCount = 32;
++    bi.bmiHeader.biCompression = BI_RGB;
++    SetStretchBltMode(s_dc, HALFTONE);
++    StretchDIBits(s_dc, x, y, w, h, 0, 0, ICON_W, ICON_H, px, &bi, DIB_RGB_COLORS, SRCCOPY);
++}
++
++static void draw_row(int y, int rh, const wchar_t* t1, const wchar_t* t2, const wchar_t* t3,
++                     const wchar_t* t4, const uint32_t* icon, int selected)
++{
++    const int mx = S(90);
++    if (selected) {
++        rect(mx, y, s_w - mx * 2, rh, RGB(62, 62, 72));
++        rect(mx, y, S(4), rh, RGB(120, 170, 255));
++    }
++    const int ix = mx + S(14), iy = y + S(6), ih = rh - S(12), iw2 = ih * ICON_W / ICON_H;
++    if (icon) draw_icon(icon, ix, iy, iw2, ih);
++    else rect(ix, iy, iw2, ih, RGB(40, 40, 46));
++    const int tx = ix + iw2 + S(22), tw = s_w - mx - tx - S(14);
++    text(t1, tx, y + S(8), tw, S(30), 22, FW_SEMIBOLD, RGB(255, 255, 255),
++         DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
++    text(t2, tx, y + S(38), tw, S(26), 19, FW_NORMAL, RGB(225, 225, 225),
++         DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
++    text(t3, tx, y + S(66), tw, S(24), 17, FW_NORMAL, RGB(190, 190, 190),
++         DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
++    text(t4, tx, y + S(90), tw, S(24), 17, FW_NORMAL, RGB(190, 190, 190),
++         DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
++}
++
++static void draw_list(void)
++{
++    const SysuiList* l = s_sc.list;
++    const int top = S(96), bottom = S(626), rh = S(124);
++    const int fit = (bottom - top - S(8)) / rh;
++    text(s_sc.header, S(96), S(46), s_w - S(192), S(44), 30, FW_NORMAL, RGB(255, 255, 255),
++         DT_LEFT | DT_SINGLELINE);
++    bands(top, bottom);
++
++    if (!s_sc.rows) {
++        text(L"There is no saved data.", 0, top, s_w, bottom - top, 26, FW_NORMAL,
++             RGB(255, 255, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
++        legend(s_w / 2, S(668), NULL, L"Back");
++        return;
++    }
++
++    if (s_sc.cursor < s_sc.top) s_sc.top = s_sc.cursor;
++    if (s_sc.cursor >= s_sc.top + fit) s_sc.top = s_sc.cursor - fit + 1;
++
++    const int base = l->has_new && !l->new_at_tail ? 1 : 0;
++    for (int row = s_sc.top; row < s_sc.rows && row < s_sc.top + fit; row++) {
++        const int y = top + S(8) + (row - s_sc.top) * rh, sel = row == s_sc.cursor;
++        const int is_new = l->has_new && (l->new_at_tail ? row == l->count : row == 0);
++        if (is_new) {
++            wchar_t nt[128];
++            widen(l->new_title ? l->new_title : "New Saved Data", nt, 128);
++            draw_row(y, rh - S(4), nt, L"Select to create a new entry", L"", L"", NULL, sel);
++        } else {
++            const SysuiListItem* it = &l->items[row - base];
++            wchar_t a[128], b[128], c[64], d[32];
++            widen(it->title, a, 128); widen(it->subtitle, b, 128);
++            widen(it->date, c, 64);   widen(it->size, d, 32);
++            draw_row(y, rh - S(4), a, b, c, d, s_sc.icons[row - base].px, sel);
++        }
++    }
++    legend(s_w / 2, S(668), L"Select", L"Back");
++}
++
++/* Alpha from brightness: GDI wrote none. */
++static void finish_alpha(void)
++{
++    const size_t n = (size_t)s_w * s_h;
++    for (size_t i = 0; i < n; i++) {
++        const uint32_t p = s_px[i];
++        uint32_t m = p & 0xFF;
++        if (((p >> 8) & 0xFF) > m) m = (p >> 8) & 0xFF;
++        if (((p >> 16) & 0xFF) > m) m = (p >> 16) & 0xFF;
++        if (m < BACK_ALPHA) m = BACK_ALPHA;
++        s_px[i] = (p & 0x00FFFFFFu) | (m << 24);
++    }
++}
++
++int sysui_draw(unsigned w, unsigned h, const void** pixels)
++{
++    const long gen = s_gen;
++    if (gen == s_drawn_gen && w == s_w && h == s_h) return 0;
++
++    if (!s_dc || w != s_w || h != s_h) {
++        if (s_bmp) DeleteObject(s_bmp);
++        if (!s_dc) s_dc = CreateCompatibleDC(NULL);
++        BITMAPINFO bi = {0};
++        bi.bmiHeader.biSize = sizeof bi.bmiHeader;
++        bi.bmiHeader.biWidth = (LONG)w;
++        bi.bmiHeader.biHeight = -(LONG)h;
++        bi.bmiHeader.biPlanes = 1;
++        bi.bmiHeader.biBitCount = 32;
++        bi.bmiHeader.biCompression = BI_RGB;
++        s_bmp = CreateDIBSection(s_dc, &bi, DIB_RGB_COLORS, (void**)&s_px, NULL, 0);
++        if (!s_bmp) { s_w = s_h = 0; return 0; }
++        SelectObject(s_dc, s_bmp);
++        SetBkMode(s_dc, TRANSPARENT);
++        s_w = w; s_h = h;
++    }
++
++    AcquireSRWLockExclusive(&s_lock);
++    s_drawn_gen = gen;
++    memset(s_px, 0, (size_t)w * h * 4);
++    if (s_sc.kind == KIND_MSG) draw_msg();
++    else if (s_sc.kind == KIND_LIST) draw_list();
++    ReleaseSRWLockExclusive(&s_lock);
++    GdiFlush();
++    finish_alpha();
++    *pixels = s_px;
++    return 1;
++}
++
++#else  /* !_WIN32: no screens; blocking calls answer as cancelled */
++#include "sysui.h"
++volatile long g_sysui_gate, g_sysui_visible;
++int  sysui_save_list(const SysuiList* l) { (void)l; return SYSUI_SEL_BACK; }
++int  sysui_msg(uint32_t t, const char* s) { (void)t; (void)s; return -1; }
++int  sysui_msg_open(uint32_t t, const char* s, sysui_done_fn d, void* c) { (void)t; (void)s; (void)d; (void)c; return 1; }
++int  sysui_msg_close(unsigned d, int r) { (void)d; (void)r; return 1; }
++void sysui_msg_abort(void) {}
++int  sysui_msg_is_open(void) { return 0; }
++int  sysui_msg_progress(unsigned i, int p, int r, const char* s) { (void)i; (void)p; (void)r; (void)s; return 1; }
++void sysui_quit(void) {}
++int  sysui_pad_gate(unsigned p, uint16_t m, uint8_t x, uint8_t y) { (void)p; (void)m; (void)x; (void)y; return 0; }
++int  sysui_draw(unsigned w, unsigned h, const void** px) { (void)w; (void)h; (void)px; return 0; }
++#endif
+diff --git a/libs/system/sysui.h b/libs/system/sysui.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc63836f9aa55ca43a18e7fcca64a44bba4f7a9d
+--- /dev/null
++++ b/libs/system/sysui.h
+@@ -0,0 +1,78 @@
++/*
++ * sysui - the screens the console's system draws for a title: the save data
++ * list and message dialogs. One screen at a time, drawn at present over the
++ * title's frame, holding the pad while it is open. docs/sysui.md in Re:Fine.
++ */
++#ifndef PS3RECOMP_SYSUI_H
++#define PS3RECOMP_SYSUI_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* sysui_save_list() results, as in the system's own list */
++#define SYSUI_SEL_NEW   (-1)   /* the "new data" row */
++#define SYSUI_SEL_BACK  (-2)   /* left with circle */
++
++#define SYSUI_MSG_MAX   512
++
++typedef struct SysuiListItem {
++    char title[128];
++    char subtitle[128];
++    char date[64];
++    char size[32];
++    char icon_path[1100];      /* ICON0.PNG of this save, "" for none */
++} SysuiListItem;
++
++typedef struct SysuiList {
++    const char*          header;     /* "Load Save" */
++    const SysuiListItem* items;
++    int                  count;
++    int                  focus;      /* index into the rows, new data row included */
++    int                  has_new;    /* show a "new data" row */
++    int                  new_at_tail;
++    const char*          new_title;  /* NULL for the default text */
++} SysuiList;
++
++/* Both block the calling thread until the user answers (is_blocking=1 in
++ * RPCS3's terms). sysui_save_list returns the index into items[] or a
++ * SYSUI_SEL_*; sysui_msg returns the CELL_MSGDIALOG_BUTTON_* pressed. Once the
++ * host has asked to quit they return at once: SEL_BACK and NONE. */
++int sysui_save_list(const SysuiList* list);
++int sysui_msg(uint32_t type, const char* utf8);
++
++/* Non-blocking dialog for cellMsgDialogOpen2. `done` runs on the thread that
++ * polls the pad, unless the dialog is aborted. Nonzero: another screen is up. */
++typedef void (*sysui_done_fn)(int button, void* ctx);
++int  sysui_msg_open(uint32_t type, const char* utf8, sysui_done_fn done, void* ctx);
++/* Close after delay_ms, reporting button `result`. Nonzero: nothing open. */
++int  sysui_msg_close(unsigned delay_ms, int result);
++void sysui_msg_abort(void);
++int  sysui_msg_is_open(void);
++/* index 0-1; percent < 0 keeps it, msg NULL keeps it. reset sets it to 0. */
++int  sysui_msg_progress(unsigned index, int percent_delta, int reset, const char* utf8);
++
++/* Host quit: answers whatever is open and refuses new blocking screens. */
++void sysui_quit(void);
++
++/* --- pad, from cellPadGetData ---
++ * g_sysui_gate is nonzero while a screen is open or a button that answered it
++ * is still down. Only then is sysui_pad_gate worth calling. */
++extern volatile long g_sysui_gate;
++/* mask = (DIGITAL2 << 8) | DIGITAL1. Nonzero: the title must see an idle pad. */
++int sysui_pad_gate(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly);
++
++/* --- present, from the render thread ---
++ * g_sysui_visible is nonzero while a screen is open: a plain read, so a frame
++ * with nothing open costs one load. sysui_draw redraws only when something
++ * changed and returns 1 then, with *pixels = BGRA, w * h, rows w * 4. */
++extern volatile long g_sysui_visible;
++int sysui_draw(unsigned w, unsigned h, const void** pixels);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/libs/system/tests/test_sysui.c b/libs/system/tests/test_sysui.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..c5715d0c16f2566f0d2a2d7bb3d897fcfddbeaf4
+--- /dev/null
++++ b/libs/system/tests/test_sysui.c
+@@ -0,0 +1,144 @@
++/*
++ * test_sysui: the model of the system screens, without a window.
++ *
++ * clang-cl -I.. -I../../.. -I../../../include test_sysui.c ../sysui.c /Fe:test_sysui.exe
++ */
++#include "../sysui.h"
++#include "../cellMsgDialog.h"
++#include <windows.h>
++#include <stdio.h>
++#include <string.h>
++
++static int s_failed;
++#define CHECK(c) do { if (!(c)) { printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); s_failed++; } } while (0)
++
++#define CROSS  0x4000
++#define CIRCLE 0x2000
++#define DOWN   0x0040
++#define UP     0x0010
++
++static void wait_visible(int v) { while ((g_sysui_visible != 0) != v) Sleep(1); }
++static void press(uint16_t m)
++{
++    sysui_pad_gate(0, m, 128, 128);
++    sysui_pad_gate(0, 0, 128, 128);
++}
++
++static SysuiListItem s_items[3];
++static SysuiList s_list;
++static volatile LONG s_out;
++static DWORD WINAPI list_thread(LPVOID p) { (void)p; s_out = sysui_save_list(&s_list); return 0; }
++static DWORD WINAPI msg_thread(LPVOID p) { s_out = sysui_msg((uint32_t)(uintptr_t)p, "Load this data?\n\nA"); return 0; }
++
++static int s_done_button, s_done_calls;
++static void on_done(int b, void* c) { (void)c; s_done_button = b; s_done_calls++; }
++
++static int run_list(int count, int has_new, int tail, const uint16_t* keys, int n)
++{
++    memset(&s_list, 0, sizeof s_list);
++    s_list.header = "Load Save"; s_list.items = s_items; s_list.count = count;
++    s_list.has_new = has_new; s_list.new_at_tail = tail;
++    HANDLE t = CreateThread(NULL, 0, list_thread, NULL, 0, NULL);
++    wait_visible(1);
++    for (int i = 0; i < n; i++) press(keys[i]);
++    WaitForSingleObject(t, 5000);
++    CloseHandle(t);
++    wait_visible(0);
++    return s_out;
++}
++
++int main(void)
++{
++    { /* empty list: cross does nothing, circle goes back */
++      uint16_t k[] = { CROSS, CIRCLE };
++      CHECK(run_list(0, 0, 0, k, 2) == SYSUI_SEL_BACK); }
++    { uint16_t k[] = { CROSS };
++      CHECK(run_list(1, 0, 0, k, 1) == 0); }
++    { /* down stops at the end, up comes back */
++      uint16_t k[] = { DOWN, DOWN, DOWN, CROSS };
++      CHECK(run_list(3, 0, 0, k, 4) == 2); }
++    { uint16_t k[] = { CROSS };
++      CHECK(run_list(0, 1, 0, k, 1) == SYSUI_SEL_NEW); }
++    { uint16_t k[] = { DOWN, CROSS };
++      CHECK(run_list(1, 1, 0, k, 2) == 0); }
++    { uint16_t k[] = { DOWN, CROSS };
++      CHECK(run_list(1, 1, 1, k, 2) == SYSUI_SEL_NEW); }
++
++    /* the pad stays closed while the answering press is held */
++    { HANDLE t = CreateThread(NULL, 0, msg_thread, (LPVOID)(uintptr_t)0x11, 0, NULL);
++      wait_visible(1);
++      CHECK(sysui_pad_gate(0, 0, 128, 128) == 1);
++      CHECK(sysui_pad_gate(0, CROSS, 128, 128) == 1);
++      WaitForSingleObject(t, 5000); CloseHandle(t);
++      wait_visible(0);
++      CHECK(s_out == CELL_MSGDIALOG_BUTTON_YES);
++      CHECK(g_sysui_gate != 0);
++      CHECK(sysui_pad_gate(0, CROSS, 128, 128) == 1);
++      CHECK(sysui_pad_gate(0, 0, 128, 128) == 0);
++      CHECK(g_sysui_gate == 0); }
++
++    /* a button already down at open is no press */
++    { sysui_msg_open(0x21, "x", on_done, NULL);
++      sysui_pad_gate(0, 0, 128, 128);
++      s_done_calls = 0;
++      CHECK(sysui_pad_gate(0, CROSS, 128, 128) == 1);
++      CHECK(s_done_calls == 1 && s_done_button == CELL_MSGDIALOG_BUTTON_OK);
++      sysui_msg_open(0x21, "y", on_done, NULL);          /* same press still down */
++      CHECK(sysui_pad_gate(0, CROSS, 128, 128) == 1);
++      CHECK(s_done_calls == 1);
++      sysui_pad_gate(0, 0, 128, 128);
++      press(CROSS);
++      CHECK(s_done_calls == 2);
++      wait_visible(0);
++      sysui_pad_gate(0, 0, 128, 128); }
++
++    /* no buttons: only the title closes it, and Close reports NONE */
++    { s_done_calls = 0;
++      sysui_msg_open(0x01, "wait", on_done, NULL);
++      press(CROSS); press(CIRCLE);
++      CHECK(s_done_calls == 0 && sysui_msg_is_open());
++      CHECK(sysui_msg_open(0x21, "other", on_done, NULL) != 0);
++      CHECK(sysui_msg_progress(0, 30, 0, "half") == 0);
++      CHECK(sysui_msg_close(0, CELL_MSGDIALOG_BUTTON_NONE) == 0);
++      CHECK(s_done_calls == 1 && s_done_button == CELL_MSGDIALOG_BUTTON_NONE);
++      CHECK(sysui_msg_close(0, CELL_MSGDIALOG_BUTTON_NONE) != 0);
++      sysui_pad_gate(0, 0, 128, 128); }
++
++    /* DISABLE_CANCEL leaves circle dead on an OK dialog; delayed close and abort */
++    { s_done_calls = 0;
++      sysui_msg_open(0xA1 | 0x20, "x", on_done, NULL);
++      press(CIRCLE);
++      CHECK(s_done_calls == 0);
++      sysui_msg_close(20, CELL_MSGDIALOG_BUTTON_NONE);
++      CHECK(s_done_calls == 0);
++      Sleep(40);
++      sysui_pad_gate(0, 0, 128, 128);
++      CHECK(s_done_calls == 1);
++      sysui_pad_gate(0, 0, 128, 128);
++      s_done_calls = 0;
++      sysui_msg_open(0x01, "x", on_done, NULL);
++      sysui_msg_abort();
++      CHECK(s_done_calls == 0 && !sysui_msg_is_open()); }
++
++    /* quit answers what is open and refuses what comes */
++    { s_list.count = 0; s_list.has_new = 0;
++      HANDLE t = CreateThread(NULL, 0, list_thread, NULL, 0, NULL);
++      wait_visible(1);
++      sysui_quit();
++      WaitForSingleObject(t, 5000); CloseHandle(t);
++      CHECK(s_out == SYSUI_SEL_BACK);
++      CHECK(sysui_save_list(&s_list) == SYSUI_SEL_BACK);
++      CHECK(sysui_msg(0x11, "x") == CELL_MSGDIALOG_BUTTON_NONE); }
++
++    /* drawing is only redone on a change */
++    { sysui_msg_open(0x21, "draw", on_done, NULL);
++      const void* px = NULL;
++      CHECK(sysui_draw(1280, 720, &px) == 1 && px);
++      CHECK(((const uint32_t*)px)[0] >> 24 != 0);
++      CHECK(sysui_draw(1280, 720, &px) == 0);
++      sysui_msg_progress(0, 10, 0, NULL);
++      CHECK(sysui_draw(1280, 720, &px) == 1); }
++
++    printf("[sysui] %s (%d failed)\n", s_failed ? "FAIL" : "PASS", s_failed);
++    return s_failed != 0;
++}
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index a171197f30e7ee33adac8edb56bd795c94280ef6..0e210ae4bae53a3d65568277dd379ff214835125 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -164,6 +164,8 @@ static HRESULT sc_compile(const void* src, SIZE_T len, const char* name, const v
+  * Constants
+  * -----------------------------------------------------------------------*/
+ 
++#include "../system/sysui.h"
++
+ #define FRAME_COUNT         2   /* double buffering */
+ #define MAX_VERTICES    393216  /* per-frame vertex buffer (dbgfont submits
+                                  * ~7.5k verts/frame; leave generous headroom) */
+@@ -4939,6 +4941,170 @@ static void composite_present(u32 fi)
+ }
+ 
+ 
++/* System screens (libs/system/sysui.c), over the finished frame. Everything is
++ * made the first time one opens; with none open this costs a load in the caller.
++ * Two upload buffers, by frame parity: the fence of this back buffer has passed,
++ * so the GPU is done with that one. */
++static struct {
++    ID3D12RootSignature*  rs;
++    ID3D12PipelineState*  pso;
++    ID3D12DescriptorHeap* heap;
++    ID3D12Resource*       tex;
++    ID3D12Resource*       up[FRAME_COUNT];
++    u8*                   up_map[FRAME_COUNT];
++    u32                   pitch;
++    u32                   ready;
++    int                   failed;
++} s_ui;
++
++static int sysui_d3d_init(void)
++{
++    if (s_ui.ready) return 1;
++    if (s_ui.failed) return 0;
++    s_ui.failed = 1;
++    static const char vs[] =
++        "float4 main(uint id : SV_VertexID) : SV_Position {\n"
++        "    float2 p = float2((id << 1) & 2, id & 2);\n"
++        "    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);\n"
++        "}\n";
++    static const char ps[] =
++        "Texture2D<float4> ui : register(t0);\n"
++        "float4 main(float4 pos : SV_Position) : SV_Target {\n"
++        "    return ui.Load(int3(pos.xy, 0));\n"
++        "}\n";
++    ID3DBlob *vb = NULL, *pb = NULL, *err = NULL, *sig = NULL;
++    if (FAILED(sc_compile(vs, sizeof vs - 1, "sysui_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
++        FAILED(sc_compile(ps, sizeof ps - 1, "sysui_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
++        printf("[D3D12] sysui shader: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
++        return 0;
++    }
++    D3D12_DESCRIPTOR_RANGE rg = {0};
++    rg.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    rg.NumDescriptors = 1;
++    D3D12_ROOT_PARAMETER rp = {0};
++    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    rp.DescriptorTable.NumDescriptorRanges = 1;
++    rp.DescriptorTable.pDescriptorRanges = &rg;
++    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_ROOT_SIGNATURE_DESC rd = {0};
++    rd.NumParameters = 1; rd.pParameters = &rp;
++    ID3D12Device* dev = s_d3d.device;
++    if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
++        FAILED(dev->lpVtbl->CreateRootSignature(dev, 0, sig->lpVtbl->GetBufferPointer(sig),
++               sig->lpVtbl->GetBufferSize(sig), &IID_ID3D12RootSignature, (void**)&s_ui.rs)))
++        return 0;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {0};
++    pd.pRootSignature = s_ui.rs;
++    pd.VS.pShaderBytecode = vb->lpVtbl->GetBufferPointer(vb);
++    pd.VS.BytecodeLength  = vb->lpVtbl->GetBufferSize(vb);
++    pd.PS.pShaderBytecode = pb->lpVtbl->GetBufferPointer(pb);
++    pd.PS.BytecodeLength  = pb->lpVtbl->GetBufferSize(pb);
++    pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
++    pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
++    D3D12_RENDER_TARGET_BLEND_DESC* bl = &pd.BlendState.RenderTarget[0];
++    bl->BlendEnable = TRUE;
++    bl->SrcBlend = D3D12_BLEND_SRC_ALPHA;   bl->DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
++    bl->BlendOp = D3D12_BLEND_OP_ADD;
++    bl->SrcBlendAlpha = D3D12_BLEND_ONE;    bl->DestBlendAlpha = D3D12_BLEND_ZERO;
++    bl->BlendOpAlpha = D3D12_BLEND_OP_ADD;
++    bl->RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    pd.SampleMask = UINT_MAX;
++    pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    pd.NumRenderTargets = 1;
++    pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
++    pd.SampleDesc.Count = 1;
++    if (FAILED(dev->lpVtbl->CreateGraphicsPipelineState(dev, &pd, &IID_ID3D12PipelineState, (void**)&s_ui.pso)))
++        return 0;
++
++    D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
++    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    hd.NumDescriptors = 1;
++    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++    if (FAILED(dev->lpVtbl->CreateDescriptorHeap(dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&s_ui.heap)))
++        return 0;
++
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC td = {0};
++    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    td.Width = s_d3d.width; td.Height = s_d3d.height;
++    td.DepthOrArraySize = 1; td.MipLevels = 1;
++    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++    td.SampleDesc.Count = 1;
++    if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &td,
++            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, NULL, &IID_ID3D12Resource, (void**)&s_ui.tex)))
++        return 0;
++    D3D12_CPU_DESCRIPTOR_HANDLE sh;
++    s_ui.heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_ui.heap, &sh);
++    dev->lpVtbl->CreateShaderResourceView(dev, s_ui.tex, NULL, sh);
++
++    s_ui.pitch = (s_d3d.width * 4u + 255u) & ~255u;
++    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
++    D3D12_RESOURCE_DESC bd = {0};
++    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++    bd.Width = (u64)s_ui.pitch * s_d3d.height; bd.Height = 1;
++    bd.DepthOrArraySize = 1; bd.MipLevels = 1;
++    bd.SampleDesc.Count = 1; bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    D3D12_RANGE nr = {0, 0};
++    for (u32 i = 0; i < FRAME_COUNT; i++) {
++        if (FAILED(dev->lpVtbl->CreateCommittedResource(dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
++                D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&s_ui.up[i])) ||
++            FAILED(s_ui.up[i]->lpVtbl->Map(s_ui.up[i], 0, &nr, (void**)&s_ui.up_map[i])))
++            return 0;
++    }
++    s_ui.failed = 0;
++    s_ui.ready = 1;
++    return 1;
++}
++
++static void sysui_present(u32 fi)
++{
++    if (!sysui_d3d_init()) return;
++    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
++    const void* px = NULL;
++    if (sysui_draw(s_d3d.width, s_d3d.height, &px)) {
++        const u8* src = (const u8*)px;
++        u8* dst = s_ui.up_map[fi];
++        for (u32 y = 0; y < s_d3d.height; y++)
++            memcpy(dst + (u64)y * s_ui.pitch, src + (u64)y * s_d3d.width * 4, s_d3d.width * 4);
++        D3D12_RESOURCE_BARRIER b = {0};
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b.Transition.pResource = s_ui.tex;
++        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
++        cl->lpVtbl->ResourceBarrier(cl, 1, &b);
++        D3D12_TEXTURE_COPY_LOCATION dl = {0}, sl = {0};
++        dl.pResource = s_ui.tex; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        sl.pResource = s_ui.up[fi]; sl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++        sl.PlacedFootprint.Footprint.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++        sl.PlacedFootprint.Footprint.Width = s_d3d.width;
++        sl.PlacedFootprint.Footprint.Height = s_d3d.height;
++        sl.PlacedFootprint.Footprint.Depth = 1;
++        sl.PlacedFootprint.Footprint.RowPitch = s_ui.pitch;
++        cl->lpVtbl->CopyTextureRegion(cl, &dl, 0, 0, 0, &sl, NULL);
++        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++        cl->lpVtbl->ResourceBarrier(cl, 1, &b);
++    }
++    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
++    s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv);
++    rtv.ptr += fi * s_d3d.rtv_descriptor_size;
++    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
++    D3D12_VIEWPORT vp = {0, 0, (float)s_d3d.width, (float)s_d3d.height, 0.0f, 1.0f};
++    D3D12_RECT sc = {0, 0, (LONG)s_d3d.width, (LONG)s_d3d.height};
++    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
++    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
++    cl->lpVtbl->SetGraphicsRootSignature(cl, s_ui.rs);
++    cl->lpVtbl->SetPipelineState(cl, s_ui.pso);
++    ID3D12DescriptorHeap* hp[] = { s_ui.heap };
++    cl->lpVtbl->SetDescriptorHeaps(cl, 1, hp);
++    D3D12_GPU_DESCRIPTOR_HANDLE gh;
++    s_ui.heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_ui.heap, &gh);
++    cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, gh);
++    cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
++}
++
+ static void guest_fb_present(u32 fi)
+ {
+     static int inited = 0;
+@@ -6298,6 +6464,8 @@ skip_dump_consider: ;
+         /* End-of-frame fallback snapshot: used when the frame never contained a
+          * reduced-viewport pass to capture mid-frame. */
+         screen_copy_capture(fi);
++        /* After the copy: what the title reads back of its screen has no system UI on it. */
++        if (g_sysui_visible && s_present_this_frame) sysui_present(fi);
+         /* Transition render target to PRESENT state */
+         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;

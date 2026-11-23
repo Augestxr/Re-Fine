@@ -1,0 +1,46 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 82ea66c6fae95e29f454f9600096ed0f0cf15f01..2e9e33b62f30e8c132b47f7b3971e8df8b28c228 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -591,6 +591,28 @@ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
+     return spurs_initialize_common(spurs_ea, attr->nSpus, (const char*)attr->prefix);
+ }
+ 
++/* CellSpurs2 (NID 0x30AA96C4). RPCS3 runs this as cellSpursInitializeWithAttribute
++ * plus SAF_SECOND_VERSION: the instance is CELL_SPURS_SIZE2 (8 KB, align 128) and
++ * carries a second set of 16 workloads. Here the whole 8 KB is cleared, so the guest
++ * never reads stale bytes from the second half, and the instance is brought up
++ * exactly like the first version. Only the first CELL_SPURS_MAX_WORKLOAD workloads
++ * are schedulable: a wid in the second set is still refused with
++ * CELL_SPURS_CORE_ERROR_INVAL by the existing checks, not accepted silently. */
++s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
++                                      const CellSpursAttribute* attr)
++{
++    if (!spurs || !attr)
++        return CELL_SPURS_CORE_ERROR_NULL_POINTER;
++    u32 spurs_ea = (u32)(uintptr_t)spurs;
++    if (spurs_ea & 0x7F)
++        return CELL_SPURS_CORE_ERROR_ALIGN;
++    memset(vm_base + spurs_ea + SPURS_INST_SIZE, 0, SPURS_INST_SIZE);
++    s32 rc = cellSpursInitializeWithAttribute(spurs, attr);
++    printf("[cellSpurs] InitializeWithAttribute2 ea=0x%08X -> 0x%08X (CellSpurs2: 8 KB "
++           "cleared, workloads 16-31 not schedulable)\n", spurs_ea, (u32)rc);
++    return rc;
++}
++
+ static void spurs_cancel_attached_queues(u32 spurs_ea);  /* defined with the queue table */
+ 
+ s32 cellSpursFinalize(CellSpurs* spurs)
+diff --git a/libs/spurs/cellSpurs.h b/libs/spurs/cellSpurs.h
+index 07a3d2e417416a849f78d1b504150d34c77c2f10..3c276b8132d1565127c01c645270f2de6e03117b 100644
+--- a/libs/spurs/cellSpurs.h
++++ b/libs/spurs/cellSpurs.h
+@@ -201,6 +201,8 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
+                         s32 ppuPriority, u8 exitIfNoWork);
+ s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr);
++s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
++                                      const CellSpursAttribute* attr);
+ s32 cellSpursFinalize(CellSpurs* spurs);
+ 
+ s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,

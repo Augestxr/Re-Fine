@@ -1,0 +1,35 @@
+Re:Fine 0108: el signo de viewport_scale.y llega al vertex shader de D3D12.
+
+El epilogo de rsx_d3d12_backend.c dejaba x/y en identidad (vpx[1] = 1) y solo aplicaba el
+rectangulo con RSSetViewports. RPCS3 si aplica la escala (draw_command_processor::
+fill_scale_offset_data, rpcs3/Emu/RSX/Core/RSXDrawCommands.cpp:563-586, master 1f59f0f2, con
+flip_y=false en Vulkan, cuyo NDC tiene y hacia abajo). En D3D, con y hacia arriba, escala
+positiva = imagen invertida: F salia boca abajo. La orientacion de caras no cambia: RPCS3
+asigna cw/ccw directo (VKGSRender.cpp:197-203), igual que este backend.
+VP_ORIENT_DBG=1 imprime los primeros valores. Evidencia en docs/STATUS.md (4f.1).
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index bc05a308d55c3cdf53c1edef309bfbd7b0e8aaa8..7970abcc4f3ea861102617276538bacb52599992 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -3616,6 +3616,20 @@ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+                if (lock && s_lock_valid) { ux = s_lock_x; uy = s_lock_y; }
+                vpx[0] = k; vpx[1] = k; vpx[4] = -ux * k; vpx[5] = -uy * k; } }
+ 
++    /* Re:Fine patches/0108: the sign of the guest's viewport Y. The RSX maps clip y
++     * to window y (counted down from the top of the surface) with
++     * viewport_scale[1]: negative is what D3D does by itself, positive is upside
++     * down from D3D's point of view. Project DIVA F programs it positive, so every
++     * pass came out mirrored. RPCS3 applies the scale in clip space
++     * (fill_scale_offset_data, RSXDrawCommands.cpp); the rectangle part of that
++     * transform is already the D3D viewport here, so only the sign is left. */
++    if (vs_[1] > 0.0f) { vpx[1] = -vpx[1]; vpx[5] = -vpx[5]; }
++    { static int dbg = -1; if (dbg < 0) dbg = getenv("VP_ORIENT_DBG") ? 1 : 0;
++      static int n = 0;
++      if (dbg && PS3_LOG_FIRST(n, 8))
++          fprintf(stderr, "[VPORIENT] scale=(%g,%g) offset=(%g,%g) clip=%ux%u posscale.y=%g%c",
++                  vs_[0], vs_[1], vo_[0], vo_[1], st->surface_clip_w, st->surface_clip_h, vpx[1], 10); }
++
+     /* Garbage-projection fallback (vkcube; see the original comment). */
+     int uses_c03 = (vs_idx >= 0 && vs_idx < s_d3d.vp_vs_n)
+                        ? s_d3d.vp_vs[vs_idx].uses_c03 : s_d3d.vp_uses_c03;

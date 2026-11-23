@@ -1,0 +1,8 @@
+﻿Re:Fine usa FFmpeg como bibliotecas dinámicas (avcodec, avutil, swresample, swscale) bajo
+la LGPL versión 3 o posterior. El texto está en FFmpeg-LGPL-3.0.txt. Puedes sustituir
+esas DLL por otra compilación compatible.
+
+Versión: FFmpeg n9.0.2-39-g7adfbe40dc
+Código fuente: https://git.ffmpeg.org/ffmpeg.git, commit 7adfbe40dc
+Compilación: https://github.com/BtbN/FFmpeg-Builds, etiqueta autobuild-2026-10-31-12-59,
+archivo ffmpeg-n9.0.2-39-g7adfbe40dc-win64-lgpl-shared-9.0.zip

@@ -1,0 +1,43 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -870,10 +870,13 @@ static void pad_sdl3_stick(PadStick* st, int x, int y, u8* ox, u8* oy)
+     const float r = SDL_sqrtf((float)x * x + (float)y * y) / 32767.0f;
+     const Uint64 now = SDL_GetTicks();
+     if (st->out && (r < s_stick_dz || (long long)x * st->x + (long long)y * st->y < 0)) {
++        if (s_star_log >= 2)   /* Re:Fine 0169 */
++            fprintf(stderr, "[pad] stick in: (%+.2f, %+.2f) r=%.2f at %llu ms (%s)\n", x / 32767.0f, y / 32767.0f, r,
++                    (unsigned long long)now, r < s_stick_dz ? "under the dead zone" : "turned back");
+         st->out = 0; st->wait = s_stick_rearm_ms != 0; st->since = 0;
+     } else if (!st->out && !st->wait && r >= s_stick_dz + s_stick_hy) {
+         st->out = 1; st->x = x; st->y = y;
+-        if (s_star_log < 0) { const char* e = getenv("REFINE_PAD_STAR_LOG"); s_star_log = e && atoi(e); }
++        if (s_star_log < 0) { const char* e = getenv("REFINE_PAD_STAR_LOG"); s_star_log = e ? atoi(e) : 0; }
+         if (s_star_log) {
+             static Uint64 last;
+             fprintf(stderr, "[pad] star: stick (%+.2f, %+.2f) r=%.2f at %llu ms, %llu ms after the last%c",
+@@ -1705,6 +1708,24 @@ skip_inject: ;
+                 data->button[_i] = 0;
+         }
+     }
++    /* Re:Fine 0169: REFINE_PAD_STAR_LOG=2 also prints what the GAME is handed on port 0, each time the sticks
++     * it gets change: the four values, the time, and how many reads of the game since the last change.
++     * Two flicks counted for one would show as the game seeing the stick leave the centre twice. */
++    if (port_no == 0) {
++        if (s_star_log < 0) { const char* e = getenv("REFINE_PAD_STAR_LOG"); s_star_log = e ? atoi(e) : 0; }
++        if (s_star_log >= 2) {
++            static unsigned reads; static u8 last[4] = {128, 128, 128, 128}; static unsigned long long t_last;
++            const u8 c[4] = { (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X], (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y],
++                              (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X], (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y] };
++            reads++;
++            if (memcmp(c, last, 4)) {
++                const unsigned long long now = GetTickCount64();
++                fprintf(stderr, "[pad] game sees: L(%d,%d) R(%d,%d) at %llu ms, %u reads and %llu ms after the last change\n",
++                        c[0] - 128, c[1] - 128, c[2] - 128, c[3] - 128, now, reads, t_last ? now - t_last : 0);
++                memcpy(last, c, 4); reads = 0; t_last = now;
++            }
++        }
++    }
+     }  /* end connected block */
+ 
+ emit:

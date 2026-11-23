@@ -1,0 +1,136 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -709,9 +709,14 @@ void cellGcmSetWaitFlip(void)
+  * a boot and got a faked CELL_OK (no wait at all) before this was registered. */
+ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
+ 
++/* Re:Fine 0150, diagnostic only: FRAME_PROF (src/main.cpp). 0 = the guest left its
++ * flip wait, 1 = it read the vblank count. NULL unless asked for. */
++void (*g_frame_prof_guest)(int) = NULL;
++
+ /* NID: 0x51C9D62B */
+ void cellGcmResetFlipStatus(void)
+ {
++    if (g_frame_prof_guest) g_frame_prof_guest(0);
+     { static int n = 0;
+       static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
+       if (fd && PS3_LOG_FIRST(n, 12))
+@@ -4142,6 +4147,7 @@ s32 cellGcmUnreserveIoMapSize(u32 size)
+  * ~55 times a second instead of 30. */
+ u32 cellGcmGetVBlankCount(void)
+ {
++    if (g_frame_prof_guest) g_frame_prof_guest(1);
+     return *(volatile u32*)&s_vblank_count;
+ }
+ 
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -5172,9 +5172,51 @@ static void guest_fb_present(u32 fi)
+ }
+ 
+ 
++/* Re:Fine 0150, diagnostic only: FRAME_PROF. Running totals in seconds of the phases of
++ * render_frame, read by src/main.cpp on this same thread. gpu is the time between
++ * two timestamps at the ends of the command list. */
++struct { double wait, cmd, exec, present, next, gpu; unsigned long long draws, renders; } g_frame_prof;
++int g_frame_prof_on;
++static ID3D12QueryHeap* s_fp_heap;
++static ID3D12Resource* s_fp_rb;
++static double s_fp_tick;
++static int s_fp_last = -1;
++
++static void fp_init(void)
++{
++    if (s_fp_heap) return;
++    D3D12_QUERY_HEAP_DESC qd = {0};
++    qd.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP; qd.Count = 2 * FRAME_COUNT;
++    s_d3d.device->lpVtbl->CreateQueryHeap(s_d3d.device, &qd, &IID_ID3D12QueryHeap, (void**)&s_fp_heap);
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_READBACK;
++    D3D12_RESOURCE_DESC rd = {0};
++    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = 16 * FRAME_COUNT;
++    rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
++    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &rd,
++        D3D12_RESOURCE_STATE_COPY_DEST, NULL, &IID_ID3D12Resource, (void**)&s_fp_rb);
++    UINT64 hz = 1;
++    s_d3d.cmd_queue->lpVtbl->GetTimestampFrequency(s_d3d.cmd_queue, &hz);
++    s_fp_tick = 1.0 / (double)hz;
++}
++
++static void fp_read_gpu(void)
++{
++    if (s_fp_last < 0) return;
++    D3D12_RANGE r = {(SIZE_T)s_fp_last * 16, (SIZE_T)s_fp_last * 16 + 16};
++    UINT64* p = NULL;
++    if (SUCCEEDED(s_fp_rb->lpVtbl->Map(s_fp_rb, 0, &r, (void**)&p)) && p) {
++        g_frame_prof.gpu += (double)(p[s_fp_last * 2 + 1] - p[s_fp_last * 2]) * s_fp_tick;
++        D3D12_RANGE none = {0, 0};
++        s_fp_rb->lpVtbl->Unmap(s_fp_rb, 0, &none);
++    }
++    s_fp_last = -1;
++}
++
+ static void render_frame(void)
+ {
+     double _rf0 = perf_on() ? perf_now() : 0.0;
++    const double _fp0 = g_frame_prof_on ? perf_now() : 0.0;
+     u32 fi = s_d3d.frame_index;
+ 
+     /* Drain the GPU before touching shared upload resources (vp_vb vertices,
+@@ -5184,6 +5226,8 @@ static void render_frame(void)
+      * polygons). These workloads are a few draws/frame, so full serialisation
+      * costs little. */
+     wait_for_gpu();
++    const double _fp1 = g_frame_prof_on ? perf_now() : 0.0;
++    if (g_frame_prof_on) { fp_init(); fp_read_gpu(); g_frame_prof.draws += s_d3d.draw_count; }
+     rdoc_frame_begin(s_d3d.draw_count);
+ 
+     /* Compile the real vertex program once its microcode is captured, and keep
+@@ -5222,6 +5266,8 @@ static void render_frame(void)
+     s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
+     s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
+     s_d3d.tex_ring_used[fi] = 0;   /* this frame index's copies are done */
++    if (g_frame_prof_on)
++        s_d3d.cmd_list->lpVtbl->EndQuery(s_d3d.cmd_list, s_fp_heap, D3D12_QUERY_TYPE_TIMESTAMP, fi * 2);
+ 
+     /* Upload the bound font atlas into an R8_UNORM texture and create its SRV.
+      * The atlas is a linear 8-bit coverage map, so a straight row copy (no
+@@ -6468,10 +6514,19 @@ skip_dump_consider: ;
+         s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 1, &barrier);
+     }
+ 
++    if (g_frame_prof_on) {
++        s_d3d.cmd_list->lpVtbl->EndQuery(s_d3d.cmd_list, s_fp_heap, D3D12_QUERY_TYPE_TIMESTAMP, fi * 2 + 1);
++        s_d3d.cmd_list->lpVtbl->ResolveQueryData(s_d3d.cmd_list, s_fp_heap, D3D12_QUERY_TYPE_TIMESTAMP,
++                                                 fi * 2, 2, s_fp_rb, (UINT64)fi * 16);
++        s_fp_last = (int)fi;
++    }
++    const double _fp2 = g_frame_prof_on ? perf_now() : 0.0;
++
+     /* Close and execute */
+     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
+     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
++    const double _fp3 = g_frame_prof_on ? perf_now() : 0.0;
+ 
+     /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
+      * frame. The legacy (is_vp=0) DrawInstanced path silently produced ZERO
+@@ -6633,9 +6688,16 @@ skip_dump_consider: ;
+                                               s_d3d.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+     }
+     rdoc_frame_end();
++    const double _fp4 = g_frame_prof_on ? perf_now() : 0.0;
+ 
+     move_to_next_frame();
+ 
++    if (g_frame_prof_on) {
++        const double _fp5 = perf_now();
++        g_frame_prof.wait += _fp1 - _fp0; g_frame_prof.cmd += _fp2 - _fp1;
++        g_frame_prof.exec += _fp3 - _fp2; g_frame_prof.present += _fp4 - _fp3;
++        g_frame_prof.next += _fp5 - _fp4; g_frame_prof.renders++;
++    }
+     s_d3d.frame_count++;
+ 
+     /* RPCS3-style titlebar stats, refreshed once a second: presented FPS,

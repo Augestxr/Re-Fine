@@ -1,0 +1,222 @@
+Re:Fine 0116: los fallos de pipeline en tabla propia, y tiempos de primera compilacion.
+
+Un fallo guardado en la cache FIFO de 256 con vp_gen en la clave podia olvidarse y recompilarse.
+rsx_fp_fail_table.h no desaloja ni lleva generacion; test en libs/video/tests/test_fp_fail_table.c.
+PSO_TIME=1 imprime cada primera compilacion de pipeline y de vertex shader por etapa ([PSOT], [VST]).
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index bcefcd8..0d81cda 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -1973,6 +1973,7 @@ static void compile_vp(void)
+  * hardcoded pixel shaders for draws whose FP we can translate -- e.g.
+  * gcm/cube's plasma FP `c = tex2D(t0, uv).x; out = (c, 0, c, 1)`. */
+ #include "rsx_fp_decompiler.h"
++#include "rsx_fp_fail_table.h"
+ 
+ /* Hash + compile the CURRENT rsx_state vertex program into the VS cache;
+  * returns the cache slot (or -1). Called at draw-record time so each draw
+@@ -1984,6 +1985,25 @@ static u32 vp_hash_ucode(const u8* p, u32 n)
+     return h ? h : 1u;
+ }
+ 
++/* Re:Fine 0116: PSO_TIME=1 prints every first compile (t = seconds since boot, ms
++ * by stage, running totals). Only a cache miss comes here. */
++typedef struct { u32 n; double sum, max; u32 over_33ms; } CompileTime;
++static CompileTime s_pso_time, s_vs_time;
++static void compile_time(const char* tag, CompileTime* t, u32 id, u32 uhash, int ok,
++                         double fe, double dx, double obj)
++{
++    static int en = -1; static double t0;
++    if (en < 0) { en = getenv("PSO_TIME") ? 1 : 0; t0 = perf_now(); }
++    const double ms = (fe + dx + obj) * 1000.0;
++    t->n++; t->sum += ms; if (ms > t->max) t->max = ms; if (ms > 33.3) t->over_33ms++;
++    if (en) {
++        fprintf(stderr, "[%s] t=%.2f ms=%.2f hlsl=%.2f dxc=%.2f pso=%.2f id=0x%08X ucode=0x%08X ok=%d n=%u sum=%.1f max=%.1f over33=%u%c",
++                tag, perf_now() - t0, ms, fe * 1000.0, dx * 1000.0, obj * 1000.0, id, uhash, ok,
++                t->n, t->sum, t->max, t->over_33ms, 10);
++        fflush(stderr);
++    }
++}
++
+ static int vp_get_vs(const rsx_state* st)
+ {
+     extern int rsx_vp_decompile(const uint8_t*, u32, char*, u32);
+@@ -2067,8 +2087,10 @@ static int vp_get_vs(const rsx_state* st)
+         }
+     }
+     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
++    const double t_vs = perf_now();
+     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
+                             "main", "vs_5_0", 0, 0, &vb, &e);
++    compile_time("VST", &s_vs_time, 0, hash, SUCCEEDED(hr), 0.0, perf_now() - t_vs, 0.0);
+     if (e) e->lpVtbl->Release(e);
+     if (FAILED(hr) || !vb) {
+         static int _e=0; if (PS3_LOG_FIRST(_e, 4)) printf("[VP] per-draw VS compile FAIL (hash=0x%08X)\n", hash);
+@@ -2390,6 +2412,9 @@ static u32 dr_cube_mask(const D3D12DrawRecord* dr)
+     return m;
+ }
+ 
++/* Re:Fine 0116: failed pipelines, apart from the PSO cache (rsx_fp_fail_table.h). */
++static rsx_fp_fail_table s_fp_fail;
++
+ /* Re:Fine 0114: a program that cannot become a pipeline is reported once, by its
+  * microcode hash, with the stage and the HRESULT. Its failure stays in the
+  * cache below, so nothing here runs per draw. */
+@@ -2471,10 +2496,16 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+             s_d3d.vp_fp[i].cull == cull &&
+             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].zs == zs)
+             return s_d3d.vp_fp[i].pso;
++    /* Re:Fine 0114, 0116: a failure is remembered, in its own table. The caller
++     * then draws with its fallback pipeline; without this every draw repeated
++     * the decompile and D3DCompile only to fail again (PV600: 38 per frame,
++     * ~1 frame/s). */
++    const rsx_fp_fail_key fail_key = { uhash, vs_hash, blend, (u32)nrt, (u32)rtfmt, ctrl,
++                                       cmask, cull, cube_mask, 0, zs };
++    if (rsx_fp_fail_find(&s_fp_fail, &fail_key)) { s_fp_fail.hits++; return NULL; }
+     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
+-    /* Re:Fine 0114: a failure is cached too, with pso NULL. The caller then draws
+-     * with its fallback pipeline; without this every draw repeated the decompile
+-     * and D3DCompile only to fail again (PV600: 38 per frame, ~1 frame/s). */
++    const double t_miss = perf_now();
++    double t_dxc = t_miss, t_obj = t_miss;
+     ID3D12PipelineState* pso = NULL;
+     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
+      * entry for the same program. "the cache misses" is not actionable; "it
+@@ -2738,8 +2769,10 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+         if (rp) memcpy(rp, "return float4(1,0,1,1)", 23);
+     }
+     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
++    t_dxc = perf_now();
+     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
+                             "main", "ps_5_0", 0, 0, &pb, &e);
++    t_obj = perf_now();
+     if (FAILED(hr) || !pb) {
+         vp_fp_fail_once(fp_addr, uhash, "PS compile", hr,
+                         e ? (const char*)e->lpVtbl->GetBufferPointer(e) : NULL);
+@@ -2855,6 +2888,17 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+     rdoc_name((ID3D12Object*)pso, "pso fp 0x%08X ucode %08X vs %d", fp_addr, uhash, vs_idx);
+ 
+ remember:
++    { const double t_end = perf_now();
++      compile_time("PSOT", &s_pso_time, fp_addr, uhash, pso != NULL,
++                   t_dxc - t_miss, t_obj - t_dxc, t_end - t_obj); }
++    if (!pso) {
++        if (rsx_fp_fail_add(&s_fp_fail, &fail_key) < 0 && s_fp_fail.dropped == 1) {
++            fprintf(stderr, "[FP] FAIL table full: later failures compile again%c", 10); fflush(stderr); }
++        { static int en = -1; if (en < 0) en = getenv("PSO_TIME") ? 1 : 0;
++          if (en) { fprintf(stderr, "[FPFAIL] held=%u dropped=%u hits=%llu%c", s_fp_fail.count,
++                            s_fp_fail.dropped, (unsigned long long)s_fp_fail.hits, 10); fflush(stderr); } }
++        return NULL;
++    }
+     /* insert (evict oldest when full) */
+     if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
+         if (s_d3d.vp_fp[0].pso) s_d3d.vp_fp[0].pso->lpVtbl->Release(s_d3d.vp_fp[0].pso);
+diff --git a/libs/video/rsx_fp_fail_table.h b/libs/video/rsx_fp_fail_table.h
+new file mode 100644
+index 00000000..e999e93a
+--- /dev/null
++++ b/libs/video/rsx_fp_fail_table.h
+@@ -0,0 +1,61 @@
++#ifndef PS3RECOMP_RSX_FP_FAIL_TABLE_H
++#define PS3RECOMP_RSX_FP_FAIL_TABLE_H
++
++/* Re:Fine 0116: pipelines that could not be built, kept apart from the PSO cache.
++ * That cache is a FIFO of 256 and its key carries vp_gen, so a failure stored
++ * there can be forgotten and compiled again. Here nothing is ever evicted and
++ * the key has no generation. A full table says so in dropped; what it holds
++ * stays. Open addressing, touched only after a PSO cache miss. */
++
++#include <stdint.h>
++#include <string.h>
++
++typedef struct {
++    uint32_t ucode_hash, vs_hash, blend, nrt, rtfmt, ctrl, cmask, cull, cube_mask;
++    uint32_t pad;   /* compared with memcmp: stays 0 */
++    uint64_t zs;
++} rsx_fp_fail_key;
++
++#define RSX_FP_FAIL_SLOTS 4096u  /* power of two */
++
++typedef struct {
++    rsx_fp_fail_key key[RSX_FP_FAIL_SLOTS];
++    uint8_t         used[RSX_FP_FAIL_SLOTS];
++    uint32_t        count;    /* distinct failures held */
++    uint32_t        dropped;  /* failures that did not fit */
++    uint64_t        hits;     /* compiles avoided */
++} rsx_fp_fail_table;
++
++static inline uint32_t rsx_fp_fail_slot(const rsx_fp_fail_key* k)
++{
++    const uint8_t* p = (const uint8_t*)k;
++    uint32_t h = 2166136261u;
++    for (size_t i = 0; i < sizeof *k; i++) { h ^= p[i]; h *= 16777619u; }
++    return h & (RSX_FP_FAIL_SLOTS - 1u);
++}
++
++static inline int rsx_fp_fail_find(const rsx_fp_fail_table* t, const rsx_fp_fail_key* k)
++{
++    if (!t->count) return 0;
++    for (uint32_t i = rsx_fp_fail_slot(k), n = 0; n < RSX_FP_FAIL_SLOTS;
++         i = (i + 1u) & (RSX_FP_FAIL_SLOTS - 1u), n++) {
++        if (!t->used[i]) return 0;
++        if (!memcmp(&t->key[i], k, sizeof *k)) return 1;
++    }
++    return 0;
++}
++
++/* 1 = added, 0 = already there, -1 = no room (counted in dropped). */
++static inline int rsx_fp_fail_add(rsx_fp_fail_table* t, const rsx_fp_fail_key* k)
++{
++    if (rsx_fp_fail_find(t, k)) return 0;
++    if (t->count == RSX_FP_FAIL_SLOTS) { t->dropped++; return -1; }
++    uint32_t i = rsx_fp_fail_slot(k);
++    while (t->used[i]) i = (i + 1u) & (RSX_FP_FAIL_SLOTS - 1u);
++    t->used[i] = 1;
++    t->key[i] = *k;
++    t->count++;
++    return 1;
++}
++
++#endif
+diff --git a/libs/video/tests/test_fp_fail_table.c b/libs/video/tests/test_fp_fail_table.c
+new file mode 100644
+index 00000000..b128c1b2
+--- /dev/null
++++ b/libs/video/tests/test_fp_fail_table.c
+@@ -0,0 +1,36 @@
++/* Re:Fine 0116: a failed pipeline is not forgotten, whatever else goes through. */
++#include <stdio.h>
++#include "../rsx_fp_fail_table.h"
++
++static rsx_fp_fail_table t;
++
++static rsx_fp_fail_key key(uint32_t n)
++{
++    rsx_fp_fail_key k;
++    memset(&k, 0, sizeof k);
++    k.ucode_hash = n * 2654435761u;
++    k.blend = n;
++    k.zs = (uint64_t)n << 32;
++    return k;
++}
++
++#define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); return 1; } } while (0)
++
++int main(void)
++{
++    /* The five programs of the PV600 fail first. */
++    for (uint32_t i = 1; i <= 5; i++) { rsx_fp_fail_key k = key(i); CHECK(rsx_fp_fail_add(&t, &k) == 1); }
++    /* Asking again adds nothing. */
++    { rsx_fp_fail_key k = key(3); CHECK(rsx_fp_fail_add(&t, &k) == 0); CHECK(t.count == 5); }
++    /* Far more than the 256 entries of the PSO cache come after them. */
++    for (uint32_t i = 1000; i < 1000 + 3000; i++) { rsx_fp_fail_key k = key(i); CHECK(rsx_fp_fail_add(&t, &k) == 1); }
++    for (uint32_t i = 1; i <= 5; i++) { rsx_fp_fail_key k = key(i); CHECK(rsx_fp_fail_find(&t, &k)); }
++    /* A key field that differs is another pipeline. */
++    { rsx_fp_fail_key k = key(1); k.cmask = 7; CHECK(!rsx_fp_fail_find(&t, &k)); }
++    /* Filling the table loses nothing that it held and says what did not fit. */
++    for (uint32_t i = 100000; t.count < RSX_FP_FAIL_SLOTS; i++) { rsx_fp_fail_key k = key(i); CHECK(rsx_fp_fail_add(&t, &k) == 1); }
++    { rsx_fp_fail_key k = key(9000000); CHECK(rsx_fp_fail_add(&t, &k) == -1); CHECK(t.dropped == 1); CHECK(!rsx_fp_fail_find(&t, &k)); }
++    for (uint32_t i = 1; i <= 5; i++) { rsx_fp_fail_key k = key(i); CHECK(rsx_fp_fail_find(&t, &k)); }
++    printf("test_fp_fail_table: OK (%u entries, %u dropped)\n", t.count, t.dropped);
++    return 0;
++}

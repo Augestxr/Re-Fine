@@ -1,0 +1,77 @@
+<rml>
+<head>
+    <title>Re:Fine</title>
+    <link type="text/rcss" href="menu.rcss"/>
+    <link type="text/rcss" href="theme.rcss"/>
+</head>
+<body>
+    <div id="launcher">
+        <div id="l_bg"><img id="l_pic" src="disc:PIC1.PNG"/></div>
+        <div id="l_shade"></div>
+        <div id="l_glow"></div>
+        <div id="l_left">
+            <div id="l_brand">Re:Fine</div>
+            <div id="l_brandbar"></div>
+            <img id="l_icon" src="disc:ICON0.PNG"/>
+            <div id="l_menu">
+                <div id="l_ink"></div>
+                <div class="mitem" id="m0"></div>
+                <div class="mitem" id="m1"></div>
+                <div class="mitem" id="m2"></div>
+            </div>
+            <div id="l_game" class="gone"></div>
+        </div>
+        <div id="l_disc"></div>
+        <div id="l_rver"></div>
+        <div id="l_toast"></div>
+        <div id="l_black"></div>
+    </div>
+    <div id="dim"></div>
+    <div id="fps"></div>
+    <div id="timing"><span id="tm_now"></span><span id="tm_avg"></span></div>
+    <div id="note"></div>
+    <div id="bar">
+        <div id="bar_tabs"></div>
+        <div id="bar_info"><span id="bar_fps"></span><span id="bar_clock"></span></div>
+        <div id="bar_line"></div>
+    </div>
+    <div id="panel">
+        <div id="p_glow"></div>
+        <div id="p_accent"></div>
+        <div id="ptop">
+            <div id="tabs"></div>
+            <div id="tab_ink"></div>
+            <div id="xclose">×</div>
+        </div>
+        <div id="cols">
+            <div id="list"></div>
+            <div id="desc">
+                <div id="desc_title"></div>
+                <div id="desc_bar"></div>
+                <div id="desc_text"></div>
+                <div id="desc_note"></div>
+                <div id="sview">
+                    <div id="sv_box">
+                        <div id="sv_leave"></div>
+                        <div id="sv_dz"></div>
+                        <div id="sv_dot"></div>
+                    </div>
+                    <div id="sv_txt"></div>
+                </div>
+            </div>
+        </div>
+        <div id="help"></div>
+    </div>
+    <div id="confirm">
+        <div id="confirm_box">
+            <div id="c_accent"></div>
+            <div id="confirm_text"></div>
+            <div id="confirm_note"></div>
+            <div id="confirm_btns">
+                <div class="cbtn" id="cyes">#confirm.yes</div>
+                <div class="cbtn" id="cno">#confirm.no</div>
+            </div>
+        </div>
+    </div>
+</body>
+</rml>

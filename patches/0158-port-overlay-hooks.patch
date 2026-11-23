@@ -1,0 +1,130 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 12678012..f8a0b4a6 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -45,6 +45,7 @@
+ #include <dxgi1_4.h>
+ #include <dxgi1_6.h>
+ #include <d3dcompiler.h>
++#include "port_overlay.h"   /* Re:Fine 0158 */
+ 
+ /* Link libraries */
+ #pragma comment(lib, "d3d12.lib")
+@@ -818,6 +819,9 @@ static u32    s_lock_n  = 0;
+ 
+ static LRESULT CALLBACK d3d12_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
++    /* Re:Fine 0158: the port's overlay sees every message first (its own toggle key). */
++    if (g_port_overlay_wndproc && g_port_overlay_wndproc(hwnd, msg, (uint64_t)wp, (int64_t)lp))
++        return 0;
+     switch (msg) {
+     case WM_CLOSE:
+         /* Re:Fine: a request, not the end. The title still has to finish its save and
+@@ -5283,6 +5287,11 @@ static struct {
+     ID3D12DescriptorHeap* heap;
+ } s_blit;
+ 
++/* Re:Fine 0158 (port_overlay.h): set by the port, never by the runtime. */
++volatile long g_port_overlay_active;
++void (*g_port_overlay_draw)(const port_overlay_frame* f);
++int (*g_port_overlay_wndproc)(void* hwnd, unsigned msg, uint64_t wp, int64_t lp);
++
+ static int present_blit_init(void)
+ {
+     if (s_blit.pso) return 1;
+@@ -5398,6 +5407,12 @@ static void present_blit(u32 fi)
+     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, gh);
+     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
++    /* Re:Fine 0158: the port's overlay on top of the finished picture, at the window's size. */
++    if (g_port_overlay_active && g_port_overlay_draw) {
++        port_overlay_frame of = { s_d3d.device, cl, (uint64_t)rtv.ptr, s_d3d.win_w, s_d3d.win_h,
++                                  fi, FRAME_COUNT, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM };
++        g_port_overlay_draw(&of);
++    }
+     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+     b[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+     b[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index c7867368..b12c4567 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -86,6 +86,10 @@ static double pad_clock(unsigned long long t0_ms)
+  * -----------------------------------------------------------------------*/
+ 
+ #include "../system/sysui.h"
++#include "../video/port_overlay.h"   /* Re:Fine 0158 */
++
++volatile long g_port_overlay_gate;
++int (*g_port_overlay_pad)(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly);
+ 
+ #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
+ 
+@@ -1598,6 +1602,21 @@ skip_inject: ;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
+     }
++    /* Re:Fine 0158: the port's overlay (its menu) holds the pad while it is open, before a
++     * system screen: the menu is drawn over everything. */
++    if (g_port_overlay_gate && g_port_overlay_pad) {
++        const u16 mask = (u16)((data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8) |
++                               (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xFF));
++        if (g_port_overlay_pad(port_no, mask, (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X],
++                               (u8)data->button[CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y])) {
++            data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = 0;
++            data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] = 0;
++            for (int _i = CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X; _i <= CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y; _i++)
++                data->button[_i] = 128;
++            for (int _i = CELL_PAD_BTN_OFFSET_PRESS_RIGHT; _i <= CELL_PAD_BTN_OFFSET_PRESS_R2; _i++)
++                data->button[_i] = 0;
++        }
++    }
+     /* A system screen holds the pad, after every source above has had its say:
+      * PAD_SCRIPT and PAD_FILE press its buttons the way a controller does. */
+     if (g_sysui_gate) {
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+new file mode 100644
+index 00000000..a791ebb4
+--- /dev/null
++++ b/libs/video/port_overlay.h
+@@ -0,0 +1,40 @@
++/* Re:Fine 0158: hooks for a port's own overlay (its settings menu), drawn on the swap chain
++ * after the scaled present, at the window's size. The runtime only calls them; the port
++ * sets them. While g_port_overlay_active is 0 the draw hook is not called at all, so a
++ * closed overlay costs one load per presented frame. */
++#ifndef PORT_OVERLAY_H
++#define PORT_OVERLAY_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef struct {
++    void*    device;        /* ID3D12Device* */
++    void*    cmd_list;      /* ID3D12GraphicsCommandList*, recording, swap buffer bound as RT */
++    uint64_t rtv;           /* D3D12_CPU_DESCRIPTOR_HANDLE.ptr of that swap buffer */
++    uint32_t width, height; /* the swap chain: the window's client area */
++    uint32_t frame_index;   /* 0..frame_count-1; per-frame resources of this index are free */
++    uint32_t frame_count;
++    uint32_t rtv_format;    /* DXGI_FORMAT of the swap buffer */
++} port_overlay_frame;
++
++/* Render thread (frame_clock), inside present_blit, only while g_port_overlay_active. */
++extern volatile long g_port_overlay_active;
++extern void (*g_port_overlay_draw)(const port_overlay_frame* f);
++
++/* Window thread: every message before the backend's own handling. Nonzero: consumed. */
++extern int (*g_port_overlay_wndproc)(void* hwnd, unsigned msg, uint64_t wp, int64_t lp);
++
++/* Guest thread, in cellPadGetData after every source has had its say. While the gate is
++ * set and the hook returns nonzero, the title reads a released pad. */
++extern volatile long g_port_overlay_gate;
++extern int (*g_port_overlay_pad)(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif

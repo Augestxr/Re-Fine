@@ -1,0 +1,326 @@
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -111,8 +111,9 @@ static struct {
+     VkDeviceMemory mem[RSX_VK_NBUF];
+     VkPhysicalDeviceMemoryProperties memp;
+     VkFormat depth_format;
+-    VkDescriptorSetLayout set_layout;
+-    VkPipelineLayout pipe_layout;
++    VkDescriptorSetLayout set_layout, set_layout_u;   /* _u: the bank declared by unit (a program with a cube, 0183) */
++    VkPipelineLayout pipe_layout, pipe_layout_u;
++    VkSurf white_cube;
+     VkSampler samp_linear;
+     VkSurf white, display, display_depth;   /* white: the null SRV stand-in, cleared to zero (D3D12's null reads 0) */
+     VkBuffer stage[FRAMES];
+@@ -536,7 +537,7 @@ static VkShaderModule vk_vs_find(u32 hash)
+  * SET_SHADER_CONTROL export bits, the cube units, the alpha test. Programs that declare units one by one (any cube
+  * unit) need another set layout: left for later, counted. */
+ #define VK_FS_MAX 2048
+-static struct { u64 key; VkShaderModule mod; int ok; } s_fs[VK_FS_MAX];
++static struct { u64 key; VkShaderModule mod; int ok, sep; } s_fs[VK_FS_MAX];
+ static u32 s_nfs; static int s_fs_bad;
+ static double s_fs_ms;
+ 
+@@ -547,8 +548,9 @@ static u64 vk_fnv(const void* p, size_t n, u64 h)
+     return h;
+ }
+ 
+-static VkShaderModule vk_fs_get(const rsx_vk_draw* d, u64* key_out)
++static VkShaderModule vk_fs_get(const rsx_vk_draw* d, u64* key_out, int* sep_out)
+ {
++    *sep_out = 0;
+     if (!d->fp_addr || !vm_base) return VK_NULL_HANDLE;
+     const u32 off = cellGcmResolveLocated((d->fp_addr & 3u) == 1, d->fp_addr & ~3u);
+     if (off == 0xFFFFFFFFu) return VK_NULL_HANDLE;
+@@ -557,7 +559,7 @@ static VkShaderModule vk_fs_get(const rsx_vk_draw* d, u64* key_out)
+     key = vk_fnv(&code, 4, key); key = vk_fnv(&d->fp_ctrl, 4, key);
+     key = vk_fnv(&d->cube_mask, 4, key); key = vk_fnv(&d->alpha_func, 4, key);
+     *key_out = key;
+-    for (u32 i = 0; i < s_nfs; i++) if (s_fs[i].key == key) return s_fs[i].mod;
++    for (u32 i = 0; i < s_nfs; i++) if (s_fs[i].key == key) { *sep_out = s_fs[i].sep; return s_fs[i].mod; }
+     if (s_nfs >= VK_FS_MAX) return VK_NULL_HANDLE;
+     const double t0 = vk_ms();
+     static char hlsl[RSX_FP_HLSL_BUFFER_SIZE];
+@@ -565,10 +567,13 @@ static VkShaderModule vk_fs_get(const rsx_vk_draw* d, u64* key_out)
+     int n = rsx_fp_decompile_buffered_ex(vm_base + off, 4096, d->fp_ctrl, d->cube_mask, hlsl, sizeof hlsl, &nk);
+     if (n > 0 && d->alpha_func && rsx_fp_apply_alpha_test_buffered(hlsl, sizeof hlsl, d->alpha_func) < 0) n = -3;
+     VkShaderModule mod = VK_NULL_HANDLE;
+-    if (n > 0 && !strstr(hlsl, "rsx_tex[16]") && strstr(hlsl, "Texture")) { s_vk.skipped_cube++; n = -4; }   /* per-unit form */
++    /* Re:Fine 0183: the bank declared by unit (a cube unit) goes to the by-unit set layout; a volume unit is not done */
++    const int sep = n > 0 && !strstr(hlsl, "rsx_tex[16]") && strstr(hlsl, "Texture");
++    if (sep && strstr(hlsl, "Texture3D")) { s_vk.skipped_cube++; n = -4; }
+     if (n > 0) mod = vk_module(hlsl, 1, "fragment", key, &s_fs_bad);
+     s_fs_ms += vk_ms() - t0;
+-    s_fs[s_nfs].key = key; s_fs[s_nfs].mod = mod; s_fs[s_nfs].ok = mod != VK_NULL_HANDLE; s_nfs++;
++    s_fs[s_nfs].key = key; s_fs[s_nfs].mod = mod; s_fs[s_nfs].ok = mod != VK_NULL_HANDLE; s_fs[s_nfs].sep = sep; s_nfs++;
++    *sep_out = sep;
+     return mod;
+ }
+ 
+@@ -577,7 +582,7 @@ static VkShaderModule vk_fs_get(const rsx_vk_draw* d, u64* key_out)
+  * -----------------------------------------------------------------------*/
+ typedef struct {
+     u32 vs; u64 fs;
+-    u32 blend_key, cmask, cull, ncol;
++    u32 blend_key, cmask, cull, ncol, sep;
+     u64 zs;
+     VkFormat cf[4], df;
+ } VkPipeKey;
+@@ -686,7 +691,7 @@ static VkPipeline vk_pipe_get(const VkPipeKey* k, VkShaderModule vs, VkShaderMod
+     pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
+     pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
+     pi.pColorBlendState = &cbs; pi.pDynamicState = &dy;
+-    pi.layout = s_vk.pipe_layout;
++    pi.layout = k->sep ? s_vk.pipe_layout_u : s_vk.pipe_layout;
+     VkPipeline p = VK_NULL_HANDLE;
+     VkResult r = vkCreateGraphicsPipelines_(s_vk.dev, VK_NULL_HANDLE, 1, &pi, NULL, &p);
+     s_pipe_ms += vk_ms() - t0;
+@@ -713,6 +718,16 @@ static int vk_layouts(void)
+     VkPipelineLayoutCreateInfo pl = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+     pl.setLayoutCount = 1; pl.pSetLayouts = &s_vk.set_layout;
+     if ((r = vkCreatePipelineLayout_(s_vk.dev, &pl, NULL, &s_vk.pipe_layout)) != VK_SUCCESS) return vk_fail("vkCreatePipelineLayout", r);
++    {   /* 0183: t0..t15 one binding each (16..31), for the programs that declare the bank by unit */
++        VkDescriptorSetLayoutBinding bu[19];
++        memset(bu, 0, sizeof bu);
++        bu[0] = b[0]; bu[1] = b[1]; bu[18] = b[3];
++        for (u32 u = 0; u < 16; u++) { bu[2 + u] = b[2]; bu[2 + u].binding = 16 + u; bu[2 + u].descriptorCount = 1; }
++        li.bindingCount = 19; li.pBindings = bu;
++        if ((r = vkCreateDescriptorSetLayout_(s_vk.dev, &li, NULL, &s_vk.set_layout_u)) != VK_SUCCESS) return vk_fail("vkCreateDescriptorSetLayout (by unit)", r);
++        pl.pSetLayouts = &s_vk.set_layout_u;
++        if ((r = vkCreatePipelineLayout_(s_vk.dev, &pl, NULL, &s_vk.pipe_layout_u)) != VK_SUCCESS) return vk_fail("vkCreatePipelineLayout (by unit)", r);
++    }
+     VkDescriptorPoolSize ps[3] = { { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2 * VK_MAX_SETS },
+                                    { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16 * VK_MAX_SETS },
+                                    { VK_DESCRIPTOR_TYPE_SAMPLER, 16 * VK_MAX_SETS } };
+@@ -800,7 +815,7 @@ static VkSurf* vk_shared_ds(VkCommandBuffer c, u32 pw, u32 ph)
+  * -----------------------------------------------------------------------*/
+ #define VK_TEX_MAX 2048
+ #define VK_STAGE_BYTES (64ull << 20)
+-typedef struct { u32 off, w, h, fmt, map; u64 csum; u64 last; VkSurf s; } VkTex;
++typedef struct { u32 off, w, h, fmt, map, cube; u64 csum; u64 last; VkSurf s; } VkTex;
+ static VkTex s_tex[VK_TEX_MAX];
+ static u32 s_ntex;
+ static u64 s_batch;
+@@ -862,19 +877,58 @@ static int vk_stage_init(void)
+     return 0;
+ }
+ 
++/* A sampled image of `layers` layers (6: a cube), in GENERAL. */
++static int vk_tex_image(VkCommandBuffer c, VkSurf* s, u32 w, u32 h, VkFormat vf, VkComponentMapping map, u32 layers)
++{
++    VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
++    ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vf;
++    ii.flags = layers == 6 ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
++    ii.extent.width = w; ii.extent.height = h; ii.extent.depth = 1;
++    ii.mipLevels = 1; ii.arrayLayers = layers; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
++    ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++    ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++    if (vkCreateImage_(s_vk.dev, &ii, NULL, &s->img) != VK_SUCCESS) { s->img = VK_NULL_HANDLE; return -1; }
++    VkMemoryRequirements req; vkGetImageMemoryRequirements_(s_vk.dev, s->img, &req);
++    VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    ma.allocationSize = req.size; ma.memoryTypeIndex = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    if (vkAllocateMemory_(s_vk.dev, &ma, NULL, &s->mem) != VK_SUCCESS) { vk_image_free(s); return -1; }
++    vkBindImageMemory_(s_vk.dev, s->img, s->mem, 0);
++    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++    vi.image = s->img; vi.viewType = layers == 6 ? VK_IMAGE_VIEW_TYPE_CUBE : VK_IMAGE_VIEW_TYPE_2D; vi.format = vf; vi.components = map;
++    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = layers;
++    if (vkCreateImageView_(s_vk.dev, &vi, NULL, &s->view) != VK_SUCCESS) { vk_image_free(s); return -1; }
++    s->pw = w; s->ph = h; s->vf = vf;
++    VkImageMemoryBarrier b = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
++    b.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++    b.image = s->img; b.subresourceRange = vi.subresourceRange;
++    vkCmdPipelineBarrier_(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &b);
++    return 0;
++}
++
+ /* The image for a guest texture unit, uploaded now if new or changed; NULL when the D3D12 backend would bind a
+- * null SRV (a format it does not upload, a cube) or when this batch's staging is full. */
+-static VkTex* vk_tex_get(VkCommandBuffer c, uint32_t f, const rsx_vk_tex* t)
++ * null SRV (a format it does not upload) or when this batch's staging is full. `cube`: the six faces (0183), each
++ * a whole mip pyramid 128-byte aligned in guest memory, as the D3D12 backend reads them; else face 0 alone. */
++static VkTex* vk_tex_get(VkCommandBuffer c, uint32_t f, const rsx_vk_tex* t, u32 cube)
+ {
+     const u32 bf = t->fmt & 0x9Fu;
+-    if (!t->set || !t->off || !t->w || !t->h || t->cube || !vm_base) return NULL;
++    if (!t->set || !t->off || !t->w || !t->h || !vm_base) return NULL;
+     if (!(bf == 0x81 || bf == 0x85 || bf == 0x8B || (bf >= 0x86 && bf <= 0x88))) return NULL;
+     rsx_tex_layout tl;
+     rsx_texture_layout(t->fmt, t->w, t->h, &tl);
+-    const u32 src_bytes = tl.face_bytes;
++    const u32 faces = cube ? 6u : 1u;
++    u32 stride = 0;
++    if (cube) {
++        u32 lw = t->w, lh = t->h;
++        for (u32 l = 0; l < (t->mips ? t->mips : 1u); l++) { rsx_tex_layout ml; rsx_texture_layout(t->fmt, lw, lh, &ml); stride += ml.face_bytes;
++            if (lw > 1) lw >>= 1; if (lh > 1) lh >>= 1; }
++        stride = (stride + 127u) & ~127u;
++    }
++    const u32 src_bytes = stride * (faces - 1u) + tl.face_bytes;
+     VkTex* e = NULL;
+     for (u32 i = 0; i < s_ntex; i++)
+-        if (s_tex[i].off == t->off && s_tex[i].w == t->w && s_tex[i].h == t->h && s_tex[i].fmt == t->fmt && s_tex[i].map == t->map) { e = &s_tex[i]; break; }
++        if (s_tex[i].off == t->off && s_tex[i].w == t->w && s_tex[i].h == t->h && s_tex[i].fmt == t->fmt && s_tex[i].map == t->map && s_tex[i].cube == cube) { e = &s_tex[i]; break; }
+     /* Re:Fine 0182: looked at once per batch. The same texture is bound by many draws of a frame, and hashing
+      * its guest bytes again for each one was most of the executor's time (the batch is recorded: the guest
+      * memory it reads does not change while it runs). */
+@@ -882,7 +936,8 @@ static VkTex* vk_tex_get(VkCommandBuffer c, uint32_t f, const rsx_vk_tex* t)
+     const u64 cs = vk_hash_bytes(vm_base + t->off, src_bytes);
+     if (e && e->s.img && e->csum == cs) { e->last = s_batch; return e; }
+     const u32 rows = tl.compressed ? tl.rows : t->h;
+-    const u64 dst_bytes = (u64)tl.dst_row_bytes * rows;
++    const u64 face_dst = (u64)tl.dst_row_bytes * rows;
++    const u64 dst_bytes = face_dst * faces;
+     const u64 at = (s_vk.stage_used + 15u) & ~15ull;
+     if (at + dst_bytes > VK_STAGE_BYTES) { s_vk.tex_full++; return e && e->s.img ? e : NULL; }   /* next batch */
+     if (!e) {
+@@ -893,37 +948,25 @@ static VkTex* vk_tex_get(VkCommandBuffer c, uint32_t f, const rsx_vk_tex* t)
+             vk_image_free(&e->s);
+         }
+         memset(e, 0, sizeof *e);
+-        e->off = t->off; e->w = t->w; e->h = t->h; e->fmt = t->fmt; e->map = t->map;
++        e->off = t->off; e->w = t->w; e->h = t->h; e->fmt = t->fmt; e->map = t->map; e->cube = cube;
+     }
+-    if (!e->s.img) {
+-        VkImageCreateInfo ii = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+-        ii.imageType = VK_IMAGE_TYPE_2D; ii.format = vk_tex_format(tl.fmt);
+-        ii.extent.width = t->w; ii.extent.height = t->h; ii.extent.depth = 1;
+-        ii.mipLevels = 1; ii.arrayLayers = 1; ii.samples = VK_SAMPLE_COUNT_1_BIT; ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+-        ii.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+-        ii.sharingMode = VK_SHARING_MODE_EXCLUSIVE; ii.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+-        if (vkCreateImage_(s_vk.dev, &ii, NULL, &e->s.img) != VK_SUCCESS) { e->s.img = VK_NULL_HANDLE; return NULL; }
+-        VkMemoryRequirements req; vkGetImageMemoryRequirements_(s_vk.dev, e->s.img, &req);
+-        VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+-        ma.allocationSize = req.size; ma.memoryTypeIndex = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+-        if (vkAllocateMemory_(s_vk.dev, &ma, NULL, &e->s.mem) != VK_SUCCESS) { vk_image_free(&e->s); return NULL; }
+-        vkBindImageMemory_(s_vk.dev, e->s.img, e->s.mem, 0);
+-        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+-        vi.image = e->s.img; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = ii.format; vi.components = vk_map(t->map);
+-        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
+-        if (vkCreateImageView_(s_vk.dev, &vi, NULL, &e->s.view) != VK_SUCCESS) { vk_image_free(&e->s); return NULL; }
+-        e->s.pw = t->w; e->s.ph = t->h; e->s.vf = ii.format;
+-        vk_to_general(c, &e->s);
++    if (!e->s.img && vk_tex_image(c, &e->s, t->w, t->h, vk_tex_format(tl.fmt), vk_map(t->map), faces)) return NULL;
++    VkBufferImageCopy bc[6]; memset(bc, 0, sizeof bc);
++    for (u32 fc = 0; fc < faces; fc++) {
++        rsx_texture_decode(s_vk.stage_map[f] + at + face_dst * fc, tl.dst_row_bytes, vm_base + t->off + stride * fc, t->w, t->h, &tl, rsx_texture_argb_is_rgba());
++        bc[fc].bufferOffset = at + face_dst * fc;
++        bc[fc].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; bc[fc].imageSubresource.baseArrayLayer = fc; bc[fc].imageSubresource.layerCount = 1;
++        bc[fc].imageExtent.width = t->w; bc[fc].imageExtent.height = t->h; bc[fc].imageExtent.depth = 1;
+     }
+-    rsx_texture_decode(s_vk.stage_map[f] + at, tl.dst_row_bytes, vm_base + t->off, t->w, t->h, &tl, rsx_texture_argb_is_rgba());
+     s_vk.stage_used = at + dst_bytes;
+-    VkBufferImageCopy bc; memset(&bc, 0, sizeof bc);
+-    bc.bufferOffset = at;
+-    bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; bc.imageSubresource.layerCount = 1;
+-    bc.imageExtent.width = t->w; bc.imageExtent.height = t->h; bc.imageExtent.depth = 1;
+-    vkCmdCopyBufferToImage_(c, s_vk.stage[f], e->s.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
++    vkCmdCopyBufferToImage_(c, s_vk.stage[f], e->s.img, VK_IMAGE_LAYOUT_GENERAL, faces, bc);
+     e->csum = cs; e->last = s_batch;
+     s_vk.tex_uploads++; s_vk.tex_bytes += dst_bytes;
++    {   static int lg = -1, n;   /* REFINE_VK_TEXLOG=1: what the big uploads are */
++        if (lg < 0) { const char* v = getenv("REFINE_VK_TEXLOG"); lg = v && *v == '1'; }
++        if (lg && dst_bytes >= (1u << 20) && s_vk.tex_uploads > 600 && n < 60) {
++            int ds = 0; for (u32 i = 0; i < s_vk.nds; i++) if (s_vk.ds[i].off == t->raw) ds = 1;
++            n++; fprintf(stderr, "[vk-tex] off %x raw %x %ux%u fmt %x ds %d%c", t->off, t->raw, t->w, t->h, t->fmt, ds, 10); } }
+     return e;
+ }
+ 
+@@ -1056,6 +1099,10 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         VkClearColorValue w1 = { { 0.0f, 0.0f, 0.0f, 0.0f } };   /* a null SRV reads zero */
+         VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+         vkCmdClearColorImage_(c, s_vk.white.img, VK_IMAGE_LAYOUT_GENERAL, &w1, 1, &rr);
++        {   VkComponentMapping id; memset(&id, 0, sizeof id);
++            if (!vk_tex_image(c, &s_vk.white_cube, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, id, 6)) {
++                VkImageSubresourceRange r6 = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 6 };
++                vkCmdClearColorImage_(c, s_vk.white_cube.img, VK_IMAGE_LAYOUT_GENERAL, &w1, 1, &r6); } }
+         s_vk.first_frame_done = 1;
+     }
+     /* The display target, at the backend's host size; cleared every batch, as the D3D12 backbuffer is. */
+@@ -1086,7 +1133,7 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+             texof[d][u] = NULL;
+             if (!r->is_vp || r->is_clear || !((r->tex_mask >> u) & 1u) || !r->tex[u].set) continue;
+             if (vk_rt_find(r->tex[u].raw)) continue;
+-            texof[d][u] = vk_tex_get(c, f, &r->tex[u]);
++            texof[d][u] = vk_tex_get(c, f, &r->tex[u], r->tex[u].cube && ((r->cube_mask >> u) & 1u));
+         }
+     }
+     vk_full_barrier(c);
+@@ -1144,11 +1191,12 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         /* the programs and the pipeline */
+         const VkShaderModule vs = vk_vs_find(r->vs_hash);
+         u64 fkey = 0;
+-        const VkShaderModule fs = vk_fs_get(r, &fkey);
++        int sep = 0;
++        const VkShaderModule fs = vk_fs_get(r, &fkey, &sep);
+         if (!vs || !fs) { s_vk.skipped_nopipe++; continue; }
+         VkPipeKey k; memset(&k, 0, sizeof k);
+         k.vs = r->vs_hash; k.fs = fkey; k.blend_key = r->blend ? r->blend_key : 0; k.cmask = r->cmask; k.cull = r->cull;
+-        k.zs = r->zs_key; k.ncol = cur.ncol;
++        k.zs = r->zs_key; k.ncol = cur.ncol; k.sep = (u32)sep;
+         for (u32 i = 0; i < cur.ncol; i++) k.cf[i] = cur.col[i]->vf;
+         k.df = cur.depth ? s_vk.depth_format : VK_FORMAT_UNDEFINED;
+         const VkPipeline p = vk_pipe_get(&k, vs, fs);
+@@ -1156,7 +1204,7 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         if (p != bound) { vkCmdBindPipeline_(c, VK_PIPELINE_BIND_POINT_GRAPHICS, p); bound = p; }
+         /* the draw's descriptors */
+         VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+-        ai.descriptorPool = s_vk.dpool[f]; ai.descriptorSetCount = 1; ai.pSetLayouts = &s_vk.set_layout;
++        ai.descriptorPool = s_vk.dpool[f]; ai.descriptorSetCount = 1; ai.pSetLayouts = sep ? &s_vk.set_layout_u : &s_vk.set_layout;
+         VkDescriptorSet set;
+         if (vkAllocateDescriptorSets_(s_vk.dev, &ai, &set) != VK_SUCCESS) { s_vk.skipped_nopipe++; continue; }
+         VkDescriptorBufferInfo ub[2] = {
+@@ -1165,12 +1213,16 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         VkDescriptorImageInfo im[16], sm[16];
+         for (u32 u = 0; u < 16; u++) {
+             VkSurf* src = &s_vk.white;
+-            if ((r->tex_mask >> u) & 1u) {
++            const int want_cube = sep && ((r->cube_mask >> u) & 1u);   /* the view must be what the program declares */
++            if (want_cube) {
++                src = &s_vk.white_cube;
++                if (((r->tex_mask >> u) & 1u) && d < VK_MAX_SETS && texof[d][u] && texof[d][u]->cube) src = &texof[d][u]->s;
++            } else if ((r->tex_mask >> u) & 1u) {
+                 VkSurf* s = r->tex[u].set ? vk_rt_find(r->tex[u].raw) : NULL;
+                 int attached = 0;
+                 for (u32 i = 0; i < cur.ncol; i++) if (cur.col[i] == s) attached = 1;
+                 if (s && !attached) src = s;   /* a surface the pass draws to is not sampled in it */
+-                else if (!s && d < VK_MAX_SETS && texof[d][u]) src = &texof[d][u]->s;
++                else if (!s && d < VK_MAX_SETS && texof[d][u] && !texof[d][u]->cube) src = &texof[d][u]->s;
+             }
+             im[u].sampler = VK_NULL_HANDLE; im[u].imageView = src->view; im[u].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+             sm[u].sampler = s_vk.samp_linear; sm[u].imageView = VK_NULL_HANDLE; sm[u].imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+@@ -1183,7 +1235,7 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         w[2].dstBinding = 16; w[2].descriptorCount = 16; w[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; w[2].pImageInfo = im;
+         w[3].dstBinding = 32; w[3].descriptorCount = 16; w[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER; w[3].pImageInfo = sm;
+         vkUpdateDescriptorSets_(s_vk.dev, 4, w, 0, NULL);
+-        vkCmdBindDescriptorSets_(c, VK_PIPELINE_BIND_POINT_GRAPHICS, s_vk.pipe_layout, 0, 1, &set, 0, NULL);
++        vkCmdBindDescriptorSets_(c, VK_PIPELINE_BIND_POINT_GRAPHICS, sep ? s_vk.pipe_layout_u : s_vk.pipe_layout, 0, 1, &set, 0, NULL);
+         /* the viewport: the guest rect when sane, else the target, in host pixels; D3D's y (negative height) */
+         float tw = (float)cur.tw, th = (float)cur.th, x = 0, y = 0, vw = tw, vh = th;
+         if (r->vp_w >= 2 && r->vp_h >= 2 && (float)(r->vp_x + r->vp_w) <= tw + 0.5f && (float)(r->vp_y + r->vp_h) <= th + 0.5f) {
+diff --git a/libs/video/rsx_vk_exec.h b/libs/video/rsx_vk_exec.h
+--- a/libs/video/rsx_vk_exec.h
++++ b/libs/video/rsx_vk_exec.h
+@@ -16,7 +16,7 @@ enum { RSX_VK_VB = 0, RSX_VK_VP_VB, RSX_VK_VP_IB, RSX_VK_VP_CB, RSX_VK_VP_FPCB,
+ 
+ /* One texture unit as the draw had it bound (D3D12DrawTex's fields the executor needs). */
+ typedef struct rsx_vk_tex {
+-    u32 raw, off, w, h, fmt, cube, set, filter, addr;
++    u32 raw, off, w, h, fmt, cube, set, filter, addr, mips;
+     u32 map;   /* the D3D12 SRV component mapping the backend derives (rsx_remap_to_d3d; 0x1000 for B8) */
+ } rsx_vk_tex;
+ 
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -6603,7 +6603,7 @@ static void render_frame_vk(void)
+             const D3D12DrawTex* t = &dr->tex[u];
+             o->tex[u].raw = t->raw; o->tex[u].off = t->off; o->tex[u].w = t->w; o->tex[u].h = t->h;
+             o->tex[u].fmt = t->fmt; o->tex[u].cube = (u32)t->cube; o->tex[u].set = (u32)t->set;
+-            o->tex[u].filter = t->filter; o->tex[u].addr = t->addr;
++            o->tex[u].filter = t->filter; o->tex[u].addr = t->addr; o->tex[u].mips = t->mips;
+             { const u32 bf = t->fmt & 0x9Fu;   /* as the D3D12 path maps the SRV (render_frame) */
+               o->tex[u].map = (bf == 0x81) ? 0x1000u : (t->set ? rsx_remap_to_d3d(t->ctrl1, bf) : 0x1688u); }
+         }

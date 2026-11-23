@@ -1,0 +1,100 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -4291,15 +4291,42 @@ static struct {
+     struct { long seq, ticks; float alpha; u8 tick; } ring[IX_RING];
+     float lag;               /* frames between a guest frame and its draws here, measured at each new state */
+     int *g_tab, *g_first, *g_list, *g_gid, *g_seen, *g_bg, *g_br, *g_cnt, *g_nxt, *g_ctab; u8* used; u32 g_cap, g_tab_n;   /* pairing scratch */
++    int only_dump;           /* 0197: this batch is kept for REFINE_DRAW_DUMP, not blended */
+     int trk, traced;         /* REFINE_INTERP_LOG=2: one moving draw (its index in b) followed frame by frame */
+     /* REFINE_INTERP_LOG, per second */
+     double t0, cost, part[6]; u32 frames, states, batches, draws, found, moving, blended, paired, jumped, big, untimed;
+     u32 slot[16], creg_draws, fp_draws;
+ } s_ix;
+ 
++/* Re:Fine 0197, diagnostic only: REFINE_DRAW_DUMP=<file>:<from s>-<to s> (seconds since the process started)
++ * writes, for every draw of every batch in that window, what it moves: its vertex-program constants and up to six
++ * of its vertices. tools/draw_census.py finds in it what only moves on the 30 Hz ticks. */
++static struct { int state; FILE* f; double from, to, t0; } s_dd;
++static int dd_want(void)
++{
++    if (s_dd.state == 0) {
++        const char* e = getenv("REFINE_DRAW_DUMP");
++        const char* c = e ? strrchr(e, ':') : NULL;
++        s_dd.state = -1;
++        if (c && sscanf(c + 1, "%lf-%lf", &s_dd.from, &s_dd.to) == 2) {
++            char path[512];
++            snprintf(path, sizeof path, "%.*s", (int)(c - e), e);
++            s_dd.f = fopen(path, "wb");
++            s_dd.t0 = (double)GetTickCount64() * 1e-3;
++            if (s_dd.f) { setvbuf(s_dd.f, NULL, _IOFBF, 64u << 20); s_dd.state = 1; }
++        }
++    }
++    if (s_dd.state < 1) return 0;
++    const double t = (double)GetTickCount64() * 1e-3 - s_dd.t0;
++    if (t > s_dd.to) { fclose(s_dd.f); s_dd.state = -1; fprintf(stderr, "[draw-dump] done%c", 10); return 0; }
++    return t >= s_dd.from;
++}
++
+ static void ix_latch(void)
+ {
+-    int want = g_port_draw_interp && !s_ix.off;
++    const int menus = g_port_draw_interp && !s_ix.off;
++    int want = !s_ix.off && (menus || dd_want());
++    s_ix.only_dump = !menus;
+     if (want && !s_ix.w_vb) {
+         const char* e = getenv("REFINE_INTERP_LOG");
+         s_ix.log = e ? (*e == '2' ? 2 : 1) : -1; s_ix.trk = -1; s_ix.lag = 1.0f;
+@@ -4941,10 +4968,52 @@ static void ix_apply_body(void)
+     if (s_ix.log > 0) { s_ix.draws += n; s_ix.found += found; s_ix.moving += moving; s_ix.blended += blended; }
+ }
+ 
++static void dd_batch(void)
++{
++    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
++    const u32 vbytes = s_d3d.vp_vb_offset;
++    LARGE_INTEGER c, q; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&q);
++    struct { u32 magic, n, nblk, present; long seq, tick; float alpha; u32 pad; double t; } h =
++        { 0x46444444u, 0, s_ix.nblk, (u32)s_present_this_frame, g_port_draw_seq, g_port_draw_tick, g_port_draw_alpha, 0,
++          (double)c.QuadPart / (double)q.QuadPart };
++    static IxSig sig;
++    for (u32 d = 0; d < n; d++) if (s_d3d.draws[d].is_vp && !s_d3d.draws[d].is_clear) h.n++;
++    fwrite(&h, sizeof h, 1, s_dd.f);
++    for (u32 b = 0; b < s_ix.nblk; b++) {              /* each block: the registers that differ from the one before */
++        const float* x = s_ix.w_cb + (u64)b * IX_CBF;
++        u32 m = 0; static u16 idx[RSX_MAX_VERTEX_CONSTANTS];
++        for (u32 r = 0; r < RSX_MAX_VERTEX_CONSTANTS; r++)
++            if (!b || memcmp(x + r * 4, x - IX_CBF + r * 4, 16)) idx[m++] = (u16)r;
++        fwrite(&m, 4, 1, s_dd.f); fwrite(idx, 2, m, s_dd.f);
++        for (u32 k = 0; k < m; k++) fwrite(x + (u32)idx[k] * 4, 16, 1, s_dd.f);
++    }
++    for (u32 d = 0; d < n; d++) {
++        const D3D12DrawRecord* dr = &s_d3d.draws[d];
++        if (!dr->is_vp || dr->is_clear) continue;
++        ix_sig(dr, d, vbytes, &sig);
++        struct { u64 call; u32 fp, vs, nv, tex, rt, blk; u16 am, vpw; u32 blend; float v[6][8]; } o;
++        memset(&o, 0, sizeof o);
++        o.call = s_ix.w_call[d]; o.fp = dr->fp_addr; o.vs = (u32)dr->vs_idx; o.nv = dr->vertex_count;
++        o.tex = dr->tex_mask & 1u ? dr->tex[0].raw : 0; o.rt = dr->rt_off; o.blk = s_ix.w_cbk[d];
++        o.am = s_ix.w_am[d]; o.vpw = (u16)dr->vp_w; o.blend = dr->blend & 1u;
++        if (sig.vn) for (u32 k = 0; k < 6 && dr->vertex_count; k++) {
++            const u8* p = s_ix.w_vb + sig.vo + (u64)(dr->vertex_count - 1) * k / 5 * IX_VSTRIDE;
++            memcpy(o.v[k], p, 16); memcpy(o.v[k] + 4, p + 8 * 16, 16);
++        }
++        fwrite(&o, sizeof o, 1, s_dd.f);
++    }
++}
++
+ static void ix_apply(void)
+ {
+     if (!s_ix.on) return;
+     s_ix.on = 0;
++    if (dd_want()) dd_batch();
++    if (s_ix.only_dump) {
++        memcpy((u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * MAX_VERTICES * IX_VSTRIDE, s_ix.w_vb, s_d3d.vp_vb_offset);
++        s_ix.nblk = 0;
++        return;
++    }
+     if (s_ix.log <= 0) { ix_apply_body(); s_ix.nblk = 0; return; }
+     LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a);
+     ix_apply_body();

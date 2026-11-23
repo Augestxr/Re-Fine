@@ -1,0 +1,904 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -4172,6 +4172,745 @@
+ /* Snapshot the VP constant bank + viewport epilogue for one draw into its
+  * vp_cb slot. Runs at record time so every draw keeps the constants that
+  * were live when the guest issued it. */
++/* ---------------------------------------------------------------------------
++ * Re:Fine 0175: the game's menus drawn between their 30 Hz ticks (port_overlay.h).
++ *
++ * Over 30 fps the port runs the menus' logic on 30 Hz ticks (src/main.cpp, g_fps_menu_hold), the speed of the
++ * original, and the frames between two ticks draw the same state again: the menus kept their speed but looked
++ * 30 fps. Here those frames are drawn between the last two ticks instead, one tick (33 ms) behind the logic, in
++ * the menus only.
++ *
++ * - A tick's state reaches the backend some frames after the tick (F builds a frame's draws and sends them later,
++ *   1 to 3 frames measured): a new state is seen in the draws themselves, when draws that stayed the same since
++ *   the last state stop coming. Draws that change in every frame (they move on their own) are left out of that.
++ * - Each draw of the new state is paired with the same draw of the state before: same program, textures,
++ *   target, blend and vertex count, and among draws alike in all that (F draws rows of the same sprite, not
++ *   always in the same order) the one whose vertices are nearest.
++ * - In every frame that draws that state again, each draw is found in it by its content (order does not matter)
++ *   and its vertices and vertex- and fragment-program constants that changed are blended from its pair, by the
++ *   game's own clock since the tick that made the state (g_port_draw_ticks + g_port_draw_alpha of the frame the
++ *   backend is drawing).
++ * - Drawn as the game sent them: draws with no pair (they came or went), draws that jumped more than a third of
++ *   the viewport in one tick (a list wrapping round), and draws that are not the state's (they move on their own).
++ *
++ * The vertices of such a frame are built in system memory (the upload heap is write-combined: reading it back
++ * costs more than the blend) and copied to the heap at the start of render_frame. The vertex-program constants
++ * are kept once per change (rsx_state.vertex_constants_dirty, set by every constant write), not once per draw.
++ * REFINE_INTERP_LOG=1 prints once a second what was paired and blended, =2 also follows one moving draw.
++ * ---------------------------------------------------------------------------*/
++volatile long  g_port_draw_interp;   /* this guest frame is a menu frame drawn between ticks */
++volatile float g_port_draw_alpha;    /* phase since the last tick, 0..1 */
++volatile long  g_port_draw_tick;     /* this guest frame ran the game's logic */
++volatile long  g_port_draw_ticks;    /* ticks so far */
++volatile long  g_port_draw_seq;      /* guest frame number */
++static int s_present_this_frame;     /* defined further down: this render_frame presents */
++
++#define IX_VSTRIDE 256u                          /* VP_VERT_STRIDE, defined further down */
++#define IX_CBF  (RSX_MAX_VERTEX_CONSTANTS * 4)   /* vertex-program constant floats per block */
++#define IX_CBW  (RSX_MAX_VERTEX_CONSTANTS / 32)  /* words of the changed-register mask */
++#define IX_FPF  (VP_FPCB_STRIDE / 4)             /* fragment-program constant floats per draw */
++#define IX_HIST 4                                /* render_frame batches of one guest frame */
++#define IX_MAXV (16u << 20)                      /* a batch with more vertex bytes is not blended */
++#define IX_RANK 16                               /* how far in a row of alike draws a pair is looked for */
++#define IX_RING 32                               /* guest frames remembered */
++
++typedef struct { u64 h, ch, ih; u32 vo, vn, fn, cbk; float jump; u16 am; } IxSig;  /* state hash, content hash, vertex
++                                    range, fp floats, constant block, largest believable move in one tick,
++                                    the vertex attributes the guest enabled (the other slots hold their defaults),
++                                    ih: the texture coordinates (attributes 8-15), what the draw shows */
++typedef struct {
++    u32 n, vbytes, nblk, cap_n, cap_v, cap_b;
++    IxSig* sig; u8* vb; float* cb; float* fp;
++} IxFrame;
++typedef struct {
++    IxFrame a, b;            /* the state before, the last state */
++    int* map;                /* draw of b -> its pair in a, -1 = none */
++    u16* vmask;              /* draw of b: vertex slots that changed from its pair */
++    u32* cmask;              /* draw of b: IX_CBW words, the constant registers that changed */
++    u8*  fdiff;              /* draw of b: its fragment constants changed */
++    u8*  vol;                /* draw of b: not seen in the frame after (it moves on its own), or a duplicate */
++    u8*  seen;               /* draw of b: seen in this frame */
++    int* tab; u32 tab_n;     /* b's draws by content hash, open addressing, index + 1 */
++    u32  cap;
++    int  ticks;              /* states held (2: a and b) */
++    int  since;              /* frames since b came */
++    long tick_seq;           /* the guest tick that made b; 0 = none known */
++    double base;             /* the game's clock (in ticks) of b's state */
++    float last_t;
++} IxHist;
++
++static struct {
++    int on, off, log, parts;
++    float rg[4]; int rg_on, rg_lines;   /* REFINE_INTERP_REGION (diagnostic): draws whose first vertex is in it */   /* parts: REFINE_INTERP_PARTS, diagnostic: 1 vertices, 2 vp constants, 4 fp constants */
++    u8* w_vb; float* w_cb; u64* w_cbh; u32* w_cbk; float* w_fp; u32* w_fn; u64* w_call; u16* w_am;
++    u32 nblk; const void* cb_state;
++    IxHist h[IX_HIST];
++    long seq; int batch, since_present;
++    struct { long seq, ticks; float alpha; u8 tick; } ring[IX_RING];
++    float lag;               /* frames between a guest frame and its draws here, measured at each new state */
++    int *g_tab, *g_first, *g_list, *g_gid, *g_seen, *g_bg, *g_br, *g_cnt, *g_nxt, *g_ctab; u8* used; u32 g_cap, g_tab_n;   /* pairing scratch */
++    int trk, traced;         /* REFINE_INTERP_LOG=2: one moving draw (its index in b) followed frame by frame */
++    /* REFINE_INTERP_LOG, per second */
++    double t0, cost, part[6]; u32 frames, states, batches, draws, found, moving, blended, paired, jumped, big, untimed;
++    u32 slot[16], creg_draws, fp_draws;
++} s_ix;
++
++static void ix_latch(void)
++{
++    int want = g_port_draw_interp && !s_ix.off;
++    if (want && !s_ix.w_vb) {
++        const char* e = getenv("REFINE_INTERP_LOG");
++        s_ix.log = e ? (*e == '2' ? 2 : 1) : -1; s_ix.trk = -1; s_ix.lag = 1.0f;
++        { const char* pp = getenv("REFINE_INTERP_PARTS"); s_ix.parts = pp ? atoi(pp) : 7; }
++        { const char* rg = getenv("REFINE_INTERP_REGION");
++          if (rg && sscanf(rg, "%f:%f:%f:%f", &s_ix.rg[0], &s_ix.rg[1], &s_ix.rg[2], &s_ix.rg[3]) == 4) s_ix.rg_on = 1; }
++        /* Reserved and committed once; the system gives pages only to what a frame writes. */
++        s_ix.w_vb = (u8*)VirtualAlloc(NULL, (SIZE_T)MAX_VERTICES * IX_VSTRIDE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++        s_ix.w_cb = (float*)VirtualAlloc(NULL, (SIZE_T)MAX_DRAWS * IX_CBF * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++        s_ix.w_fp = (float*)VirtualAlloc(NULL, (SIZE_T)MAX_DRAWS * IX_FPF * 4, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
++        s_ix.w_cbh = (u64*)calloc(MAX_DRAWS, sizeof(u64));
++        s_ix.w_cbk = (u32*)calloc(MAX_DRAWS, sizeof(u32));
++        s_ix.w_fn = (u32*)calloc(MAX_DRAWS, sizeof(u32));
++        s_ix.w_call = (u64*)calloc(MAX_DRAWS, sizeof(u64));
++        s_ix.w_am = (u16*)calloc(MAX_DRAWS, sizeof(u16));
++        if (!s_ix.w_vb || !s_ix.w_cb || !s_ix.w_fp || !s_ix.w_cbh || !s_ix.w_cbk || !s_ix.w_fn || !s_ix.w_call || !s_ix.w_am) {
++            fprintf(stderr, "[interp] out of memory for the menu frame copies: menus drawn at the ticks only\n");
++            s_ix.off = 1; want = 0;
++        } else fprintf(stderr, "[interp] menus drawn between ticks (REFINE_MENU_INTERP=0 turns it off)\n");
++    }
++    s_ix.on = want;
++}
++
++/* Where the VP vertex uploads of this batch go: the latch is taken at the batch's first upload. */
++static u8* vp_vb_base(void)
++{
++    if (s_d3d.vp_vb_offset == 0) ix_latch();
++    return s_ix.on ? s_ix.w_vb
++                   : (u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * MAX_VERTICES * IX_VSTRIDE;
++}
++
++/* The primitive and vertex count of each draw call folded into its record (merged batches too). */
++static void ix_note_call(u32 dc0, u32 prim, u32 count)
++{
++    if (!s_ix.on) return;
++    const u64 k = (((u64)prim << 32) ^ count) + 1;
++    u16 am = 0;
++    if (s_d3d.current_rsx_state)
++        for (int a = 0; a < 16; a++) if (s_d3d.current_rsx_state->vertex_attribs[a].enabled) am |= (u16)(1u << a);
++    if (s_d3d.draw_count > dc0 && s_d3d.draw_count <= MAX_DRAWS) {
++        s_ix.w_call[s_d3d.draw_count - 1] = k * 0x9E3779B97F4A7C15ull;
++        s_ix.w_am[s_d3d.draw_count - 1] = am;
++    } else if (dc0 && dc0 <= MAX_DRAWS) {
++        s_ix.w_call[dc0 - 1] = (s_ix.w_call[dc0 - 1] ^ k) * 0x9E3779B97F4A7C15ull;
++        s_ix.w_am[dc0 - 1] |= am;
++    }
++}
++
++static u64 ix_mix(u64 h, u64 v) { h ^= v; h *= 0x100000001B3ull; h ^= h >> 29; return h; }
++
++/* Four independent chains, so the multiplies overlap: a frame's vertices are a megabyte or two. */
++static inline u64 ix_rotl(u64 x, int r) { return (x << r) | (x >> (64 - r)); }
++static u64 ix_hash(const void* p, u32 n, u64 h)
++{
++    const u64 K = 0x9E3779B97F4A7C15ull;
++    const u8* b = (const u8*)p;
++    u64 a0 = h, a1 = h ^ 0xC2B2AE3D27D4EB4Full, a2 = h ^ 0x165667B19E3779F9ull, a3 = h ^ 0x27D4EB2F165667C5ull;
++    u32 i = 0;
++    for (; i + 32 <= n; i += 32) {
++        u64 w0, w1, w2, w3;
++        memcpy(&w0, b + i, 8); memcpy(&w1, b + i + 8, 8); memcpy(&w2, b + i + 16, 8); memcpy(&w3, b + i + 24, 8);
++        a0 = ix_rotl((a0 ^ w0) * K, 29); a1 = ix_rotl((a1 ^ w1) * K, 29);
++        a2 = ix_rotl((a2 ^ w2) * K, 29); a3 = ix_rotl((a3 ^ w3) * K, 29);
++    }
++    for (; i + 8 <= n; i += 8) { u64 w; memcpy(&w, b + i, 8); a0 = ix_rotl((a0 ^ w) * K, 29); }
++    for (; i < n; i++) a0 = (a0 ^ b[i]) * 0x100000001B3ull;
++    u64 r = a0 ^ ix_rotl(a1, 17) ^ ix_rotl(a2, 31) ^ ix_rotl(a3, 47) ^ n;
++    r = (r ^ (r >> 33)) * 0xFF51AFD7ED558CCDull;
++    return r ^ (r >> 33);
++}
++
++/* The enabled slots of nv vertices (the others are the defaults read_vp_vertex writes). */
++static u64 ix_hash_verts(const u8* p, u32 nv, u16 am, u64 h)
++{
++    const u64 K = 0x9E3779B97F4A7C15ull;
++    int sl[16], m = 0;
++    for (int a = 0; a < 16; a++) if (am & (1u << a)) sl[m++] = a;
++    u64 a0 = h, a1 = h ^ 0xC2B2AE3D27D4EB4Full, a2 = h ^ 0x165667B19E3779F9ull, a3 = h ^ 0x27D4EB2F165667C5ull;
++    for (u32 v = 0; v < nv; v++) {
++        const u8* q = p + (u64)v * IX_VSTRIDE;
++        int k = 0;
++        for (; k + 2 <= m; k += 2) {
++            u64 w0, w1, w2, w3;
++            memcpy(&w0, q + sl[k] * 16, 8); memcpy(&w1, q + sl[k] * 16 + 8, 8);
++            memcpy(&w2, q + sl[k + 1] * 16, 8); memcpy(&w3, q + sl[k + 1] * 16 + 8, 8);
++            a0 = ix_rotl((a0 ^ w0) * K, 29); a1 = ix_rotl((a1 ^ w1) * K, 29);
++            a2 = ix_rotl((a2 ^ w2) * K, 29); a3 = ix_rotl((a3 ^ w3) * K, 29);
++        }
++        if (k < m) {
++            u64 w0, w1;
++            memcpy(&w0, q + sl[k] * 16, 8); memcpy(&w1, q + sl[k] * 16 + 8, 8);
++            a0 = ix_rotl((a0 ^ w0) * K, 29); a1 = ix_rotl((a1 ^ w1) * K, 29);
++        }
++    }
++    u64 r = a0 ^ ix_rotl(a1, 17) ^ ix_rotl(a2, 31) ^ ix_rotl(a3, 47) ^ ((u64)nv << 16 | am);
++    r = (r ^ (r >> 33)) * 0xFF51AFD7ED558CCDull;
++    return r ^ (r >> 33);
++}
++
++/* vp_record_cb: draw slot's vertex-program constants, a new block only when the guest wrote any since the last. */
++static void ix_note_constants(u32 slot, const rsx_state* st)
++{
++    if (!s_ix.on || slot >= MAX_DRAWS) return;
++    if (!s_ix.nblk || st != s_ix.cb_state || st->vertex_constants_dirty) {
++        if (s_ix.nblk >= MAX_DRAWS) { s_ix.w_cbk[slot] = s_ix.nblk - 1; return; }   /* cannot happen: one per draw at most */
++        float* b = s_ix.w_cb + (u64)s_ix.nblk * IX_CBF;
++        memcpy(b, st->vertex_constants, IX_CBF * 4);
++        s_ix.w_cbh[s_ix.nblk] = ix_hash(b, IX_CBF * 4, 0x84222325CBF29CE4ull);
++        ((rsx_state*)st)->vertex_constants_dirty = 0;   /* read by nothing else (rsx_commands.c sets it) */
++        s_ix.cb_state = st;
++        s_ix.nblk++;
++    }
++    s_ix.w_cbk[slot] = s_ix.nblk - 1;
++}
++
++/* Draw d of this batch as recorded: its state, and its content in the w_ copies. */
++static void ix_sig(const D3D12DrawRecord* dr, u32 d, u32 vbytes, IxSig* s)
++{
++    u64 h = 0xCBF29CE484222325ull;
++    h = ix_mix(h, (u64)(dr->is_vp & 1) | (u64)(dr->is_clear & 1) << 1 | (u64)(dr->indexed & 1) << 2
++                  | (u64)dr->topology << 8 | (u64)(u32)dr->vs_idx << 32);
++    h = ix_mix(h, (u64)dr->fp_addr << 32 | dr->fp_ctrl);
++    h = ix_mix(h, (u64)dr->rt_off << 32 | dr->blend_key);
++    h = ix_mix(h, (u64)dr->alpha_ctl << 32 | (u64)dr->cmask << 1 | (u64)(dr->blend & 1));
++    h = ix_mix(h, (u64)dr->vertex_count << 32 | dr->index_count);
++    h = ix_mix(h, dr->zs_key);
++    h = ix_mix(h, (u64)dr->cull << 32 | dr->stencil_ref);
++    h = ix_mix(h, (u64)dr->vp_x << 48 | (u64)dr->vp_y << 32 | (u64)dr->vp_w << 16 | dr->vp_h);
++    if (!dr->is_clear) h = ix_mix(h, s_ix.w_call[d] ^ (u64)s_ix.w_am[d] << 48);   /* clears have no draw call */
++    h = ix_mix(h, dr->tex_mask);
++    for (u32 u = 0; u < RSX_FP_TEX_UNITS; u++) {
++        if (!(dr->tex_mask & (1u << u))) continue;
++        h = ix_mix(h, (u64)dr->tex[u].raw << 32 | dr->tex[u].off);
++        h = ix_mix(h, (u64)dr->tex[u].fmt << 32 | (u64)dr->tex[u].w << 16 | dr->tex[u].h);
++    }
++    s->h = h;
++    s->vo = s->vn = s->fn = s->cbk = 0; s->am = dr->is_clear ? 0 : s_ix.w_am[d];
++    s->jump = 1e30f;
++    s->ch = h; s->ih = h;
++    if (!dr->is_vp || dr->is_clear || dr->cb_slot != d || s_ix.w_cbk[d] >= s_ix.nblk) return;
++    const u64 end = (u64)dr->vb_byte_offset + (u64)dr->vertex_count * IX_VSTRIDE;
++    if (end > vbytes) return;
++    s->vo = dr->vb_byte_offset; s->vn = dr->vertex_count * IX_VSTRIDE;
++    s->fn = s_ix.w_fn[d];
++    s->cbk = s_ix.w_cbk[d];
++    const u32 big = dr->vp_w > dr->vp_h ? dr->vp_w : dr->vp_h;
++    if (big) s->jump = (float)big / 3.0f;
++    u64 c = ix_hash_verts(s_ix.w_vb + s->vo, s->vn / IX_VSTRIDE, s->am, h);
++    c = ix_mix(c, s_ix.w_cbh[s->cbk]);
++    if (s->fn) c = ix_hash(s_ix.w_fp + (u64)d * IX_FPF, s->fn * 4, c);
++    s->ch = c;
++    s->ih = (s->am & 0xFF00u) ? ix_hash_verts(s_ix.w_vb + s->vo, s->vn / IX_VSTRIDE, (u16)(s->am & 0xFF00u), h) : h;
++}
++
++static int ix_same(const IxSig* a, const IxSig* b) { return a->h == b->h && a->vn == b->vn && a->fn == b->fn; }
++
++static int ix_grow(void** p, u64 bytes)
++{
++    void* q = realloc(*p, bytes ? bytes : 1);
++    if (!q) return 0;
++    *p = q; return 1;
++}
++
++static u32 ix_pow2(u32 n) { u32 m = 64; while (m < n * 2) m <<= 1; return m; }
++
++/* f = this batch as recorded (the w_ copies). */
++static int ix_frame_set(IxFrame* f, u32 n, u32 vbytes, const IxSig* sig)
++{
++    const u32 nb = s_ix.nblk;
++    if (n > f->cap_n) {
++        if (!ix_grow((void**)&f->sig, (u64)n * sizeof(IxSig)) || !ix_grow((void**)&f->fp, (u64)n * IX_FPF * 4)) return 0;
++        f->cap_n = n;
++    }
++    if (nb > f->cap_b) {
++        if (!ix_grow((void**)&f->cb, (u64)nb * IX_CBF * 4)) return 0;
++        f->cap_b = nb;
++    }
++    if (vbytes > f->cap_v) {
++        if (!ix_grow((void**)&f->vb, vbytes)) return 0;
++        f->cap_v = vbytes;
++    }
++    f->n = n; f->vbytes = vbytes; f->nblk = nb;
++    memcpy(f->sig, sig, (size_t)n * sizeof(IxSig));
++    memcpy(f->vb, s_ix.w_vb, vbytes);
++    memcpy(f->cb, s_ix.w_cb, (size_t)nb * IX_CBF * 4);
++    for (u32 d = 0; d < n; d++) if (sig[d].fn) memcpy(f->fp + (u64)d * IX_FPF, s_ix.w_fp + (u64)d * IX_FPF, sig[d].fn * 4);
++    return 1;
++}
++
++static int ix_room(IxHist* H, u32 n)
++{
++    if (n > H->cap) {
++        if (!ix_grow((void**)&H->map, (u64)n * sizeof(int)) || !ix_grow((void**)&H->vmask, (u64)n * 2) ||
++            !ix_grow((void**)&H->cmask, (u64)n * IX_CBW * 4) || !ix_grow((void**)&H->fdiff, n) ||
++            !ix_grow((void**)&H->vol, n) || !ix_grow((void**)&H->seen, n)) return 0;
++        H->cap = n;
++    }
++    const u32 t = ix_pow2(n);
++    if (t > H->tab_n) {
++        if (!ix_grow((void**)&H->tab, (u64)t * sizeof(int))) return 0;
++        H->tab_n = t;
++    }
++    if (n > s_ix.g_cap) {
++        if (!ix_grow((void**)&s_ix.g_first, (u64)(n + 1) * sizeof(int)) || !ix_grow((void**)&s_ix.g_list, (u64)n * sizeof(int)) ||
++            !ix_grow((void**)&s_ix.g_gid, (u64)n * sizeof(int)) || !ix_grow((void**)&s_ix.g_seen, (u64)(n + 1) * sizeof(int)) ||
++            !ix_grow((void**)&s_ix.g_bg, (u64)n * sizeof(int)) || !ix_grow((void**)&s_ix.g_br, (u64)n * sizeof(int)) ||
++            !ix_grow((void**)&s_ix.g_cnt, (u64)(n + 1) * sizeof(int)) || !ix_grow((void**)&s_ix.g_nxt, (u64)n * sizeof(int)) ||
++            !ix_grow((void**)&s_ix.used, n)) return 0;
++        s_ix.g_cap = n;
++    }
++    if (t > s_ix.g_tab_n) {
++        if (!ix_grow((void**)&s_ix.g_tab, (u64)t * sizeof(int)) || !ix_grow((void**)&s_ix.g_ctab, (u64)t * sizeof(int))) return 0;
++        s_ix.g_tab_n = t;
++    }
++    return 1;
++}
++
++/* How far apart two alike draws are: the positions (attribute 0) of their vertices, and the largest move. */
++static float ix_apart(const IxFrame* A, int i, const IxFrame* B, int j, float* most)
++{
++    const float* pa = (const float*)(A->vb + A->sig[i].vo); const float* pb = (const float*)(B->vb + B->sig[j].vo);
++    const u32 nv = B->sig[j].vn / IX_VSTRIDE;
++    float sum = 0.0f, m = 0.0f;
++    for (u32 v = 0; v < nv; v++)
++        for (int c = 0; c < 3; c++) {
++            float d = pa[v * 64 + c] - pb[v * 64 + c];
++            d = d < 0.0f ? -d : d;
++            if (!(d == d)) d = 1e30f;
++            sum += d; if (d > m) m = d;
++        }
++    *most = m;
++    return sum;
++}
++
++/* The pair in the state before of each draw of the last state, in three passes (2026-11-11, the author's title
++ * screen: the blinking PRESS START and the copyright are the same program, font and quad size, and a greedy
++ * nearest match slid letters of one onto the other):
++ * 1. the same content anywhere (nothing moved): those are taken first, so no moving draw can claim them;
++ * 2. among draws alike in state (a group, in the order drawn; draw j, the r-th of its group in b, looks at the
++ *    group's draws in a ranked r - IX_RANK .. r + IX_RANK), the same texture coordinates (attributes 8-15: the
++ *    same letter, the same image) and the nearest position;
++ * 3. a group left with one draw without a pair on each side: those two (a sprite whose image scrolled).
++ * A pair that moved more than a third of the viewport is no pair (a list wrapping round). */
++static void ix_pair(IxHist* H)
++{
++    const IxFrame* A = &H->a; const IxFrame* B = &H->b;
++    int* tab = s_ix.g_tab; const u32 tm = s_ix.g_tab_n - 1;
++    int* first = s_ix.g_first;   /* group -> its first draw in a, then its start in g_list */
++    int* end = s_ix.g_seen;      /* group -> its end in g_list */
++    int* gid = s_ix.g_gid;       /* draw of a -> group */
++    int* bg = s_ix.g_bg;         /* draw of b -> group, -1 = none */
++    int* br = s_ix.g_br;         /* draw of b -> its rank in the group */
++    int* cnt = s_ix.g_cnt;       /* group -> counter */
++    int* nxt = s_ix.g_nxt;       /* draw of a -> next draw of a with the same content */
++    int* ctab = s_ix.g_ctab;     /* content hash -> first draw of a with it */
++    for (u32 k = 0; k <= tm; k++) { tab[k] = -1; ctab[k] = -1; }
++    u32 ng = 0;
++    for (u32 i = 0; i < A->n; i++) {
++        u32 k = (u32)(A->sig[i].h ^ A->sig[i].h >> 32) & tm;
++        while (tab[k] >= 0 && A->sig[first[tab[k]]].h != A->sig[i].h) k = (k + 1) & tm;
++        if (tab[k] < 0) { tab[k] = (int)ng; first[ng] = (int)i; end[ng] = 0; ng++; }
++        gid[i] = tab[k];
++        end[tab[k]]++;
++    }
++    {   int at = 0;
++        for (u32 g = 0; g < ng; g++) { const int c = end[g]; first[g] = at; end[g] = at; at += c; }
++        for (u32 i = 0; i < A->n; i++) s_ix.g_list[end[gid[i]]++] = (int)i;
++    }
++    memset(s_ix.used, 0, A->n);
++    for (u32 g = 0; g < ng; g++) cnt[g] = 0;
++    for (u32 j = 0; j < B->n; j++) {
++        H->map[j] = -1; bg[j] = -1;
++        if (!B->sig[j].vn) continue;
++        u32 k = (u32)(B->sig[j].h ^ B->sig[j].h >> 32) & tm;
++        while (tab[k] >= 0 && A->sig[s_ix.g_list[first[tab[k]]]].h != B->sig[j].h) k = (k + 1) & tm;
++        if (tab[k] < 0) continue;                               /* new in this state */
++        bg[j] = tab[k]; br[j] = cnt[tab[k]]++;
++    }
++    /* 1. the same content */
++    for (int i = (int)A->n - 1; i >= 0; i--) {
++        if (!A->sig[i].vn) continue;
++        u32 k = (u32)(A->sig[i].ch ^ A->sig[i].ch >> 32) & tm;
++        while (ctab[k] >= 0 && A->sig[ctab[k]].ch != A->sig[i].ch) k = (k + 1) & tm;
++        nxt[i] = ctab[k]; ctab[k] = i;
++    }
++    for (u32 j = 0; j < B->n; j++) {
++        if (bg[j] < 0) continue;
++        u32 k = (u32)(B->sig[j].ch ^ B->sig[j].ch >> 32) & tm;
++        while (ctab[k] >= 0 && A->sig[ctab[k]].ch != B->sig[j].ch) k = (k + 1) & tm;
++        for (int i = ctab[k]; i >= 0; i = nxt[i])
++            if (!s_ix.used[i] && ix_same(&A->sig[i], &B->sig[j])) { s_ix.used[i] = 1; H->map[j] = i; break; }
++    }
++    /* 2. the same image, the nearest */
++    for (u32 j = 0; j < B->n; j++) {
++        if (bg[j] < 0 || H->map[j] >= 0) continue;
++        const int g = bg[j];
++        int lo = first[g] + br[j] - IX_RANK, hi = first[g] + br[j] + IX_RANK;
++        if (lo < first[g]) lo = first[g];
++        if (hi > end[g] - 1) hi = end[g] - 1;
++        int best = -1; float bd = 0.0f, bm = 0.0f;
++        for (int q = lo; q <= hi; q++) {
++            const int i = s_ix.g_list[q];
++            if (s_ix.used[i] || A->sig[i].ih != B->sig[j].ih || !ix_same(&A->sig[i], &B->sig[j])) continue;
++            float m; const float d = ix_apart(A, i, B, (int)j, &m);
++            if (best < 0 || d < bd) { best = i; bd = d; bm = m; }
++        }
++        if (best < 0) continue;
++        if (bm > B->sig[j].jump) { if (s_ix.log > 0) s_ix.jumped++; continue; }   /* a wrap, not a move */
++        s_ix.used[best] = 1;
++        H->map[j] = best;
++    }
++    /* 3. one left on each side of a group */
++    int* ua = cnt;   /* reused: group -> draws without a pair, a's in the low 16 bits, b's above */
++    for (u32 g = 0; g < ng; g++) ua[g] = 0;
++    for (u32 i = 0; i < A->n; i++) if (!s_ix.used[i] && A->sig[i].vn) ua[gid[i]]++;
++    for (u32 j = 0; j < B->n; j++) if (bg[j] >= 0 && H->map[j] < 0) ua[bg[j]] += 1 << 16;
++    for (u32 j = 0; j < B->n; j++) {
++        if (bg[j] < 0 || H->map[j] >= 0 || ua[bg[j]] != (1 << 16 | 1)) continue;
++        const int g = bg[j];
++        for (int q = first[g]; q < end[g]; q++) {
++            const int i = s_ix.g_list[q];
++            if (s_ix.used[i] || !A->sig[i].vn || !ix_same(&A->sig[i], &B->sig[j])) continue;
++            float m; ix_apart(A, i, B, (int)j, &m);
++            if (m <= B->sig[j].jump) { s_ix.used[i] = 1; H->map[j] = i; }
++            break;
++        }
++    }
++}
++
++static void ix_diffs(IxHist* H)
++{
++    const IxFrame* A = &H->a; const IxFrame* B = &H->b;
++    for (u32 j = 0; j < B->n; j++) {
++        u16 vm = 0; u32* cm = H->cmask + (u64)j * IX_CBW; u8 fd = 0;
++        memset(cm, 0, IX_CBW * 4);
++        const int i = H->map[j];
++        if (i >= 0 && A->sig[i].ch != B->sig[j].ch) {
++            const u8* pa = A->vb + A->sig[i].vo; const u8* pb = B->vb + B->sig[j].vo;
++            const u16 am = B->sig[j].am;
++            for (u32 o = 0; o < B->sig[j].vn; o += IX_VSTRIDE)
++                for (u32 s = 0; s < 16; s++)
++                    if ((am & (1u << s)) && !(vm & (1u << s)) && memcmp(pa + o + s * 16, pb + o + s * 16, 16)) vm |= (u16)(1u << s);
++            const float* ca = A->cb + (u64)A->sig[i].cbk * IX_CBF; const float* cb = B->cb + (u64)B->sig[j].cbk * IX_CBF;
++            if (memcmp(ca, cb, IX_CBF * 4))
++                for (u32 r = 0; r < RSX_MAX_VERTEX_CONSTANTS; r++)
++                    if (memcmp(ca + r * 4, cb + r * 4, 16)) cm[r >> 5] |= 1u << (r & 31);
++            if (B->sig[j].fn && memcmp(A->fp + (u64)i * IX_FPF, B->fp + (u64)j * IX_FPF, B->sig[j].fn * 4)) fd = 1;
++        }
++        H->vmask[j] = vm; H->fdiff[j] = fd;
++    }
++    /* b's draws by content, for the frames that draw this state again; a second draw with the same content is
++     * found as the first, so only the first is looked for when telling a new state. */
++    const u32 tm = H->tab_n - 1;
++    for (u32 k = 0; k <= tm; k++) H->tab[k] = 0;
++    for (u32 j = 0; j < B->n; j++) {
++        H->vol[j] = 0; H->seen[j] = 0;
++        if (!B->sig[j].vn) { H->vol[j] = 1; continue; }
++        u32 k = (u32)(B->sig[j].ch ^ B->sig[j].ch >> 32) & tm;
++        while (H->tab[k] && B->sig[H->tab[k] - 1].ch != B->sig[j].ch) k = (k + 1) & tm;
++        if (H->tab[k]) H->vol[j] = 1; else H->tab[k] = (int)j + 1;
++    }
++}
++
++static int ix_find(const IxHist* H, const IxSig* s)
++{
++    const u32 tm = H->tab_n - 1;
++    u32 k = (u32)(s->ch ^ s->ch >> 32) & tm;
++    while (H->tab[k]) {
++        const int j = H->tab[k] - 1;
++        if (H->b.sig[j].ch == s->ch) return ix_same(&H->b.sig[j], s) ? j : -1;
++        k = (k + 1) & tm;
++    }
++    return -1;
++}
++
++static inline float ix_lerp(float a, float b, float t)
++{
++    const float r = a + (b - a) * t;
++    return (r == r && a - a == 0.0f && b - b == 0.0f) ? r : b;   /* inf / NaN: the last state's value */
++}
++
++/* The game's clock (in ticks) of guest frame g, if remembered. */
++static int ix_clock(long g, double* c)
++{
++    const int k = (int)(g & (IX_RING - 1));
++    if (s_ix.ring[k].seq != g) return 0;
++    *c = (double)s_ix.ring[k].ticks + s_ix.ring[k].alpha;
++    return 1;
++}
++
++/* The newest guest tick after `after` and not after `upto`, 0 = none. */
++static long ix_tick_since(long after, long upto)
++{
++    for (long g = upto; g > after && g > upto - IX_RING + 1; g--) {
++        const int k = (int)(g & (IX_RING - 1));
++        if (s_ix.ring[k].seq == g && s_ix.ring[k].tick) return g;
++    }
++    return 0;
++}
++
++static double ix_qpc(void) { LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f); return (double)c.QuadPart / (double)f.QuadPart; }
++#define IX_PART(i, t) do { if (s_ix.log > 0) { const double _n = ix_qpc(); s_ix.part[i] += _n - (t); (t) = _n; } } while (0)
++static void ix_log(void)
++{
++    LARGE_INTEGER qc, qf; QueryPerformanceCounter(&qc); QueryPerformanceFrequency(&qf);
++    const double now = (double)qc.QuadPart / (double)qf.QuadPart;
++    if (s_ix.t0 == 0.0) { s_ix.t0 = now; return; }
++    if (now - s_ix.t0 < 1.0) return;
++    const u32 f = s_ix.frames ? s_ix.frames : 1, t = s_ix.states ? s_ix.states : 1;
++    fprintf(stderr, "[interp] %.1f s: frames=%u batches=%u states=%u (untimed %u) lag=%.1f | per frame: draws=%u found=%u"
++                    " moving=%u blended=%u | per state: paired=%u jumped=%u, changed: vertex", now - s_ix.t0, s_ix.frames,
++            s_ix.batches, s_ix.states, s_ix.untimed, s_ix.lag, s_ix.draws / f, s_ix.found / f, s_ix.moving / f,
++            s_ix.blended / f, s_ix.paired / t, s_ix.jumped);
++    for (int k = 0; k < 16; k++) if (s_ix.slot[k]) fprintf(stderr, " a%d=%u", k, s_ix.slot[k]);
++    fprintf(stderr, ", vp constants=%u, fp constants=%u | big=%u | %.0f us/frame (copy %.0f sig %.0f find %.0f state %.0f blend %.0f)%c",
++            s_ix.creg_draws, s_ix.fp_draws, s_ix.big, s_ix.cost * 1e6 / f, s_ix.part[0] * 1e6 / f, s_ix.part[1] * 1e6 / f,
++            s_ix.part[2] * 1e6 / f, s_ix.part[3] * 1e6 / f, s_ix.part[4] * 1e6 / f, 10);
++    memset(s_ix.part, 0, sizeof s_ix.part);
++    memset(s_ix.slot, 0, sizeof s_ix.slot);
++    s_ix.frames = s_ix.states = s_ix.untimed = s_ix.batches = s_ix.draws = s_ix.found = s_ix.moving = s_ix.blended = 0;
++    s_ix.paired = s_ix.jumped = s_ix.big = s_ix.creg_draws = s_ix.fp_draws = 0;
++    s_ix.cost = 0.0;
++    s_ix.t0 = now;
++}
++
++/* A new state in b: the one before goes to a, pairs and changes worked out. */
++static int ix_new_state(IxHist* H, u32 n, u32 vbytes, const IxSig* sig, long seq)
++{
++    const IxFrame t = H->a; H->a = H->b; H->b = t;
++    const double old_base = H->base;
++    if (!ix_room(H, n) || !ix_frame_set(&H->b, n, vbytes, sig)) { H->ticks = 0; return 0; }
++    if (H->ticks < 2) H->ticks++;
++    H->since = 0; H->last_t = 0.0f;
++    /* Its time: the guest tick that made it, the newest since the last state's. A state with no tick behind it
++     * (something changed on its own) starts now on the game's clock. */
++    const long tk = ix_tick_since(H->tick_seq, seq);
++    double c;
++    if (tk) {
++        const int k = (int)(tk & (IX_RING - 1));
++        H->base = (double)s_ix.ring[k].ticks;
++        H->tick_seq = tk;
++        s_ix.lag = s_ix.lag * 0.75f + (float)(seq - tk) * 0.25f;
++    } else {
++        H->base = ix_clock(seq - (long)(s_ix.lag + 0.5f), &c) ? c : 0.0;
++        if (s_ix.log > 0) s_ix.untimed++;
++    }
++    /* Never blended from a state older than the tick before: frames this history did not see came between. */
++    if (H->ticks >= 2 && (H->base - old_base > 1.5 || H->base < old_base)) H->ticks = 1;
++    if (H->ticks < 2) {   /* the first state: nothing to pair yet, only its content table */
++        for (u32 j = 0; j < H->b.n; j++) H->map[j] = -1;
++        ix_diffs(H);
++        return 1;
++    }
++    ix_pair(H); ix_diffs(H);
++    if (s_ix.log > 1) {   /* REFINE_INTERP_LOG=2: draws whose vp and fp constants both changed */
++        static int shown;
++        for (u32 j = 0; j < H->b.n && shown < 24; j++) {
++            const int i = H->map[j];
++            if (i < 0 || !H->fdiff[j]) continue;
++            const u32* cm = H->cmask + (u64)j * IX_CBW; int any = 0;
++            for (u32 w = 0; w < IX_CBW; w++) if (cm[w]) any = 1;
++            if (!any) continue;
++            shown++;
++            const float* ca = H->a.cb + (u64)H->a.sig[i].cbk * IX_CBF; const float* cb = H->b.cb + (u64)H->b.sig[j].cbk * IX_CBF;
++            fprintf(stderr, "[interp] both j=%u i=%d vn=%u fn=%u vm=0x%X regs:", j, i, H->b.sig[j].vn / IX_VSTRIDE, H->b.sig[j].fn, H->vmask[j]);
++            int k = 0;
++            for (u32 r = 0; r < RSX_MAX_VERTEX_CONSTANTS && k < 4; r++) if (cm[r >> 5] & (1u << (r & 31))) { k++;
++                fprintf(stderr, " c%u a(%g %g %g %g) b(%g %g %g %g)", r, ca[r*4], ca[r*4+1], ca[r*4+2], ca[r*4+3], cb[r*4], cb[r*4+1], cb[r*4+2], cb[r*4+3]); }
++            const float* fa = H->a.fp + (u64)i * IX_FPF; const float* fb = H->b.fp + (u64)j * IX_FPF;
++            fprintf(stderr, " | fp:"); k = 0;
++            for (u32 c = 0; c < H->b.sig[j].fn && k < 8; c++) if (fa[c] != fb[c]) { k++; fprintf(stderr, " f%u %g->%g", c, fa[c], fb[c]); }
++            fprintf(stderr, "%c", 10);
++        }
++    }
++    if (s_ix.log > 0) {
++        s_ix.states++;
++        for (u32 j = 0; j < H->b.n; j++) {
++            if (H->map[j] < 0) continue;
++            s_ix.paired++;
++            const u32* cm = H->cmask + (u64)j * IX_CBW; int any = 0;
++            for (u32 w = 0; w < IX_CBW; w++) if (cm[w]) any = 1;
++            for (int k = 0; k < 16; k++) if (H->vmask[j] & (1u << k)) s_ix.slot[k]++;
++            s_ix.creg_draws += any; s_ix.fp_draws += H->fdiff[j];
++        }
++    }
++    if (s_ix.log > 1 && H == &s_ix.h[0]) {   /* follow the same draw into this state, or take the one that moved most */
++        int nt = -1; float most = 0.0f;
++        for (u32 j = 0; j < H->b.n; j++) {
++            if (H->map[j] < 0 || !(H->vmask[j] & 1u)) continue;
++            if (H->map[j] == s_ix.trk) { nt = (int)j; break; }
++            float m; ix_apart(&H->a, H->map[j], &H->b, (int)j, &m);
++            if (m > most) { most = m; nt = (int)j; }
++        }
++        s_ix.trk = nt;
++    }
++    return 1;
++}
++
++/* Start of render_frame: this batch's vertices to the upload heap, and its moving draws blended. */
++static void ix_apply_body(void)
++{
++    const u32 n = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
++    const u32 vbytes = s_d3d.vp_vb_offset;
++    u8* dst = (u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * MAX_VERTICES * IX_VSTRIDE;
++    double pt = s_ix.log > 0 ? ix_qpc() : 0.0;
++    memcpy(dst, s_ix.w_vb, vbytes);                       /* the batch as the game sent it */
++    IX_PART(0, pt);
++
++    const long seq = g_port_draw_seq;
++    if (seq != s_ix.seq) {
++        if (seq - s_ix.seq > 2 || seq < s_ix.seq)         /* back from frames not drawn this way */
++            for (int k = 0; k < IX_HIST; k++) { s_ix.h[k].ticks = 0; s_ix.h[k].tick_seq = 0; }
++        s_ix.seq = seq;
++        const int k = (int)(seq & (IX_RING - 1));
++        s_ix.ring[k].seq = seq; s_ix.ring[k].tick = (u8)(g_port_draw_tick != 0);
++        s_ix.ring[k].ticks = g_port_draw_ticks; s_ix.ring[k].alpha = g_port_draw_alpha;
++        if (s_ix.log > 0) s_ix.frames++;
++    }
++    /* A history per batch of a frame: the batches since the last one presented (F's menus: one, presented). */
++    s_ix.batch = s_ix.since_present;
++    s_ix.since_present = s_present_this_frame ? 0 : s_ix.since_present + 1;
++    if (s_ix.log > 0) { s_ix.batches++; ix_log(); }
++    if (s_ix.batch >= IX_HIST) return;
++    IxHist* H = &s_ix.h[s_ix.batch];
++    if (vbytes > IX_MAXV) { H->ticks = 0; if (s_ix.log > 0) s_ix.big++; return; }
++
++    static IxSig sig[MAX_DRAWS];
++    static int found_j[MAX_DRAWS];
++    for (u32 d = 0; d < n; d++) ix_sig(&s_d3d.draws[d], d, vbytes, &sig[d]);
++    IX_PART(1, pt);
++
++    /* A new state? Draws of b that stayed the same until the last frame no longer come. */
++    int fresh = H->ticks == 0;
++    if (!fresh) {
++        for (u32 j = 0; j < H->b.n; j++) H->seen[j] = 0;
++        for (u32 d = 0; d < n; d++) {
++            found_j[d] = sig[d].vn ? ix_find(H, &sig[d]) : -1;
++            if (found_j[d] >= 0) H->seen[found_j[d]] = 1;
++        }
++        H->since++;
++        if (H->since == 1) {   /* a frame after a state never holds the next: what changed moves on its own */
++            for (u32 j = 0; j < H->b.n; j++) if (!H->seen[j]) H->vol[j] = 1;
++        } else {
++            for (u32 j = 0; j < H->b.n && !fresh; j++) if (!H->vol[j] && !H->seen[j]) fresh = 1;
++            /* A tick that changed nothing seen here: its time is taken all the same, a few frames on. */
++            if (!fresh && ix_tick_since(H->tick_seq, seq - (long)(s_ix.lag + 0.5f) - 3)) fresh = 1;
++        }
++    }
++    IX_PART(2, pt);
++    if (fresh) {
++        if (!ix_new_state(H, n, vbytes, sig, seq)) return;
++        for (u32 d = 0; d < n; d++) found_j[d] = sig[d].vn ? ix_find(H, &sig[d]) : -1;
++    }
++    IX_PART(3, pt);
++    if (H->ticks < 2) return;
++
++    /* The phase: the game's clock of the frame being drawn here, from the state's tick; never backwards. */
++    double c; float t = 1.0f;
++    if (ix_clock(seq - (long)(s_ix.lag + 0.5f), &c)) t = (float)(c - H->base);
++    t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
++    if (t < H->last_t) t = H->last_t;
++    H->last_t = t;
++
++    const IxFrame* A = &H->a; const IxFrame* B = &H->b;
++    u32 found = 0, moving = 0, blended = 0;
++    static long rg_from = -1;
++    if (rg_from < 0) { const char* f = getenv("REFINE_INTERP_REGION_FROM"); rg_from = f ? atol(f) : 0; }
++    if (s_ix.rg_on && s_ix.batch == 0 && s_ix.rg_lines < 4000 && seq >= rg_from) {
++        for (u32 d = 0; d < n; d++) {
++            if (!sig[d].vn) continue;
++            const float* w = (const float*)(s_ix.w_vb + sig[d].vo);
++            if (w[0] < s_ix.rg[0] || w[0] > s_ix.rg[2] || w[1] < s_ix.rg[1] || w[1] > s_ix.rg[3]) continue;
++            s_ix.rg_lines++;
++            const int j = found_j[d], i = j >= 0 ? H->map[j] : -1;
++            fprintf(stderr, "[interp] region seq=%ld since=%d t=%.3f d=%u nv=%u am=0x%X j=%d i=%d vm=0x%X fd=%d pos(%.1f,%.1f) col(%.3f %.3f %.3f %.3f)",
++                    seq, H->since, t, d, sig[d].vn / IX_VSTRIDE, sig[d].am, j, i, j >= 0 ? H->vmask[j] : 0, j >= 0 ? H->fdiff[j] : 0,
++                    w[0], w[1], w[12], w[13], w[14], w[15]);
++            if (i >= 0) {
++                const float* a = (const float*)(A->vb + A->sig[i].vo);
++                fprintf(stderr, " | a pos(%.1f,%.1f) col(%.3f %.3f %.3f %.3f)", a[0], a[1], a[12], a[13], a[14], a[15]);
++            }
++            fprintf(stderr, "%c", 10);
++        }
++    }
++    for (u32 d = 0; d < n; d++) {
++        const int j = found_j[d];
++        if (j < 0) continue;                                 /* not the state's: as sent */
++        found++;
++        const int i = H->map[j];
++        if (i < 0) continue;
++        const u32* cm = H->cmask + (u64)j * IX_CBW; int any = 0;
++        for (u32 w = 0; w < IX_CBW; w++) if (cm[w]) { any = 1; break; }
++        const u16 vm = (s_ix.parts & 1) ? H->vmask[j] : 0; const u8 fd = (s_ix.parts & 4) ? H->fdiff[j] : 0;
++        if (!(s_ix.parts & 2)) any = 0;
++        if (!vm && !any && !fd) continue;
++        moving++;
++        const IxSig* sb = &B->sig[j]; const IxSig* sa = &A->sig[i];
++        if (memcmp(s_ix.w_vb + sig[d].vo, B->vb + sb->vo, 64)) continue;   /* a hash collision (64-bit: never seen) */
++        blended++;
++        if (s_ix.log > 1 && s_ix.batch == 0 && j == s_ix.trk && s_ix.traced < 240) {
++            const float* va = (const float*)(A->vb + sa->vo); const float* vb = (const float*)(B->vb + sb->vo);
++            s_ix.traced++;
++            fprintf(stderr, "[interp] trace seq=%ld since=%d t=%.3f x=%.2f y=%.2f (a %.2f,%.2f b %.2f,%.2f)%c", seq,
++                    H->since, t, ix_lerp(va[0], vb[0], t), ix_lerp(va[1], vb[1], t), va[0], va[1], vb[0], vb[1], 10);
++        }
++        if (vm) {
++            const float* va = (const float*)(A->vb + sa->vo); const float* vb = (const float*)(B->vb + sb->vo);
++            float* vo = (float*)(dst + sig[d].vo);
++            const u32 nv = sb->vn / IX_VSTRIDE;
++            for (u32 v = 0; v < nv; v++)
++                for (u32 s = 0; s < 16; s++) {
++                    if (!(vm & (1u << s))) continue;
++                    const u32 o = v * 64 + s * 4;
++                    float q[4];
++                    for (int k = 0; k < 4; k++) q[k] = ix_lerp(va[o + k], vb[o + k], t);
++                    memcpy(vo + o, q, 16);
++                }
++        }
++        const u32 slot = s_d3d.draws[d].cb_slot;
++        if (any && slot < MAX_DRAWS) {
++            const float* ca = A->cb + (u64)sa->cbk * IX_CBF; const float* cb = B->cb + (u64)sb->cbk * IX_CBF;
++            float* co = (float*)((char*)s_d3d.vp_cb_mapped + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE);
++            for (u32 r = 0; r < RSX_MAX_VERTEX_CONSTANTS; r++) {
++                if (!(cm[r >> 5] & (1u << (r & 31)))) continue;
++                float q[4];
++                for (int k = 0; k < 4; k++) q[k] = ix_lerp(ca[r * 4 + k], cb[r * 4 + k], t);
++                memcpy(co + r * 4, q, 16);
++            }
++        }
++        if (fd && slot < MAX_DRAWS && s_d3d.vp_fpcb_mapped) {
++            const float* fa = A->fp + (u64)i * IX_FPF; const float* fb = B->fp + (u64)j * IX_FPF;
++            float* fo = (float*)((char*)s_d3d.vp_fpcb_mapped + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_FPCB_STRIDE);
++            float q[IX_FPF];
++            for (u32 k = 0; k < sb->fn; k++) q[k] = ix_lerp(fa[k], fb[k], t);
++            memcpy(fo, q, sb->fn * 4);
++        }
++    }
++    IX_PART(4, pt);
++    if (s_ix.log > 0) { s_ix.draws += n; s_ix.found += found; s_ix.moving += moving; s_ix.blended += blended; }
++}
++
++static void ix_apply(void)
++{
++    if (!s_ix.on) return;
++    s_ix.on = 0;
++    if (s_ix.log <= 0) { ix_apply_body(); s_ix.nblk = 0; return; }
++    LARGE_INTEGER a, b, f; QueryPerformanceCounter(&a);
++    ix_apply_body();
++    s_ix.nblk = 0;
++    QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
++    s_ix.cost += (double)(b.QuadPart - a.QuadPart) / (double)f.QuadPart;
++}
++
+ static void vp_record_cb_body(u32 slot, int vs_idx, const D3D12DrawRecord* dr);
+ static void vp_record_cb(u32 slot, int vs_idx, const D3D12DrawRecord* dr)
+ {
+@@ -4184,6 +4923,7 @@
+ {
+     const rsx_state* st = s_d3d.current_rsx_state;
+     if (!s_d3d.vp_cb_mapped || !st || slot >= MAX_DRAWS) return;
++    if (s_ix.on) { s_ix.w_fn[slot] = 0; s_ix.w_cbk[slot] = 0xFFFFFFFFu; }
+     tex_race_init();
+     if (s_tr_f && dr) {
+         extern uint8_t* vm_base;
+@@ -4215,6 +4955,13 @@
+         /* More would not fit; vp_get_fp_pso refuses that program. */
+         const u32 n = k.count > VP_FPCB_MAX_K ? 0 : k.count;
+         if (n) memcpy(ts, k.values, n * 16u);
++        if (s_ix.on) {   /* Re:Fine 0175: the frame copy, read back by ix_apply */
++            float* w = s_ix.w_fp + (u64)slot * IX_FPF;
++            if (n) memcpy(w, k.values, n * 16u);
++            float* wa = w + (n ? n : 1u) * 4u;
++            wa[0] = dr ? (float)(dr->alpha_ctl & 0xFFu) / 255.0f : 0.0f; wa[1] = wa[2] = wa[3] = 0.0f;
++            s_ix.w_fn[slot] = ((n ? n : 1u) + 1u) * 4u;
++        }
+         float* a = ts + (n ? n : 1u) * 4u;
+         /* rsx_fp_apply_alpha_test_buffered compares against fp_alpha.x. y and z
+          * are the WPOS window convention; 0 leaves the host position, as before.
+@@ -4226,6 +4973,7 @@
+         + ((u64)s_d3d.vp_parity * MAX_DRAWS + slot) * VP_CB_STRIDE;
+     { FP_PART_BEGIN;
+       memcpy(dst, st->vertex_constants, RSX_MAX_VERTEX_CONSTANTS * 16);
++      ix_note_constants(slot, st);   /* Re:Fine 0175 */
+       FP_PART_END(2); }
+     /* VP_MVP=<N>: the constant bank as the shader will see it, for the first N
+      * draws. A snapshot taken from a stale rsx_state looks exactly like a broken
+@@ -5813,6 +6561,7 @@
+      * polygons). These workloads are a few draws/frame, so full serialisation
+      * costs little. */
+     wait_for_gpu();
++    ix_apply();              /* Re:Fine 0175: before anything reads this batch's vertices */
+     swap_chain_resize();
+     exclusive_apply();       /* Re:Fine 0167 */
+     render_height_apply();   /* Re:Fine 0161 */
+@@ -8044,8 +8793,7 @@
+     u32 quads = count / 4;
+     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+     if (quads * 6 > maxv) quads = maxv / 6;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    VPSlot* out = (VPSlot*)(vp_vb_base() + s_d3d.vp_vb_offset);
+     u32 o = 0;
+     for (u32 q = 0; q < quads; q++) {
+         VPSlot c[4][16];
+@@ -8081,8 +8829,7 @@
+             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
+                     state->shader_program, count, maxv, 10); }
+         count = maxv - (maxv % 3); }
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    VPSlot* out = (VPSlot*)(vp_vb_base() + s_d3d.vp_vb_offset);
+     { double _tv = perf_on() ? perf_now() : 0.0;
+       for (u32 k = 0; k < count; k++)
+           read_vp_vertex(state, first + k, &out[k*16]);
+@@ -8144,8 +8891,7 @@
+     u32 tris = count - 2;
+     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+     if (tris * 3 > maxv) tris = maxv / 3;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    VPSlot* out = (VPSlot*)(vp_vb_base() + s_d3d.vp_vb_offset);
+     u32 o = 0;
+     vc_begin_draw();
+     for (u32 t = 0; t < tris; t++) {
+@@ -8188,8 +8934,7 @@
+     u32 quads = count / 4;
+     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+     if (quads * 6 > maxv) quads = maxv / 6;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    VPSlot* out = (VPSlot*)(vp_vb_base() + s_d3d.vp_vb_offset);
+     u32 o = 0;
+     vc_begin_draw();
+     for (u32 q = 0; q < quads; q++) {
+@@ -8273,7 +9018,7 @@
+         s_ix_vbase  = s_d3d.vp_vb_offset / VP_VERT_STRIDE;
+         s_ix_nverts = 0;
+     }
+-    VPSlot* vb = (VPSlot*)((u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE);
++    VPSlot* vb = (VPSlot*)vp_vb_base();
+     u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)s_d3d.vp_parity * VP_MAX_INDICES + s_d3d.vp_ib_offset;
+     const int local = ((state->index_array_dma & 0xF) == 0);
+     const u8* ip = vm_base + cellGcmResolveLocated(local, state->index_array_offset);
+@@ -8319,8 +9064,7 @@
+             fprintf(stderr, "[VBFULL] fp=0x%X wanted %u verts, room for %u%c",
+                     state->shader_program, count, maxv, 10); }
+         count = maxv - (maxv % 3); }
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    VPSlot* out = (VPSlot*)(vp_vb_base() + s_d3d.vp_vb_offset);
+     { double _tv = perf_on() ? perf_now() : 0.0;
+       vc_begin_draw();
+       for (u32 k = 0; k < count; k++)
+@@ -8550,8 +9294,7 @@
+         fprintf(stderr, "[STRIP] restart enable=%d index=0x%X width=%d%c",
+                 state->restart_index_enable, state->restart_index, sixteen ? 16 : 32, 10); }
+     u32 maxv = (MAX_VERTICES * VP_VERT_STRIDE - s_d3d.vp_vb_offset) / VP_VERT_STRIDE;
+-    VPSlot* out = (VPSlot*)((u8*)s_d3d.vp_vb_mapped
+-        + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE + s_d3d.vp_vb_offset);
++    VPSlot* out = (VPSlot*)(vp_vb_base() + s_d3d.vp_vb_offset);
+     u32 o = 0;
+     vc_begin_draw();
+     for (u32 k = 0; k < count; k++) {
+@@ -8601,7 +9344,7 @@
+     s_strip.valid = 1; s_strip.epoch = state->begin_epoch; s_strip.next = first + count;
+     const int sixteen = (((state->index_array_dma >> 4) & 0xF) == 1);
+     const int restart = state->restart_index_enable && (!sixteen || state->restart_index <= 0xFFFFu);
+-    VPSlot* vb = (VPSlot*)((u8*)s_d3d.vp_vb_mapped + (u64)s_d3d.vp_parity * MAX_VERTICES * VP_VERT_STRIDE);
++    VPSlot* vb = (VPSlot*)vp_vb_base();
+     u32* ib = (u32*)s_d3d.vp_ib_mapped + (u64)s_d3d.vp_parity * VP_MAX_INDICES + s_d3d.vp_ib_offset;
+     u32 n = s_ix_nverts, o = 0;
+     for (u32 k = 0; k < count; k++) {
+@@ -9230,7 +9973,9 @@
+ {
+     FP_PART_BEGIN;
+     s_fetch.valid = 0;
++    const u32 dc0 = s_d3d.draw_count;
+     d3d12_draw_arrays(ud, primitive, first, count);
++    ix_note_call(dc0, primitive, count);   /* Re:Fine 0175 */
+     FP_PART_END(0);
+     FP_PART_END(4);
+ }
+@@ -9239,7 +9984,9 @@
+ {
+     FP_PART_BEGIN;
+     s_fetch.valid = 0;
++    const u32 dc0 = s_d3d.draw_count;
+     d3d12_draw_indexed(ud, primitive, first, count);
++    ix_note_call(dc0, primitive | 0x100u, count);   /* Re:Fine 0175 */
+     FP_PART_END(0);
+ }
+ 
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -94,6 +94,15 @@
+ /* Re:Fine 0173. Nonzero for a frame the game's logic does not step (the menus over 30 fps, src/main.cpp):
+  * cellPadGetData hands the game its last packet again, so a press is first seen on a step. */
+ extern volatile long g_port_pad_hold;
++/* Re:Fine 0175, set by the port at the start of each guest frame (src/main.cpp) for the D3D12 backend: draw
++ * this frame's menus between their last two states. The game's clock: g_port_draw_ticks ticks so far and
++ * g_port_draw_alpha (0..1) since the last; g_port_draw_tick = this frame ran a tick; g_port_draw_seq counts
++ * the frames. */
++extern volatile long  g_port_draw_interp;
++extern volatile float g_port_draw_alpha;
++extern volatile long  g_port_draw_tick;
++extern volatile long  g_port_draw_ticks;
++extern volatile long  g_port_draw_seq;
+ 
+ #ifdef __cplusplus
+ }

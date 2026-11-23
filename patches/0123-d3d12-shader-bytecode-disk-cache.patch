@@ -1,0 +1,386 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index ecb28419..679d2a64 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -51,6 +51,115 @@
+ #pragma comment(lib, "dxgi.lib")
+ #pragma comment(lib, "d3dcompiler.lib")
+ 
++/* Re:Fine 0123: every shader goes through the disk cache in rsx_shader_cache.h, so
++ * a second run compiles nothing. The bytecode comes from the game's microcode:
++ * it lives outside the repo, in %LOCALAPPDATA%\ReFine\shadercache, and is rebuilt
++ * from the game at will. REFINE_SHADER_CACHE=<dir> moves it, =off disables it.
++ * Only a pipeline-cache miss comes here: no cost on the draw path. */
++#include "rsx_shader_cache.h"
++#include <bcrypt.h>
++#pragma comment(lib, "bcrypt.lib")
++
++static wchar_t s_sc_dir[MAX_PATH];
++static uint64_t s_sc_compiler;
++static volatile LONG s_sc_hits, s_sc_compiles, s_sc_rejects;
++static double sc_now(void)
++{
++    LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c);
++    return (double)c.QuadPart / (double)f.QuadPart;
++}
++
++static BOOL CALLBACK sc_init(PINIT_ONCE once, PVOID arg, PVOID* ctx)
++{
++    (void)once; (void)arg; (void)ctx;
++    wchar_t env[MAX_PATH];
++    const DWORD n = GetEnvironmentVariableW(L"REFINE_SHADER_CACHE", env, MAX_PATH);
++    if (n && n < MAX_PATH) {
++        if (_wcsicmp(env, L"off") == 0) return TRUE;
++        wcscpy(s_sc_dir, env);
++        CreateDirectoryW(s_sc_dir, NULL);
++    } else {
++        const DWORD m = GetEnvironmentVariableW(L"LOCALAPPDATA", env, MAX_PATH);
++        if (!m || m >= MAX_PATH - 32) return TRUE;
++        swprintf(s_sc_dir, MAX_PATH, L"%ls\\ReFine", env);
++        CreateDirectoryW(s_sc_dir, NULL);
++        wcscat(s_sc_dir, L"\\shadercache");
++        CreateDirectoryW(s_sc_dir, NULL);
++    }
++    /* The compiler's build: a new d3dcompiler_47.dll must not reuse old output. */
++    const HMODULE dll = GetModuleHandleW(L"d3dcompiler_47.dll");
++    if (dll) {
++        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)dll;
++        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)((const u8*)dll + dos->e_lfanew);
++        s_sc_compiler = ((uint64_t)nt->FileHeader.TimeDateStamp << 32) | nt->OptionalHeader.SizeOfImage;
++    }
++    if (!s_sc_compiler) s_sc_dir[0] = 0;
++    return TRUE;
++}
++
++static int sc_key(const void* src, size_t len, const char* entry, const char* target,
++                  u32 flags1, u32 flags2, u8 key[32])
++{
++    BCRYPT_ALG_HANDLE alg = NULL; BCRYPT_HASH_HANDLE h = NULL; int ok = 0;
++    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0) return 0;
++    if (BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) == 0) {
++        const u32 sizes[4] = { (u32)len, (u32)strlen(entry), flags1, flags2 };
++        ok = BCryptHashData(h, (PUCHAR)sizes, sizeof sizes, 0) == 0 &&
++             BCryptHashData(h, (PUCHAR)&s_sc_compiler, sizeof s_sc_compiler, 0) == 0 &&
++             BCryptHashData(h, (PUCHAR)entry, (ULONG)strlen(entry), 0) == 0 &&
++             BCryptHashData(h, (PUCHAR)target, (ULONG)strlen(target) + 1, 0) == 0 &&
++             BCryptHashData(h, (PUCHAR)src, (ULONG)len, 0) == 0 &&
++             BCryptFinishHash(h, key, 32, 0) == 0;
++        BCryptDestroyHash(h);
++    }
++    BCryptCloseAlgorithmProvider(alg, 0);
++    return ok;
++}
++
++/* D3DCompile's signature, without its macros and include handler (no call passes any). */
++static HRESULT sc_compile(const void* src, SIZE_T len, const char* name, const void* defs,
++                          void* incl, const char* entry, const char* target, UINT f1, UINT f2,
++                          ID3DBlob** code, ID3DBlob** err)
++{
++    static INIT_ONCE once = INIT_ONCE_STATIC_INIT;
++    InitOnceExecuteOnce(&once, sc_init, NULL, NULL);
++    static int en = -1; if (en < 0) en = getenv("PSO_TIME") ? 1 : 0;
++    const double t0 = sc_now();
++    wchar_t path[MAX_PATH + 72]; u8 key[32];
++    const int cached = s_sc_dir[0] && sc_key(src, len, entry, target, f1, f2, key);
++    if (cached) {
++        wchar_t* w = path + swprintf(path, MAX_PATH, L"%ls\\", s_sc_dir);
++        for (int i = 0; i < 32; i++) w += swprintf(w, 3, L"%02x", key[i]);
++        wcscpy(w, L".dxbc");
++        void* data = NULL; u32 size = 0;
++        const int rc = rsx_sc_load(path, key, s_sc_compiler, &data, &size);
++        if (rc == RSX_SC_HIT) {
++            const HRESULT hr = D3DCreateBlob(size, code);
++            if (SUCCEEDED(hr)) memcpy((*code)->lpVtbl->GetBufferPointer(*code), data, size);
++            free(data);
++            if (SUCCEEDED(hr)) {
++                InterlockedIncrement(&s_sc_hits);
++                if (en) { fprintf(stderr, "[SHC] hit %s %s ms=%.2f%c", name, target, (sc_now() - t0) * 1000.0, 10); fflush(stderr); }
++                return S_OK;
++            }
++        } else if (rc == RSX_SC_REJECTED) {
++            InterlockedIncrement(&s_sc_rejects);
++            fprintf(stderr, "[SHC] rejected %s %s: compiling again%c", name, target, 10);
++        }
++    }
++    const HRESULT hr = D3DCompile(src, len, name, (const D3D_SHADER_MACRO*)defs, (ID3DInclude*)incl,
++                                  entry, target, f1, f2, code, err);
++    InterlockedIncrement(&s_sc_compiles);
++    if (cached && SUCCEEDED(hr) && *code &&
++        !rsx_sc_store(path, key, s_sc_compiler, (*code)->lpVtbl->GetBufferPointer(*code),
++                      (u32)(*code)->lpVtbl->GetBufferSize(*code))) {
++        static int told;
++        if (!told) { told = 1; fprintf(stderr, "[SHC] could not write the cache%c", 10); }
++    }
++    if (en) { fprintf(stderr, "[SHC] compile %s %s ms=%.2f%c", name, target, (sc_now() - t0) * 1000.0, 10); fflush(stderr); }
++    return hr;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Constants
+  * -----------------------------------------------------------------------*/
+@@ -1098,7 +1207,7 @@ static int init_d3d12(u32 width, u32 height)
+         ID3DBlob* ps_blob = NULL;
+         ID3DBlob* err = NULL;
+ 
+-        hr = D3DCompile(vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL, NULL,
++        hr = sc_compile(vs_hlsl, sizeof(vs_hlsl) - 1, "vs_basic", NULL, NULL,
+                         "main", "vs_5_0", 0, 0, &vs_blob, &err);
+         if (FAILED(hr)) {
+             printf("[D3D12] VS compile failed: %s\n",
+@@ -1106,7 +1215,7 @@ static int init_d3d12(u32 width, u32 height)
+             if (err) err->lpVtbl->Release(err);
+         }
+ 
+-        hr = D3DCompile(ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL, NULL,
++        hr = sc_compile(ps_hlsl, sizeof(ps_hlsl) - 1, "ps_basic", NULL, NULL,
+                         "main", "ps_5_0", 0, 0, &ps_blob, &err);
+         if (FAILED(hr)) {
+             printf("[D3D12] PS compile failed: %s\n",
+@@ -1207,9 +1316,9 @@ static int init_d3d12(u32 width, u32 height)
+                 "  return float4(i.col.rgb, i.col.a * cov); }\n";
+ 
+             ID3DBlob *vtb = NULL, *ptb = NULL, *e2 = NULL;
+-            hr = D3DCompile(vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, NULL, "main", "vs_5_0", 0, 0, &vtb, &e2);
++            hr = sc_compile(vs_tex, sizeof(vs_tex) - 1, "vs_tex", NULL, NULL, "main", "vs_5_0", 0, 0, &vtb, &e2);
+             if (FAILED(hr)) printf("[D3D12] VS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
+-            hr = D3DCompile(ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, NULL, "main", "ps_5_0", 0, 0, &ptb, &e2);
++            hr = sc_compile(ps_tex, sizeof(ps_tex) - 1, "ps_tex", NULL, NULL, "main", "ps_5_0", 0, 0, &ptb, &e2);
+             if (FAILED(hr)) printf("[D3D12] PS(tex) compile failed: %s\n", e2 ? (const char*)e2->lpVtbl->GetBufferPointer(e2) : "?");
+ 
+             if (vtb && ptb) {
+@@ -1864,9 +1973,9 @@ static void compile_vp(void)
+         "  if (cov <= 0.5) discard; return float4(i.col0.rgb, 1); }\n";
+ 
+     ID3DBlob *vb=NULL,*pb=NULL,*e=NULL;
+-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "vp", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &e);
++    HRESULT hr = sc_compile(hlsl, strlen(hlsl), "vp", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &e);
+     if (FAILED(hr)) { printf("[VP] VS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
+-    hr = D3DCompile(ps, sizeof(ps)-1, "vpps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &e);
++    hr = sc_compile(ps, sizeof(ps)-1, "vpps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &e);
+     if (FAILED(hr)) { printf("[VP] PS compile FAIL: %s\n", e?(const char*)e->lpVtbl->GetBufferPointer(e):"?"); if(e)e->lpVtbl->Release(e); if(vb)vb->lpVtbl->Release(vb); s_d3d.vp_compiled_bytes=st->vp_ucode_bytes; return; }
+ 
+     /* The decompiled VS declares inputs a0:ATTR0 .. a15:ATTR15 and the HLSL
+@@ -1928,7 +2037,7 @@ static void compile_vp(void)
+             "  float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7; };\n"
+             "float4 main(PSIn i):SV_TARGET{ return float4(i.col0.rgb, 1); }\n";
+         ID3DBlob *pcb=NULL,*ec=NULL;
+-        if (SUCCEEDED(D3DCompile(ps_col, sizeof(ps_col)-1, "vppsc", NULL, NULL,
++        if (SUCCEEDED(sc_compile(ps_col, sizeof(ps_col)-1, "vppsc", NULL, NULL,
+                                  "main", "ps_5_0", 0, 0, &pcb, &ec)) && pcb) {
+             pd.PS.pShaderBytecode = pcb->lpVtbl->GetBufferPointer(pcb);
+             pd.PS.BytecodeLength  = pcb->lpVtbl->GetBufferSize(pcb);
+@@ -2104,7 +2213,7 @@ static int vp_get_vs(const rsx_state* st)
+     shader_dump("vs", hash, hlsl);
+     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
+     const double t_vs = perf_now();
+-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
++    HRESULT hr = sc_compile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
+                             "main", "vs_5_0", 0, 0, &vb, &e);
+     compile_time("VST", &s_vs_time, 0, hash, SUCCEEDED(hr), 0.0, perf_now() - t_vs, 0.0);
+     if (e) e->lpVtbl->Release(e);
+@@ -2833,7 +2942,7 @@ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, in
+     shader_dump("ps", uhash, hlsl);
+     ID3DBlob* pb = NULL; ID3DBlob* e = NULL;
+     t_dxc = perf_now();
+-    HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
++    HRESULT hr = sc_compile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
+                             "main", "ps_5_0", 0, 0, &pb, &e);
+     t_obj = perf_now();
+     if (FAILED(hr) || !pb) {
+@@ -4322,8 +4431,8 @@ static int dsconv_init(void)
+         "    return float4((d >> 8) & 255u, d & 255u, s & 255u, d >> 16) / 255.0;\n"
+         "}\n";
+     ID3DBlob *vb = NULL, *pb = NULL, *err = NULL;
+-    if (FAILED(D3DCompile(vs, sizeof vs - 1, "dsconv_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
+-        FAILED(D3DCompile(ps, sizeof ps - 1, "dsconv_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
++    if (FAILED(sc_compile(vs, sizeof vs - 1, "dsconv_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
++        FAILED(sc_compile(ps, sizeof ps - 1, "dsconv_ps", NULL, NULL, "main", "ps_5_0", 0, 0, &pb, &err))) {
+         printf("[D3D12] depth copy shader: %s%c", err ? (const char*)err->lpVtbl->GetBufferPointer(err) : "?", 10);
+         return 0;
+     }
+diff --git a/libs/video/rsx_shader_cache.h b/libs/video/rsx_shader_cache.h
+new file mode 100644
+index 00000000..a9448fe3
+--- /dev/null
++++ b/libs/video/rsx_shader_cache.h
+@@ -0,0 +1,98 @@
++/*
++ * ps3recomp - on-disk cache of compiled shader bytecode (Re:Fine patches/0123)
++ *
++ * One file per shader, named by the hex of its key. The key covers everything
++ * the output depends on (source, entry, target, flags, compiler build), so a
++ * new compiler or a new generator simply misses.
++ *
++ * A file is only trusted if its header and its checksum hold. Anything else --
++ * short, corrupt, another format, another compiler -- is "rejected": the caller
++ * compiles and stores over it. Nothing here can fail the draw.
++ *
++ * Header-only, without D3D, so libs/video/tests can test it alone.
++ */
++#ifndef RSX_SHADER_CACHE_H
++#define RSX_SHADER_CACHE_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <windows.h>
++
++#define RSX_SC_FORMAT 1u
++#define RSX_SC_MAX_SIZE (16u * 1024u * 1024u)
++
++enum { RSX_SC_HIT = 0, RSX_SC_MISSING = -1, RSX_SC_REJECTED = -2 };
++
++typedef struct {
++    char     magic[4];       /* "OFSC" */
++    uint32_t format;
++    uint64_t compiler_id;
++    uint64_t checksum;       /* FNV-1a 64 of the bytecode */
++    uint32_t size;
++    uint32_t reserved;
++    uint8_t  key[32];
++} RsxScHeader;
++
++static uint64_t rsx_sc_fnv64(const void* data, size_t n)
++{
++    const uint8_t* p = (const uint8_t*)data;
++    uint64_t h = 14695981039346656037ull;
++    for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
++    return h;
++}
++
++/* The bytecode in a malloc'd buffer, or why not. */
++static int rsx_sc_load(const wchar_t* path, const uint8_t key[32], uint64_t compiler_id,
++                       void** out, uint32_t* out_size)
++{
++    FILE* f = _wfopen(path, L"rb");
++    if (!f) return RSX_SC_MISSING;
++    RsxScHeader h;
++    int rc = RSX_SC_REJECTED;
++    if (fread(&h, 1, sizeof h, f) == sizeof h && memcmp(h.magic, "OFSC", 4) == 0 &&
++        h.format == RSX_SC_FORMAT && h.compiler_id == compiler_id &&
++        memcmp(h.key, key, 32) == 0 && h.size > 0 && h.size <= RSX_SC_MAX_SIZE) {
++        void* data = malloc(h.size);
++        if (data) {
++            if (fread(data, 1, h.size, f) == h.size && fgetc(f) == EOF &&
++                rsx_sc_fnv64(data, h.size) == h.checksum) {
++                *out = data; *out_size = h.size; rc = RSX_SC_HIT;
++            } else {
++                free(data);
++            }
++        }
++    }
++    fclose(f);
++    return rc;
++}
++
++/* Written beside the target and moved over it, so a crash or a second process
++ * leaves the old file or the new one, never half of one. 1 = stored. */
++static int rsx_sc_store(const wchar_t* path, const uint8_t key[32], uint64_t compiler_id,
++                        const void* data, uint32_t size)
++{
++    static volatile LONG seq;
++    wchar_t tmp[MAX_PATH + 32];
++    swprintf(tmp, sizeof tmp / sizeof tmp[0], L"%ls.%lu.%ld.tmp", path,
++             (unsigned long)GetCurrentProcessId(), InterlockedIncrement(&seq));
++    FILE* f = _wfopen(tmp, L"wb");
++    if (!f) return 0;
++    RsxScHeader h;
++    memset(&h, 0, sizeof h);
++    memcpy(h.magic, "OFSC", 4);
++    h.format = RSX_SC_FORMAT;
++    h.compiler_id = compiler_id;
++    h.checksum = rsx_sc_fnv64(data, size);
++    h.size = size;
++    memcpy(h.key, key, 32);
++    const int ok = fwrite(&h, 1, sizeof h, f) == sizeof h && fwrite(data, 1, size, f) == size;
++    if (fclose(f) != 0 || !ok || !MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
++        DeleteFileW(tmp);
++        return 0;
++    }
++    return 1;
++}
++
++#endif /* RSX_SHADER_CACHE_H */
+diff --git a/libs/video/tests/test_shader_cache.c b/libs/video/tests/test_shader_cache.c
+new file mode 100644
+index 00000000..2169f38a
+--- /dev/null
++++ b/libs/video/tests/test_shader_cache.c
+@@ -0,0 +1,76 @@
++/*
++ * test_shader_cache - rsx_shader_cache.h: what comes back is what went in, and a
++ * damaged or foreign file is refused, never trusted and never fatal.
++ *
++ * clang-cl -I libs/video libs/video/tests/test_shader_cache.c -Fe:test_shader_cache.exe
++ */
++#include "rsx_shader_cache.h"
++
++static const wchar_t* PATH = L"test_shader_cache.bin";
++static int fails;
++
++#define CHECK(c) do { if (!(c)) { printf("FALLO linea %d: %s\n", __LINE__, #c); fails++; } } while (0)
++
++static void poke(long off, int whence, unsigned char v)
++{
++    FILE* f = _wfopen(PATH, L"r+b");
++    fseek(f, off, whence); fputc(v, f); fclose(f);
++}
++
++static void truncate_to(long n)
++{
++    HANDLE h = CreateFileW(PATH, GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
++    SetFilePointer(h, n, NULL, FILE_BEGIN); SetEndOfFile(h); CloseHandle(h);
++}
++
++int main(void)
++{
++    uint8_t key[32], other[32], data[4096];
++    for (int i = 0; i < 32; i++) { key[i] = (uint8_t)i; other[i] = (uint8_t)(i + 1); }
++    for (int i = 0; i < 4096; i++) data[i] = (uint8_t)(i * 7);
++    void* out = NULL; uint32_t n = 0;
++    const uint64_t id = 0x1122334455667788ull;
++
++    DeleteFileW(PATH);
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_MISSING);
++
++    CHECK(rsx_sc_store(PATH, key, id, data, sizeof data) == 1);
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_HIT);
++    CHECK(n == sizeof data && memcmp(out, data, n) == 0);
++    free(out);
++
++    /* otro compilador, otra clave */
++    CHECK(rsx_sc_load(PATH, key, id + 1, &out, &n) == RSX_SC_REJECTED);
++    CHECK(rsx_sc_load(PATH, other, id, &out, &n) == RSX_SC_REJECTED);
++
++    /* un byte del bytecode, del formato, de la cabecera */
++    poke(-1, SEEK_END, 0x5A);
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_REJECTED);
++    CHECK(rsx_sc_store(PATH, key, id, data, sizeof data) == 1);
++    poke(4, SEEK_SET, 0x7F);
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_REJECTED);
++    CHECK(rsx_sc_store(PATH, key, id, data, sizeof data) == 1);
++    poke(0, SEEK_SET, 'X');
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_REJECTED);
++
++    /* cortado por la mitad, por la cabecera, vacio; con bytes de mas */
++    CHECK(rsx_sc_store(PATH, key, id, data, sizeof data) == 1);
++    truncate_to(2000);
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_REJECTED);
++    truncate_to(10);
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_REJECTED);
++    truncate_to(0);
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_REJECTED);
++    CHECK(rsx_sc_store(PATH, key, id, data, sizeof data) == 1);
++    { FILE* f = _wfopen(PATH, L"ab"); fputc(1, f); fclose(f); }
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_REJECTED);
++
++    /* reescribir encima lo arregla */
++    CHECK(rsx_sc_store(PATH, key, id, data, sizeof data) == 1);
++    CHECK(rsx_sc_load(PATH, key, id, &out, &n) == RSX_SC_HIT);
++    free(out);
++
++    DeleteFileW(PATH);
++    printf("test_shader_cache: %s\n", fails ? "FALLO" : "OK");
++    return fails != 0;
++}

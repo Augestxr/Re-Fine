@@ -1,0 +1,143 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -5557,6 +5557,110 @@ static void fp_read_gpu(void)
+     s_fp_last = -1;
+ }
+ 
++/* Re:Fine 0161: render_height in a running game. The host (the port's menu) asks with
++ * rsx_d3d12_set_render_height from its own thread; render_frame applies it here, with the
++ * GPU idle and before it records. Everything sized by rw x rh or by the scale goes: the
++ * display target, the shared depth buffer, every offscreen colour and depth surface (they
++ * come back at the new scale, filled from guest memory the first time the game binds them,
++ * as at boot), the system-dialog texture and the dump readback. One frame can look odd. */
++static volatile LONG s_rh_pending;
++void rsx_d3d12_set_render_height(unsigned h)
++{
++    if (h >= 360 && h <= 2160) InterlockedExchange(&s_rh_pending, (LONG)h);
++}
++
++#define RH_REL(p) do { if (p) { (p)->lpVtbl->Release(p); (p) = NULL; } } while (0)
++
++static void render_height_apply(void)
++{
++    const u32 want = (u32)InterlockedExchange(&s_rh_pending, 0) & ~1u;
++    if (!want || want == s_d3d.rh || !s_d3d.device) return;
++    const double t0 = perf_now();
++    { const HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
++      if (FAILED(rr)) { fprintf(stderr, "[D3D12] render_height %u: the device was removed before (0x%08lX)%c", want, (long)rr, 10); return; } }
++    wait_for_gpu();
++    const u32 width = s_d3d.width, height = s_d3d.height;
++    for (u32 i = 0; i < FRAME_COUNT; i++) RH_REL(s_d3d.render_targets[i]);
++    RH_REL(s_d3d.depth_buffer);
++    for (int i = 0; i < MAX_OFF_RTS; i++) {
++        RH_REL(s_d3d.off_rt[i].res);
++        RH_REL(s_d3d.off_rt[i].up);
++        memset(&s_d3d.off_rt[i], 0, sizeof s_d3d.off_rt[i]);
++    }
++    for (int i = 0; i < MAX_OFF_DS; i++) {
++        RH_REL(s_d3d.off_ds[i].res);
++        memset(&s_d3d.off_ds[i], 0, sizeof s_d3d.off_ds[i]);
++    }
++    RH_REL(s_d3d.readback_buf);
++    RH_REL(s_screen_copy);   /* the lazy copy of the display target, rw x rh */
++    RH_REL(s_ui.tex); RH_REL(s_ui.heap); RH_REL(s_ui.pso); RH_REL(s_ui.rs);
++    for (u32 i = 0; i < FRAME_COUNT; i++) RH_REL(s_ui.up[i]);
++    memset(&s_ui, 0, sizeof s_ui);
++
++    s_d3d.rh = want;
++    s_d3d.rw = (u32)(((u64)width * s_d3d.rh + height / 2) / height) & ~1u;
++    s_d3d.rs = (s_d3d.rh >= height && s_d3d.rh <= RS_SCENE_H) ? 1.0f : (float)s_d3d.rh / RS_SCENE_H;
++
++    D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC td = {0};
++    td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    td.Width = s_d3d.rw; td.Height = s_d3d.rh;
++    td.DepthOrArraySize = 1; td.MipLevels = 1;
++    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM; td.SampleDesc.Count = 1;
++    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++    D3D12_CLEAR_VALUE cv = {0};
++    cv.Format = td.Format;
++    memcpy(cv.Color, s_d3d.clear_color, sizeof cv.Color);
++    HRESULT hr = s_d3d.device->lpVtbl->CreateCommittedResource(
++        s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COMMON, &cv,
++        &IID_ID3D12Resource, (void**)&s_d3d.render_targets[0]);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[D3D12] ERROR: render_height %u: display target failed (0x%08lX)%c", want, (long)hr, 10);
++        return;
++    }
++    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
++    s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv);
++    for (u32 i = 0; i < FRAME_COUNT; i++) {
++        if (i) {
++            s_d3d.render_targets[i] = s_d3d.render_targets[0];
++            s_d3d.render_targets[i]->lpVtbl->AddRef(s_d3d.render_targets[i]);
++        }
++        s_d3d.device->lpVtbl->CreateRenderTargetView(s_d3d.device, s_d3d.render_targets[i], NULL, rtv);
++        rtv.ptr += s_d3d.rtv_descriptor_size;
++    }
++
++    if (s_blit.heap) {   /* the present blit's view of the display target, made once at its init */
++        D3D12_CPU_DESCRIPTOR_HANDLE sh;
++        s_blit.heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_blit.heap, &sh);
++        s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, s_d3d.render_targets[0], NULL, sh);
++    }
++
++    D3D12_RESOURCE_DESC dd = {0};
++    dd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    dd.Width = s_d3d.rs > 1.0f ? rs_dim(2048) : 2048;
++    dd.Height = dd.Width;
++    dd.DepthOrArraySize = 1; dd.MipLevels = 1;
++    dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dd.SampleDesc.Count = 1;
++    dd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
++    D3D12_CLEAR_VALUE dc = {0};
++    dc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dc.DepthStencil.Depth = 1.0f;
++    hr = s_d3d.device->lpVtbl->CreateCommittedResource(
++        s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &dd, D3D12_RESOURCE_STATE_DEPTH_WRITE, &dc,
++        &IID_ID3D12Resource, (void**)&s_d3d.depth_buffer);
++    if (FAILED(hr)) {
++        fprintf(stderr, "[D3D12] ERROR: render_height %u: depth buffer failed (0x%08lX)%c", want, (long)hr, 10);
++        return;
++    }
++    D3D12_DEPTH_STENCIL_VIEW_DESC dv = {0};
++    dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
++    D3D12_CPU_DESCRIPTOR_HANDLE dsv;
++    s_d3d.dsv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.dsv_heap, &dsv);
++    s_d3d.device->lpVtbl->CreateDepthStencilView(s_d3d.device, s_d3d.depth_buffer, &dv, dsv);
++    fprintf(stderr, "[D3D12] render_height now %u: display target %ux%u, offscreen scale %.4f (%.1f ms)%c",
++            want, s_d3d.rw, s_d3d.rh, s_d3d.rs, (perf_now() - t0) * 1000.0, 10);
++}
++
+ static void render_frame(void)
+ {
+     double _rf0 = perf_on() ? perf_now() : 0.0;
+@@ -5570,6 +5674,7 @@ static void render_frame(void)
+      * costs little. */
+     wait_for_gpu();
+     swap_chain_resize();
++    render_height_apply();   /* Re:Fine 0161 */
+     u32 fi = s_d3d.frame_index;
+     const double _fp1 = g_frame_prof_on ? perf_now() : 0.0;
+     if (g_frame_prof_on) { fp_init(); fp_read_gpu(); g_frame_prof.draws += s_d3d.draw_count; }
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -844,6 +844,9 @@ static const char* pad_sdl3_label(SDL_Gamepad* gp, SDL_GamepadButton b)
+  * the dead zone for stick_rearm_ms (34 by default over 30 fps, 0 at 30). */
+ static float s_stick_dz = -1.0f, s_stick_hy;
+ static Uint64 s_stick_rearm_ms;
++static int s_rearm_env;   /* Re:Fine 0161: stick_rearm_ms set by the user: the frame rate does not change it */
++/* Re:Fine 0161: the frame rate changed in the running game (the port's menu). */
++void pad_set_fps_high(int high) { if (!s_rearm_env) s_stick_rearm_ms = high ? 34 : 0; }
+ typedef struct { int out, x, y, wait; Uint64 since; u8 lx, ly; } PadStick;
+ 
+ static void pad_sdl3_stick(PadStick* st, int x, int y, u8* ox, u8* oy)
+@@ -1098,6 +1101,7 @@ static int SDLCALL pad_sdl3_main(void* unused)
+       s_stick_hy = hy ? (float)atof(hy) : 0.25f;
+       const char* rm = getenv("REFINE_STICK_REARM_MS");    /* refine.ini: stick_rearm_ms */
+       const char* fp = getenv("REFINE_FPS_TARGET");
++      s_rearm_env = rm != NULL;
+       s_stick_rearm_ms = rm ? (Uint64)atoi(rm) : (fp && atoi(fp) > 30 ? 34 : 0);
+       fprintf(stderr, "[cellPad] stick dead zone %.2f, leaves the centre at %.2f, re-arms after %d ms%c", s_stick_dz, s_stick_dz + s_stick_hy, (int)s_stick_rearm_ms, 10); }
+     const Uint64 t0 = SDL_GetTicksNS();

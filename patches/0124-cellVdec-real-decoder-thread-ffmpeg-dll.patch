@@ -1,0 +1,1513 @@
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index 7e222c92..cd2c5c62 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -1,12 +1,14 @@
+ /*
+  * ps3recomp - cellVdec HLE implementation
+  *
+- * H.264 and MPEG-2 decode through libavcodec when the runtime is built with
+- * PS3RECOMP_FFMPEG_RUNTIME and the library is present (vdec_ffmpeg.c,
+- * ffmpeg_runtime.c): every AU is decoded, pictures are queued in display
+- * order and announced with PICOUT, and GetPicture converts them to the
+- * requested format. Otherwise this is the callback-only decoder it always
+- * was: AUDONE and PICOUT per AU, and a black picture.
++ * H.264 and MPEG-2 decode through libavcodec, on one host thread per decoder
++ * (vdec_ffmpeg.c, ffmpeg_runtime.c). DecodeAu queues the AU and returns; the
++ * thread decodes it and calls the title back with AUDONE and PICOUT, as the
++ * system library does from its own thread. Pictures are converted to the
++ * title's format on that thread too, so GetPicture only copies.
++ *
++ * The behaviour follows RPCS3 (Modules/cellVdec.cpp, 1f59f0f2); the code does
++ * not. Without libavcodec Open fails: there is no pretend decoder.
+  */
+ 
+ #include "cellVdec.h"
+@@ -15,74 +17,93 @@
+ #include <string.h>
+ #include "vdec_ffmpeg.h"
+ #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
+-#include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
+-#include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
+-#include "../../runtime/ps3_log.h"       /* ps3_log_verbose */
++#include "ps3emu/guest_call.h" /* ps3_invoke_guest -- cbFunc is a GUEST OPD */
++#include "../../runtime/memory/vm.h"
+ 
+-#ifdef _WIN32
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+-static SRWLOCK s_vdec_lock = SRWLOCK_INIT;
+-#define VDEC_LOCK()   AcquireSRWLockExclusive(&s_vdec_lock)
+-#define VDEC_UNLOCK() ReleaseSRWLockExclusive(&s_vdec_lock)
+-static u64 vdec_now_ms(void) { return (u64)GetTickCount64(); }
+-#else
+-#include <pthread.h>
+-#include <time.h>
+-#include <unistd.h>
+-static pthread_mutex_t s_vdec_lock = PTHREAD_MUTEX_INITIALIZER;
+-#define VDEC_LOCK()   pthread_mutex_lock(&s_vdec_lock)
+-#define VDEC_UNLOCK() pthread_mutex_unlock(&s_vdec_lock)
+-static u64 vdec_now_ms(void)
+-{
+-    struct timespec ts;
+-    clock_gettime(CLOCK_MONOTONIC, &ts);
+-    return (u64)ts.tv_sec * 1000u + (u64)ts.tv_nsec / 1000000u;
+-}
+-#endif
+ 
+ /* ---------------------------------------------------------------------------
+  * Internal state
+  * -----------------------------------------------------------------------*/
+ #define MAX_VDEC 4
+-#define VDEC_QUEUE   32   /* decoded pictures waiting for GetPicture */
+-#define VDEC_BUSY_AT 16   /* refuse new AUs past this many (EndSeq can add more) */
+-#define VDEC_AU_RING 64   /* AUs remembered for pictures that come out late */
++#define VDEC_AU_DEPTH  4   /* AUs not yet done before DecodeAu says BUSY */
++#define VDEC_CMDS      16  /* the AUs above plus start, drain, end, close */
++#define VDEC_PIC_MAX   61  /* pictures waiting for GetPicture; full, the thread waits */
++#define VDEC_PENDING   8   /* pictures one decoder call can hand back */
++#define VDEC_AU_RING   64  /* AUs remembered for pictures that come out late */
++#define VDEC_CONV_AHEAD 4  /* pictures nearest GetPicture kept converted */
++#define VDEC_BUF_POOL  8   /* converted-picture buffers kept for reuse */
++#define VDEC_ITEM_SLOTS 32
++#define VDEC_ITEM_BYTES 0x100u
++#define VDEC_TS_INVALID (~0ull)
++
++typedef enum { VDEC_SEQ_CLOSED, VDEC_SEQ_DORMANT, VDEC_SEQ_READY, VDEC_SEQ_ENDING } VdecSeq;
++typedef enum { VDEC_CMD_START, VDEC_CMD_AU, VDEC_CMD_DRAIN, VDEC_CMD_END, VDEC_CMD_CLOSE } VdecCmdType;
++
++typedef struct {
++    VdecCmdType type;
++    CellVdecAuInfo au;
++} VdecCmd;
+ 
+-/* A decoded picture waiting for the title (decoder path only). */
++/* A decoded picture waiting for the title. */
+ typedef struct {
+     u8* yuv;            /* I420, width x height */
+-    CellVdecPicItem item;
++    u8* conv;           /* in the format of conv_key, or NULL */
++    u32 conv_key;
++    size_t conv_bytes;
++    u32 width, height;
++    u64 pts, dts, userData;
+     int pictType;       /* 1 I, 2 P, 3 B, 0 unknown */
+-    int key;
+-    u32 frameTicks;     /* one frame, 90 kHz (0 unknown) */
++    u32 frameTicks;     /* one frame, 90 kHz */
++    int itemTaken;      /* GetPicItem has reported it */
++    int converting;     /* the thread is on it: GetPicture has to wait */
+ } VdecPic;
+ 
+ typedef struct {
+     int in_use;
++    u32 slot;
+     u32 codecType;
+     u32 cbFunc;         /* guest EA of the callback's OPD */
+     u32 cbArg;          /* guest EA handed back to it     */
+-    int seqStarted;
+-    CellVdecPicItem lastPic;
+-    int hasPic;
+-    u32 auCount;        /* total AUs decoded */
+-    u16 width;          /* configured resolution (0 = use default) */
+-    u16 height;
+-    /* Decoder path: NULL when there is no libavcodec, and then nothing
+-     * below is used. */
++    u32 memAddr;        /* the title's work memory: picture items */
+     VdecFf* ff;
+-    VdecPic queue[VDEC_QUEUE];
++    HANDLE thread;
++    SRWLOCK lock;
++    CONDITION_VARIABLE wake;   /* the thread: a command, or room in the queue */
++    CONDITION_VARIABLE converted;  /* GetPicture: the picture it wants is ready */
++    SRWLOCK conv_lock;  /* the scaler: this thread, or a late GetPicture */
++    VdecSeq seq;
++    int abort;          /* Close: decode no more, but finish the commands */
++
++    VdecCmd cmds[VDEC_CMDS];
++    u32 cmdHead, cmdCount;
++    u32 ausQueued;      /* AUs without their AUDONE yet */
++
++    VdecPic queue[VDEC_PIC_MAX];
+     u32 qHead, qCount;
++    u32 itemSlot;
++
++    int fmtKnown;       /* the title's last GetPicture format */
++    u32 fmtType, fmtMatrix;
++    u8  fmtAlpha;
++    u8* bufPool[VDEC_BUF_POOL];
++    u32 bufCount;
++    size_t bufBytes;
++
++    /* Thread only. */
+     CellVdecAuInfo aus[VDEC_AU_RING];   /* by auCount % VDEC_AU_RING */
+-    u32 newPics;        /* pictures queued by the current decode call */
+-    u64 nextPts;        /* synthesized PTS for an AU that carries none (90 kHz) */
+-    u32 picsDecoded;    /* pictures the decoder has given back, this sequence */
+-    u64 lastAuMs;       /* when the last AU arrived (idle drain) */
+-    int idleDrained;    /* the idle drain already ran since that AU */
++    u32 auCount;
++    VdecPic pending[VDEC_PENDING];
++    u32 pendingCount;
++    u64 nextPts, nextDts;
++
++    /* Totals for VDEC_TRACE, over the decoder's life. */
++    u32 nAuDone, nPicOut, nGetItem, nGetPic, nLateConv, qPeak, nFullWaits;
+ } VdecSlot;
+ 
+ static VdecSlot s_vdec[MAX_VDEC];
++static SRWLOCK s_vdec_open = SRWLOCK_INIT;
+ 
+ /* The handle the guest sees is the slot index plus one, never 0: some
+  * titles treat a 0 handle as "no decoder open".
+@@ -93,153 +114,290 @@ static VdecSlot s_vdec[MAX_VDEC];
+ #define VDEC_HANDLE_OF(slot) ((CellVdecHandle)((u32)(slot) + 1u))
+ #define VDEC_SLOT_OF(h)      (((u32)(h) - 1u) < MAX_VDEC ? (u32)(h) - 1u : (u32)MAX_VDEC)
+ 
+-/* Deliver a vdec message to the guest callback (handle, msgType, msgData,
+- * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
+- * to call it as a host function pointer, which crashes the first time a
+- * title's callback is reached.
+- * ponytail: synchronous on the caller's thread, like adec_notify; give it a
+- * decoder thread if a title's callback ever blocks on the DecodeAu caller. */
+-static void vdec_notify(u32 slot, u32 msg_type, s32 msg_data)
++static int vdec_trace(void)
+ {
+-    if (slot >= MAX_VDEC || !s_vdec[slot].in_use) return;
+-    const VdecSlot* v = &s_vdec[slot];
+-    if (!v->cbFunc || !g_ps3_guest_caller) return;
+-    g_ps3_guest_caller(v->cbFunc, (u64)VDEC_HANDLE_OF(slot), (u64)msg_type,
+-                       (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
++    static int s = -1;
++    if (s < 0) {
++        const char* e = getenv("VDEC_TRACE");
++        s = e ? atoi(e) : 0;
++    }
++    return s;
++}
++
++static VdecSlot* vdec_of(CellVdecHandle handle)
++{
++    u32 slot = VDEC_SLOT_OF(handle);
++    return slot < MAX_VDEC && s_vdec[slot].in_use ? &s_vdec[slot] : NULL;
++}
++
++/* cbFunc(handle, msgType, msgData, cbArg). A guest OPD, run on the decoder
++ * thread with no lock held: the title's handler may call GetPicItem. */
++static void vdec_notify(VdecSlot* v, u32 msg_type, s32 msg_data)
++{
++    if (!v->cbFunc) return;
++    ps3_invoke_guest(v->cbFunc, (u64)VDEC_HANDLE_OF(v->slot), (u64)msg_type,
++                     (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * Decoder path (libavcodec present)
++ * Picture buffers
+  * -----------------------------------------------------------------------*/
+ 
+-static void vdec_queue_clear(VdecSlot* v)
++/* A picture is 3.7 MB. A fresh malloc that size is fresh pages, faulted in on
++ * every frame, so converted buffers go round a small pool. Under v->lock. */
++static u8* vdec_buf_get(VdecSlot* v, size_t bytes)
+ {
+-    for (u32 i = 0; i < v->qCount; i++)
+-        free(v->queue[(v->qHead + i) % VDEC_QUEUE].yuv);
+-    v->qHead = v->qCount = 0;
++    if (v->bufBytes != bytes) {
++        while (v->bufCount) free(v->bufPool[--v->bufCount]);
++        v->bufBytes = bytes;
++    }
++    return v->bufCount ? v->bufPool[--v->bufCount] : (u8*)malloc(bytes);
++}
++
++static void vdec_buf_put(VdecSlot* v, u8* buf, size_t bytes)
++{
++    if (buf && bytes == v->bufBytes && v->bufCount < VDEC_BUF_POOL)
++        v->bufPool[v->bufCount++] = buf;
++    else
++        free(buf);
++}
++
++static void vdec_pic_free(VdecSlot* v, VdecPic* p)
++{
++    free(p->yuv);
++    p->yuv = NULL;
++    vdec_buf_put(v, p->conv, p->conv_bytes);
++    p->conv = NULL;
++}
++
++static u32 vdec_fmt_key(u32 type, u32 matrix, u8 alpha)
++{
++    return (type & 0xFF) << 16 | (matrix & 0xFF) << 8 | alpha;
+ }
+ 
+-/* vdec_ff_emit_fn: queue a decoded picture under the item of the AU it was
+- * decoded from. Pictures leave the decoder in display order, so with B-frames
+- * that is not the AU just submitted; the token is that AU's auCount. */
++/* The next queued picture to convert, or NULL. A converted picture is 3.7 MB
++ * and a player may keep 60 queued, so only the ones about to be taken are, in
++ * the format of the title's last GetPicture. Under v->lock. */
++static VdecPic* vdec_next_to_convert(VdecSlot* v)
++{
++    if (!v->fmtKnown || v->fmtType >= 3 || v->abort)   /* 3: stored as it is */
++        return NULL;
++    const u32 key = vdec_fmt_key(v->fmtType, v->fmtMatrix, v->fmtAlpha);
++    for (u32 i = 0; i < v->qCount && i < VDEC_CONV_AHEAD; i++) {
++        VdecPic* p = &v->queue[(v->qHead + i) % VDEC_PIC_MAX];
++        if (!p->conv || p->conv_key != key)
++            return p;
++    }
++    return NULL;
++}
++
++/* Convert here and not on the title's thread. Under v->lock, dropped while the
++ * scaler runs: GetPicture waits on `converting` rather than take the picture,
++ * so p stays put. */
++static void vdec_convert_one(VdecSlot* v, VdecPic* p)
++{
++    const u32 type = v->fmtType, matrix = v->fmtMatrix;
++    const u8 alpha = v->fmtAlpha;
++    const size_t bytes = vdec_picture_bytes(p->width, p->height, type);
++    u8* old = p->conv;
++    const size_t old_bytes = p->conv_bytes;
++    u8* buf = vdec_buf_get(v, bytes);
++    p->converting = 1;
++    ReleaseSRWLockExclusive(&v->lock);
++
++    int r = buf ? -1 : 0;
++    if (buf) {
++        AcquireSRWLockExclusive(&v->conv_lock);
++        r = vdec_ff_convert(v->ff, p->yuv, p->width, p->height, type, matrix, alpha, buf);
++        ReleaseSRWLockExclusive(&v->conv_lock);
++    }
++
++    AcquireSRWLockExclusive(&v->lock);
++    p->converting = 0;
++    if (buf && r == 0) {
++        p->conv = buf;
++        p->conv_key = vdec_fmt_key(type, matrix, alpha);
++        p->conv_bytes = bytes;
++        vdec_buf_put(v, old, old_bytes);
++    } else {
++        vdec_buf_put(v, buf, bytes);
++        /* Not again: GetPicture converts it and reports the failure. */
++        p->conv_key = vdec_fmt_key(type, matrix, alpha);
++    }
++    WakeAllConditionVariable(&v->converted);
++}
++
++/* vdec_ff_emit_fn: stamp a decoded picture and hold it until AUDONE has gone
++ * out. Pictures leave the decoder in display order, so with B-frames that is
++ * not the AU just submitted; the token is that AU's auCount.
++ *
++ * Time stamps as the title sees them: the PTS of the AU the picture came from
++ * when it has one, else the previous one plus a frame; the DTS of the AU being
++ * decoded as it came out, likewise. */
+ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
+ {
+     VdecSlot* v = (VdecSlot*)ctx;
+-    if (v->qCount == VDEC_QUEUE) {
+-        printf("[cellVdec] picture queue full; dropping the oldest\n");
+-        free(v->queue[v->qHead].yuv);
+-        v->qHead = (v->qHead + 1) % VDEC_QUEUE;
+-        v->qCount--;
++    if (v->pendingCount == VDEC_PENDING) {
++        fprintf(stderr, "[cellVdec] more than %d pictures from one AU; dropping one\n", VDEC_PENDING);
++        free(pic->yuv);
++        return;
+     }
+     const CellVdecAuInfo* au = &v->aus[pic->token % VDEC_AU_RING];
+-    VdecPic* q = &v->queue[(v->qHead + v->qCount) % VDEC_QUEUE];
+-    memset(q, 0, sizeof(*q));
+-    q->yuv = pic->yuv;
+-    q->pictType = pic->pict_type;
+-    q->key = pic->key;
+-    q->frameTicks = pic->frame_ticks;
+-    q->item.codecType = v->codecType;
+-    q->item.startAddr = au->startAddr;
+-    q->item.size      = au->size;
+-    q->item.auNum     = pic->token;
+-    /* An AU without a time stamp (both words 0xFFFFFFFF, as GoW:A's demuxer
+-     * sends every one of them) gets the next one on the stream's clock; a
+-     * player that paces display by PTS otherwise never shows a second picture. */
++    const CellVdecAuInfo* now = &v->aus[v->auCount % VDEC_AU_RING];
+     const u32 ticks = pic->frame_ticks ? pic->frame_ticks : 3003u;
+-    const u64 pts = au->pts == ~0ull ? v->nextPts : au->pts;
+-    v->nextPts = pts + ticks;
+-    q->item.pts       = pts;
+-    q->item.dts       = au->dts == ~0ull ? pts : au->dts;
+-    q->item.userData  = au->userData;
+-    q->item.status    = 0;
+-    q->item.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
+-    q->item.width     = (u16)pic->width;
+-    q->item.height    = (u16)pic->height;
+-    v->qCount++;
+-    v->newPics++;
+-    v->picsDecoded++;
++    if (au->pts != VDEC_TS_INVALID)
++        v->nextPts = au->pts;
++    if (now->dts != VDEC_TS_INVALID)
++        v->nextDts = now->dts;
++
++    VdecPic* p = &v->pending[v->pendingCount++];
++    memset(p, 0, sizeof(*p));
++    p->yuv = pic->yuv;
++    p->width = pic->width;
++    p->height = pic->height;
++    p->pts = v->nextPts;
++    p->dts = v->nextDts;
++    p->userData = au->userData;
++    p->pictType = pic->pict_type;
++    p->frameTicks = ticks;
++    v->nextPts += ticks;
++    v->nextDts += ticks;
++    if (vdec_trace() >= 2)
++        fprintf(stderr, "[vdec] pic au=%u pts=0x%llx dts=0x%llx\n", pic->token,
++                (unsigned long long)p->pts, (unsigned long long)p->dts);
++}
++
++/* Out to the queue, each with its PICOUT; waits while the title is behind. */
++static void vdec_flush_pending(VdecSlot* v)
++{
++    for (u32 i = 0; i < v->pendingCount; i++) {
++        VdecPic* p = &v->pending[i];
++        AcquireSRWLockExclusive(&v->lock);
++        if (v->qCount >= VDEC_PIC_MAX)
++            v->nFullWaits++;
++        while (!v->abort && v->qCount >= VDEC_PIC_MAX) {
++            VdecPic* c = vdec_next_to_convert(v);
++            if (c)
++                vdec_convert_one(v, c);
++            else
++                SleepConditionVariableSRW(&v->wake, &v->lock, INFINITE, 0);
++        }
++        if (v->abort) {
++            vdec_pic_free(v, p);
++            ReleaseSRWLockExclusive(&v->lock);
++            continue;
++        }
++        v->queue[(v->qHead + v->qCount) % VDEC_PIC_MAX] = *p;
++        v->qCount++;
++        if (v->qCount > v->qPeak)
++            v->qPeak = v->qCount;
++        v->nPicOut++;
++        ReleaseSRWLockExclusive(&v->lock);
++        vdec_notify(v, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
++    }
++    v->pendingCount = 0;
+ }
+ 
+-/* PICOUT for each picture the last decoder call queued. The count is taken
+- * under the lock; the callbacks run outside it, because a title's PICOUT
+- * handler may call GetPicItem/GetPicture right away. */
+-static void vdec_notify_new_pics(u32 slot)
++static void vdec_queue_clear(VdecSlot* v)
+ {
+-    VDEC_LOCK();
+-    u32 n = s_vdec[slot].newPics;
+-    s_vdec[slot].newPics = 0;
+-    VDEC_UNLOCK();
+-    while (n--)
+-        vdec_notify(slot, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
++    for (u32 i = 0; i < v->qCount; i++)
++        vdec_pic_free(v, &v->queue[(v->qHead + i) % VDEC_PIC_MAX]);
++    v->qHead = v->qCount = 0;
+ }
+ 
+-/* Idle drain. libavcodec holds back the pictures a B-frame stream may still
+- * reorder (has_b_frames of them) until it sees the next AU or the end of the
+- * stream. A title that waits for every picture before it calls EndSeq never
+- * gets the last ones, and EndSeq is where they used to come out: Resistance's
+- * movie player is handed 5583 pictures for its 5584-AU intro and waits for the
+- * last one for ever, so the level behind the movie never loads.
+- *
+- * When a sequence has had no AU for VDEC_IDLE_DRAIN_MS (default 1500, 0 =
+- * off), the title has taken every picture it was given (the queue is empty,
+- * so it is waiting on the decoder, not the other way round) and the decoder
+- * still owes pictures, drain it as EndSeq would and announce them. The drain
+- * flushes the decoder, so if the title was only stalled and sends more AUs,
+- * they decode from the next reference picture on -- a glitch, where not
+- * draining is a hang. Both other conditions matter: Resistance holds back AUs
+- * for over 500 ms while it prebuffers (pictures still queued) and, on a
+- * loaded host, mid-movie. */
+-static void* vdec_idle_thread(void* arg)
++/* ---------------------------------------------------------------------------
++ * The decoder thread
++ * -----------------------------------------------------------------------*/
++
++static DWORD WINAPI vdec_thread(LPVOID arg)
+ {
+-    (void)arg;
+-    const char* e = getenv("VDEC_IDLE_DRAIN_MS");
+-    const u64 idle_ms = e ? (u64)strtoull(e, NULL, 0) : 1500u;
+-    if (!idle_ms) return NULL;
++    VdecSlot* v = (VdecSlot*)arg;
++    SetThreadDescription(GetCurrentThread(), L"vdec_decoder");
++
+     for (;;) {
+-#ifdef _WIN32
+-        Sleep(50);
+-#else
+-        usleep(50 * 1000);
+-#endif
+-        for (CellVdecHandle h = 0; h < MAX_VDEC; h++) {
+-            VDEC_LOCK();
+-            VdecSlot* v = &s_vdec[h];
+-            int drained = 0;
+-            if (v->in_use && v->ff && v->seqStarted && !v->idleDrained &&
+-                v->qCount == 0 && v->picsDecoded < v->auCount && v->lastAuMs &&
+-                vdec_now_ms() - v->lastAuMs >= idle_ms) {
+-                v->idleDrained = 1;
++        AcquireSRWLockExclusive(&v->lock);
++        while (!v->cmdCount) {
++            VdecPic* c = vdec_next_to_convert(v);
++            if (c)
++                vdec_convert_one(v, c);
++            else
++                SleepConditionVariableSRW(&v->wake, &v->lock, INFINITE, 0);
++        }
++        VdecCmd cmd = v->cmds[v->cmdHead];
++        v->cmdHead = (v->cmdHead + 1) % VDEC_CMDS;
++        v->cmdCount--;
++        ReleaseSRWLockExclusive(&v->lock);
++
++        if (cmd.type == VDEC_CMD_CLOSE)
++            break;
++
++        switch (cmd.type) {
++        case VDEC_CMD_START:
++            vdec_ff_reset(v->ff);
++            AcquireSRWLockExclusive(&v->lock);
++            vdec_queue_clear(v);
++            ReleaseSRWLockExclusive(&v->lock);
++            v->auCount = 0;
++            v->nextPts = v->nextDts = 0;
++            break;
++
++        case VDEC_CMD_AU: {
++            v->auCount++;
++            v->aus[v->auCount % VDEC_AU_RING] = cmd.au;
++            if (v->nextPts == 0 && cmd.au.pts != VDEC_TS_INVALID) v->nextPts = cmd.au.pts;
++            if (v->nextDts == 0 && cmd.au.dts != VDEC_TS_INVALID) v->nextDts = cmd.au.dts;
++            if (!v->abort && cmd.au.size)
++                vdec_ff_decode(v->ff, vm_ptr8(cmd.au.startAddr), cmd.au.size, v->auCount,
++                               vdec_on_picture, v);
++            AcquireSRWLockExclusive(&v->lock);
++            v->ausQueued--;
++            v->nAuDone++;
++            ReleaseSRWLockExclusive(&v->lock);
++            vdec_notify(v, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
++            vdec_flush_pending(v);
++            break;
++        }
++
++        case VDEC_CMD_DRAIN:
++            if (!v->abort) {
+                 vdec_ff_drain(v->ff, vdec_on_picture, v);
+-                printf("[cellVdec] handle %u idle %llu ms: drained to %u of %u pictures\n",
+-                       (u32)VDEC_HANDLE_OF(h), (unsigned long long)idle_ms,
+-                       v->picsDecoded, v->auCount);
+-                drained = 1;
++                vdec_flush_pending(v);
+             }
+-            VDEC_UNLOCK();
+-            if (drained)
+-                vdec_notify_new_pics(h);
++            break;
++
++        case VDEC_CMD_END:
++            AcquireSRWLockExclusive(&v->lock);
++            v->seq = VDEC_SEQ_DORMANT;
++            ReleaseSRWLockExclusive(&v->lock);
++            vdec_notify(v, CELL_VDEC_MSG_TYPE_SEQDONE, CELL_OK);
++            break;
++
++        default:
++            break;
+         }
+     }
+-    return NULL;
+-}
+ 
+-#ifdef _WIN32
+-static DWORD WINAPI vdec_idle_thread_w32(LPVOID arg) { vdec_idle_thread(arg); return 0; }
+-#endif
++    if (vdec_trace()) {
++        /* Cycles, not GetThreadTimes: that counts the 15.6 ms ticks that found
++         * the thread running, and one that works in short bursts after a wake-up
++         * can go through a whole movie without being caught by any. */
++        ULONG64 cycles = 0;
++        QueryThreadCycleTime(GetCurrentThread(), &cycles);
++        fprintf(stderr, "[vdec] close: au_done=%u pic_out=%u get_item=%u get_pic=%u late_conv=%u "
++                        "queue_peak=%u full_waits=%u mcycles=%llu\n",
++                v->nAuDone, v->nPicOut, v->nGetItem, v->nGetPic, v->nLateConv, v->qPeak,
++                v->nFullWaits, (unsigned long long)(cycles / 1000000));
++    }
++    return 0;
++}
+ 
+-static void vdec_idle_thread_start(void)
++/* Under v->lock. There is always room: at most VDEC_AU_DEPTH AUs, and one each
++ * of the rest. */
++static void vdec_push(VdecSlot* v, const VdecCmd* cmd)
+ {
+-    static int started = 0;
+-    if (started) return;
+-    started = 1;
+-#ifdef _WIN32
+-    HANDLE t = CreateThread(NULL, 0, vdec_idle_thread_w32, NULL, 0, NULL);
+-    if (t) CloseHandle(t);
+-#else
+-    pthread_t t;
+-    if (pthread_create(&t, NULL, vdec_idle_thread, NULL) == 0)
+-        pthread_detach(t);
+-#endif
++    v->cmds[(v->cmdHead + v->cmdCount) % VDEC_CMDS] = *cmd;
++    v->cmdCount++;
++    WakeAllConditionVariable(&v->wake);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -249,9 +407,9 @@ static void vdec_idle_thread_start(void)
+ /* cellVdecQueryAttr: how much work memory the decoder wants, before Open.
+  * CellVdecAttr (guest, big-endian): +0 u32 memSize, +4 u8 cmdDepth,
+  * +8 u32 decoderVerUpper, +0xC u32 decoderVerLower.
+- * Decoding is host-side, so the guest's buffer is never touched; memSize only
+- * has to be something the title can allocate. cmdDepth sizes the title's own
+- * AU queue, so it must not be 0. Unimplemented, the call left the struct
++ * Decoding is host-side, so the guest's buffer holds only picture items; memSize
++ * only has to be something the title can allocate. cmdDepth sizes the title's
++ * own AU queue, so it must not be 0. Unimplemented, the call left the struct
+  * unfilled and a movie player (Resistance: Fall of Man) gave up and retried
+  * forever. */
+ s32 cellVdecQueryAttr(const CellVdecType* type, void* attr)
+@@ -260,7 +418,7 @@ s32 cellVdecQueryAttr(const CellVdecType* type, void* attr)
+     if (!type || !ea)
+         return (s32)CELL_VDEC_ERROR_ARG;
+     vm_write32(ea + 0x0, 0x100000);   /* memSize: 1 MB */
+-    vm_write8 (ea + 0x4, 4);          /* cmdDepth */
++    vm_write8 (ea + 0x4, VDEC_AU_DEPTH); /* cmdDepth */
+     vm_write32(ea + 0x8, 0x00010000); /* decoderVerUpper */
+     vm_write32(ea + 0xC, 0);          /* decoderVerLower */
+     return CELL_OK;
+@@ -270,38 +428,58 @@ s32 cellVdecQueryAttr(const CellVdecType* type, void* attr)
+  * cb is a guest pointer to { u32 cbFunc; u32 cbArg; }. Declared with five,
+  * `handle` came from r7 instead of r6: the handle was written somewhere
+  * random and the title's own handle stayed 0 (Resistance: Fall of Man opened
+- * handle 1, then called StartSeq(0)); four Opens later every call was BUSY. */
++ * handle 1, then called StartSeq(0)); four Opens later every call was BUSY.
++ *
++ * res is a guest pointer too; +0 memAddr, +4 memSize in both its forms. */
+ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
+                   const CellVdecCb* cb, CellVdecHandle* handle)
+ {
+-    (void)res;
+-    u32 cb_ea = (u32)(uintptr_t)cb;
+-
++    u32 cb_ea = GUEST_EA(cb), res_ea = GUEST_EA(res);
+     u32 codec_type = type ? vm_read32(GUEST_EA(type)) : 0;   /* codecType */
+-    printf("[cellVdec] Open(codecType=%u)\n", codec_type);
++    fprintf(stderr, "[cellVdec] Open(codecType=%u)\n", codec_type);
+ 
+-    if (!type || !handle)
++    if (!type || !handle || !res_ea)
++        return (s32)CELL_VDEC_ERROR_ARG;
++    const u32 mem = vm_read32(res_ea + 0), mem_size = vm_read32(res_ea + 4);
++    if (!mem || mem_size < VDEC_ITEM_SLOTS * VDEC_ITEM_BYTES)
+         return (s32)CELL_VDEC_ERROR_ARG;
+ 
++    VdecFf* ff = vdec_ff_open(codec_type);
++    if (!ff) {
++        fprintf(stderr, "[cellVdec] no decoder for codecType %u: Open fails (is FFmpeg next to "
++                        "the executable? tools/fetch_ffmpeg.ps1)\n", codec_type);
++        return (s32)CELL_VDEC_ERROR_FATAL;
++    }
++
++    AcquireSRWLockExclusive(&s_vdec_open);
+     for (int i = 0; i < MAX_VDEC; i++) {
+-        if (!s_vdec[i].in_use) {
+-            VDEC_LOCK();
+-            memset(&s_vdec[i], 0, sizeof(VdecSlot));
+-            s_vdec[i].in_use = 1;
+-            s_vdec[i].codecType = codec_type;
+-            s_vdec[i].cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
+-            s_vdec[i].cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
+-            s_vdec[i].ff = vdec_ff_open(codec_type);
+-            VDEC_UNLOCK();
+-            vm_write32((u32)(uintptr_t)handle, (u32)VDEC_HANDLE_OF(i));
+-            printf("[cellVdec] Open -> handle=%u\n", (u32)VDEC_HANDLE_OF(i));
+-            if (s_vdec[i].ff) {
+-                printf("[cellVdec] decoding with libavcodec\n");
+-                vdec_idle_thread_start();
+-            }
+-            return CELL_OK;
++        VdecSlot* v = &s_vdec[i];
++        if (v->in_use)
++            continue;
++        memset(v, 0, sizeof(*v));
++        v->in_use = 1;
++        v->slot = (u32)i;
++        v->codecType = codec_type;
++        v->cbFunc = cb_ea ? vm_read32(cb_ea + 0) : 0;
++        v->cbArg  = cb_ea ? vm_read32(cb_ea + 4) : 0;
++        v->memAddr = mem;
++        v->ff = ff;
++        v->seq = VDEC_SEQ_DORMANT;
++        InitializeSRWLock(&v->lock);
++        InitializeSRWLock(&v->conv_lock);
++        InitializeConditionVariable(&v->wake);
++        InitializeConditionVariable(&v->converted);
++        v->thread = CreateThread(NULL, 1u << 20, vdec_thread, v, 0, NULL);
++        if (!v->thread) {
++            v->in_use = 0;
++            break;
+         }
++        ReleaseSRWLockExclusive(&s_vdec_open);
++        vm_write32(GUEST_EA(handle), (u32)VDEC_HANDLE_OF(i));
++        return CELL_OK;
+     }
++    ReleaseSRWLockExclusive(&s_vdec_open);
++    vdec_ff_close(ff);
+     return (s32)CELL_VDEC_ERROR_BUSY;
+ }
+ 
+@@ -321,178 +499,134 @@ s32 cellVdecOpenEx(const CellVdecType* type, const CellVdecResource* res,
+     return cellVdecOpen(type, res, cb, handle);
+ }
+ 
++/* The commands already queued run first, so an EndSeq still gets its SEQDONE;
++ * abort only stops decoding and any wait for the title. */
+ s32 cellVdecClose(CellVdecHandle handle)
+ {
+-    printf("[cellVdec] Close(handle=%u)\n", handle);
+-    handle = VDEC_SLOT_OF(handle);
+-
+-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
++    fprintf(stderr, "[cellVdec] Close(handle=%u)\n", handle);
++    VdecSlot* v = vdec_of(handle);
++    if (!v)
+         return (s32)CELL_VDEC_ERROR_ARG;
+ 
+-    VDEC_LOCK();
+-    if (s_vdec[handle].ff) {
+-        vdec_queue_clear(&s_vdec[handle]);
+-        vdec_ff_close(s_vdec[handle].ff);
+-        s_vdec[handle].ff = NULL;
+-    }
+-    s_vdec[handle].in_use = 0;
+-    VDEC_UNLOCK();
++    VdecCmd cmd;
++    memset(&cmd, 0, sizeof(cmd));
++    cmd.type = VDEC_CMD_CLOSE;
++    AcquireSRWLockExclusive(&v->lock);
++    v->abort = 1;
++    vdec_push(v, &cmd);
++    ReleaseSRWLockExclusive(&v->lock);
++
++    WaitForSingleObject(v->thread, INFINITE);
++    CloseHandle(v->thread);
++
++    AcquireSRWLockExclusive(&v->lock);
++    vdec_queue_clear(v);
++    while (v->bufCount) free(v->bufPool[--v->bufCount]);
++    v->seq = VDEC_SEQ_CLOSED;
++    ReleaseSRWLockExclusive(&v->lock);
++    vdec_ff_close(v->ff);
++    v->ff = NULL;
++    v->in_use = 0;
+     return CELL_OK;
+ }
+ 
+ s32 cellVdecStartSeq(CellVdecHandle handle)
+ {
+-    printf("[cellVdec] StartSeq(handle=%u)\n", handle);
+-    handle = VDEC_SLOT_OF(handle);
+-
+-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
++    fprintf(stderr, "[cellVdec] StartSeq(handle=%u)\n", handle);
++    VdecSlot* v = vdec_of(handle);
++    if (!v)
+         return (s32)CELL_VDEC_ERROR_ARG;
+ 
+-    VDEC_LOCK();
+-    s_vdec[handle].seqStarted = 1;
+-    if (s_vdec[handle].ff) {
+-        /* A new sequence: nothing from the last one is shown. */
+-        vdec_ff_reset(s_vdec[handle].ff);
+-        s_vdec[handle].nextPts = 0;
+-        vdec_queue_clear(&s_vdec[handle]);
+-        s_vdec[handle].auCount = 0;
+-        s_vdec[handle].picsDecoded = 0;
+-        s_vdec[handle].lastAuMs = 0;
+-        s_vdec[handle].idleDrained = 0;
++    VdecCmd cmd;
++    memset(&cmd, 0, sizeof(cmd));
++    cmd.type = VDEC_CMD_START;
++    AcquireSRWLockExclusive(&v->lock);
++    if (v->seq != VDEC_SEQ_DORMANT && v->seq != VDEC_SEQ_READY) {
++        ReleaseSRWLockExclusive(&v->lock);
++        return (s32)CELL_VDEC_ERROR_SEQ;
+     }
+-    VDEC_UNLOCK();
++    v->seq = VDEC_SEQ_READY;
++    vdec_push(v, &cmd);
++    ReleaseSRWLockExclusive(&v->lock);
+     return CELL_OK;
+ }
+ 
++/* The pictures the decoder still holds for reordering come out, each with its
++ * PICOUT, before SEQDONE. A title that closes straight after EndSeq, as F does,
++ * loses them: the system library's order, and RPCS3's. */
+ s32 cellVdecEndSeq(CellVdecHandle handle)
+ {
+-    printf("[cellVdec] EndSeq(handle=%u)\n", handle);
+-    handle = VDEC_SLOT_OF(handle);
+-
+-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
++    fprintf(stderr, "[cellVdec] EndSeq(handle=%u)\n", handle);
++    VdecSlot* v = vdec_of(handle);
++    if (!v)
+         return (s32)CELL_VDEC_ERROR_ARG;
+ 
+-    /* Pictures the decoder still holds for reordering come out now, each
+-     * with its PICOUT, before SEQDONE. */
+-    VDEC_LOCK();
+-    s_vdec[handle].seqStarted = 0;
+-    const int ff = s_vdec[handle].ff != NULL;
+-    if (ff)
+-        vdec_ff_drain(s_vdec[handle].ff, vdec_on_picture, &s_vdec[handle]);
+-    VDEC_UNLOCK();
+-    if (ff)
+-        vdec_notify_new_pics(handle);
+-
+-    /* Notify sequence done */
+-    vdec_notify(handle, CELL_VDEC_MSG_TYPE_SEQDONE, CELL_OK);
+-
++    VdecCmd cmd;
++    memset(&cmd, 0, sizeof(cmd));
++    AcquireSRWLockExclusive(&v->lock);
++    if (v->seq != VDEC_SEQ_READY) {
++        ReleaseSRWLockExclusive(&v->lock);
++        return (s32)CELL_VDEC_ERROR_SEQ;
++    }
++    v->seq = VDEC_SEQ_ENDING;
++    cmd.type = VDEC_CMD_DRAIN;
++    vdec_push(v, &cmd);
++    cmd.type = VDEC_CMD_END;
++    vdec_push(v, &cmd);
++    ReleaseSRWLockExclusive(&v->lock);
+     return CELL_OK;
+ }
+ 
+ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auInfo)
+ {
+     (void)mode;
+-    handle = VDEC_SLOT_OF(handle);
+-
+-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
++    VdecSlot* v = vdec_of(handle);
++    if (!v || !auInfo)
+         return (s32)CELL_VDEC_ERROR_ARG;
+-    if (!auInfo)
+-        return (s32)CELL_VDEC_ERROR_ARG;
+-
+-    VdecSlot* v = &s_vdec[handle];
+ 
+     /* CellVdecAuInfo mixes u32 and u64, so it comes across field by field: a
+      * big-endian u64 is high word first, and a word-at-a-time copy would put
+      * the two halves the wrong way round on a little-endian host. */
+     u32 au_ea = GUEST_EA(auInfo);
+-    CellVdecAuInfo au;
+-    au.startAddr = vm_read32(au_ea + (u32)offsetof(CellVdecAuInfo, startAddr));
+-    au.size      = vm_read32(au_ea + (u32)offsetof(CellVdecAuInfo, size));
+-    au.pts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, pts));
+-    au.dts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, dts));
+-    au.userData  = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, userData));
+-
+-    /* A player whose decoder is full retries the same unit until it is
+-     * accepted -- thousands of times a second -- so this line is opt-in:
+-     * VDEC_TRACE, or PS3_VERBOSE. */
+-    { static int s_log = -1;
+-      if (s_log < 0) s_log = (getenv("VDEC_TRACE") || ps3_log_verbose()) ? 1 : 0;
+-      if (s_log)
+-          printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
+-                 (u32)VDEC_HANDLE_OF(handle), au.startAddr, au.size,
+-                 (unsigned long long)au.pts); }
+-
+-    if (v->ff) {
+-        VDEC_LOCK();
+-        if (v->qCount >= VDEC_BUSY_AT) {
+-            VDEC_UNLOCK();
+-            return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
+-        }
+-        v->auCount++;
+-        v->aus[v->auCount % VDEC_AU_RING] = au;
+-        v->newPics = 0;
+-        if (au.size)   /* an empty packet would mean end of stream to FFmpeg */
+-            vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
+-                           vdec_on_picture, v);
+-        v->lastAuMs = vdec_now_ms();
+-        v->idleDrained = 0;
+-        VDEC_UNLOCK();
+-        vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
+-        vdec_notify_new_pics(handle);
+-        return CELL_OK;
++    VdecCmd cmd;
++    memset(&cmd, 0, sizeof(cmd));
++    cmd.type = VDEC_CMD_AU;
++    cmd.au.startAddr = vm_read32(au_ea + (u32)offsetof(CellVdecAuInfo, startAddr));
++    cmd.au.size      = vm_read32(au_ea + (u32)offsetof(CellVdecAuInfo, size));
++    cmd.au.pts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, pts));
++    cmd.au.dts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, dts));
++    cmd.au.userData  = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, userData));
++
++    AcquireSRWLockExclusive(&v->lock);
++    if (v->seq != VDEC_SEQ_READY) {
++        ReleaseSRWLockExclusive(&v->lock);
++        return (s32)CELL_VDEC_ERROR_SEQ;
+     }
+-
+-    /* Step 1: Report AU consumed */
+-    vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
+-
+-    /* Step 2: Generate a dummy PICOUT callback.
+-     * Without FFmpeg, we can't actually decode video. But games expect the
+-     * PICOUT callback to fire for each AU, so we generate a placeholder
+-     * picture. Games that only check for completion (not pixel data) will
+-     * proceed correctly. */
+-    v->auCount++;
+-    memset(&v->lastPic, 0, sizeof(v->lastPic));
+-    v->lastPic.codecType = v->codecType;
+-    v->lastPic.startAddr = au.startAddr;
+-    v->lastPic.size      = au.size;
+-    v->lastPic.auNum     = v->auCount;
+-    v->lastPic.pts       = au.pts;
+-    v->lastPic.dts       = au.dts;
+-    v->lastPic.userData  = au.userData;
+-    v->lastPic.status    = 0; /* OK */
+-    v->lastPic.picFmt    = CELL_VDEC_PIC_FMT_YUV420P;
+-    v->lastPic.width     = v->width ? v->width : 1280;
+-    v->lastPic.height    = v->height ? v->height : 720;
+-    v->hasPic = 1;
+-
+-    vdec_notify(handle, CELL_VDEC_MSG_TYPE_PICOUT, CELL_OK);
+-
++    if (v->ausQueued >= VDEC_AU_DEPTH) {
++        ReleaseSRWLockExclusive(&v->lock);
++        return (s32)CELL_VDEC_ERROR_BUSY;
++    }
++    v->ausQueued++;
++    vdec_push(v, &cmd);
++    ReleaseSRWLockExclusive(&v->lock);
+     return CELL_OK;
+ }
+ 
+-/* Guest-resident pic items. cellVdecGetPicItem hands the title a POINTER to a
+- * CellVdecPicItem, so it has to live in guest memory, big-endian; writing
+- * &host_struct through the guest's out-pointer crashed Resistance: Fall of Man
+- * inside its PICOUT callback. One 0x100-byte block per decoder after cellAdec's
+- * scratch (VM_HLE_INJECT_BASE + 0x40000..0x50000): the item at +0, the codec
+- * info it points to at +0x80.
+- *
+- * Guest CellVdecPicItem: +0x00 codecType, +0x04 startAddr, +0x08 size,
++/* Guest CellVdecPicItem: +0x00 codecType, +0x04 startAddr, +0x08 size,
+  * +0x0C u8 auNum, +0x10 auPts[2] {upper,lower}, +0x20 auDts[2],
+  * +0x30 u64 auUserData[2], +0x40 status, +0x44 attr (0 normal, 1 skipped),
+  * +0x48 picInfo. CellVdecAvcInfo and CellVdecMpeg2Info both begin with
+- * u16 horizontalSize, u16 verticalSize; the rest of the info block is zero. */
+-#define VDEC_ITEM_EA(h)  (VM_HLE_INJECT_BASE + 0x50000u + (u32)(h) * 0x100u)
+-#define VDEC_INFO_EA(h)  (VDEC_ITEM_EA(h) + 0x80u)
+-
+-static void vdec_write_item(CellVdecHandle handle, const CellVdecPicItem* p)
++ * u16 horizontalSize, u16 verticalSize; the rest of the info block is zero.
++ *
++ * An item stays readable after the next one: a ring in the title's work memory,
++ * as the system library does, 0x100 bytes each, the codec info at +0x80. */
++static void vdec_write_item(u32 it, const VdecSlot* v, const VdecPic* p)
+ {
+-    const VdecSlot* v = &s_vdec[handle];
+-    u32 it = VDEC_ITEM_EA(handle), info = VDEC_INFO_EA(handle);
+-    for (u32 o = 0; o < 0x100; o += 4) vm_write32(it + o, 0);
++    u32 info = it + 0x80u;
++    for (u32 o = 0; o < VDEC_ITEM_BYTES; o += 4) vm_write32(it + o, 0);
+     vm_write32(it + 0x00, v->codecType);
+-    vm_write32(it + 0x04, p->startAddr);
+-    vm_write32(it + 0x08, p->size);
++    vm_write32(it + 0x04, 0x00000123u);                /* a picture has no AU address */
++    vm_write32(it + 0x08, ((p->width * p->height * 3 / 2) + 127u) & ~127u);
+     vm_write8 (it + 0x0C, 1);                          /* one AU per picture */
+     vm_write32(it + 0x10, (u32)(p->pts >> 32));        /* auPts[0] */
+     vm_write32(it + 0x14, (u32)p->pts);
+@@ -506,182 +640,162 @@ static void vdec_write_item(CellVdecHandle handle, const CellVdecPicItem* p)
+     vm_write32(it + 0x40, 0);                          /* status: OK */
+     vm_write32(it + 0x44, 0);                          /* attr: normal */
+     vm_write32(it + 0x48, info);
+-    vm_write16(info + 0, p->width);
+-    vm_write16(info + 2, p->height);
+-}
+-
+-/* The decoder path also reports the picture type.
+- * ASSUMPTION (field order of the SDK's CellVdecAvcInfo / CellVdecMpeg2Info,
+- * not yet checked against a title):
+- *   AVC   +0x04 u8 pictureType[2] (0 I, 1 P, 2 B, 3 unknown),
+- *         +0x06 u8 idrPictureFlag;
+- *   MPEG2 +0x12 u8 picture_coding_type[2] (1 I, 2 P, 3 B, as in the bitstream).
+- * pict_type is FFmpeg's (1 I, 2 P, 3 B, 0 none). */
+-static void vdec_write_pic_type(CellVdecHandle handle, const VdecPic* q)
+-{
+-    u32 info = VDEC_INFO_EA(handle);
+-    int t = q->pictType;
+-    if (s_vdec[handle].codecType == CELL_VDEC_CODEC_TYPE_AVC) {
++    vm_write16(info + 0, (u16)p->width);
++    vm_write16(info + 2, (u16)p->height);
++
++    int t = p->pictType;
++    if (v->codecType == CELL_VDEC_CODEC_TYPE_AVC) {
++        /* ASSUMPTION (field order of the SDK's CellVdecAvcInfo, not checked
++         * against a title): +0x04 u8 pictureType[2] (0 I, 1 P, 2 B, 3 unknown),
++         * +0x06 u8 idrPictureFlag. */
+         vm_write8(info + 0x04, (u8)(t >= 1 && t <= 3 ? t - 1 : 3));
+         vm_write8(info + 0x05, 3);
+-        vm_write8(info + 0x06, (u8)(q->key && t == 1));
+-    } else if (s_vdec[handle].codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
++    } else if (v->codecType == CELL_VDEC_CODEC_TYPE_MPEG2) {
+         /* CellVdecMpeg2Info: +4 aspect_ratio_information, +5 frame_rate_code,
+-         * +6 progressive_sequence. GoW:A's player paces pictures by
+-         * time x the rate it looks up from frame_rate_code; left 0
+-         * ("forbidden") the rate was 0 and only the first picture was ever
+-         * taken. Codes are the MPEG-2 ones: 1 23.976 .. 8 60. */
++         * +6 progressive_sequence, +0x12 picture_coding_type[2] (1 I, 2 P, 3 B,
++         * as in the bitstream). GoW:A's player paces pictures by time x the rate
++         * it looks up from frame_rate_code; left 0 ("forbidden") the rate was 0
++         * and only the first picture was ever taken. Codes are the MPEG-2 ones:
++         * 1 23.976 .. 8 60. */
+         static const u32 code_ticks[9] = { 0, 3754, 3750, 3600, 3003, 3000, 1800, 1502, 1500 };
+         u8 code = 4;                                   /* 29.97 when unknown */
+         u32 best = ~0u;
+-        if (q->frameTicks)
++        if (p->frameTicks)
+             for (u8 c = 1; c <= 8; c++) {
+-                u32 d = q->frameTicks > code_ticks[c] ? q->frameTicks - code_ticks[c]
+-                                                      : code_ticks[c] - q->frameTicks;
++                u32 d = p->frameTicks > code_ticks[c] ? p->frameTicks - code_ticks[c]
++                                                      : code_ticks[c] - p->frameTicks;
+                 if (d < best) { best = d; code = c; }
+             }
+-        vm_write8(info + 0x04, (u8)(q->item.width * 9u == q->item.height * 16u ? 3 : 2));
++        vm_write8(info + 0x04, (u8)(p->width * 9u == p->height * 16u ? 3 : 2));
+         vm_write8(info + 0x05, code);
+         vm_write8(info + 0x06, 1);
+         vm_write8(info + 0x12, (u8)(t >= 1 && t <= 3 ? t : 0));
+     }
+ }
+ 
+-/* cellVdecGetPicItem(handle, &item): the NEXT picture's item, without
+- * consuming it; cellVdecGetPicture is what takes it off the queue. */
++/* cellVdecGetPicItem(handle, &item): the item of the next picture that has not
++ * had one, which is not taken off the queue: cellVdecGetPicture does that. */
+ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
+ {
+-    handle = VDEC_SLOT_OF(handle);
+-    u32 out = (u32)(uintptr_t)picItem;
+-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !out)
++    VdecSlot* v = vdec_of(handle);
++    u32 out = GUEST_EA(picItem);
++    if (!v || !out)
+         return (s32)CELL_VDEC_ERROR_ARG;
+-    const VdecSlot* v = &s_vdec[handle];
+-    if (v->ff) {
+-        VDEC_LOCK();
+-        if (!v->qCount) {
+-            VDEC_UNLOCK();
+-            return (s32)CELL_VDEC_ERROR_EMPTY;
+-        }
+-        const VdecPic* q = &v->queue[v->qHead];
+-        vdec_write_item(handle, &q->item);
+-        vdec_write_pic_type(handle, q);
+-        vm_write32(out, VDEC_ITEM_EA(handle));
+-        VDEC_UNLOCK();
++
++    AcquireSRWLockExclusive(&v->lock);
++    if (v->seq == VDEC_SEQ_CLOSED) {
++        ReleaseSRWLockExclusive(&v->lock);
++        return (s32)CELL_VDEC_ERROR_SEQ;
++    }
++    for (u32 i = 0; i < v->qCount; i++) {
++        VdecPic* p = &v->queue[(v->qHead + i) % VDEC_PIC_MAX];
++        if (p->itemTaken)
++            continue;
++        p->itemTaken = 1;
++        const u32 it = v->memAddr + v->itemSlot * VDEC_ITEM_BYTES;
++        v->itemSlot = (v->itemSlot + 1) % VDEC_ITEM_SLOTS;
++        vdec_write_item(it, v, p);
++        vm_write32(out, it);
++        v->nGetItem++;
++        ReleaseSRWLockExclusive(&v->lock);
+         return CELL_OK;
+     }
+-    if (!s_vdec[handle].hasPic)
+-        return (s32)CELL_VDEC_ERROR_EMPTY;
+-    vdec_write_item(handle, &v->lastPic);
+-    vm_write32(out, VDEC_ITEM_EA(handle));
+-    return CELL_OK;
++    ReleaseSRWLockExclusive(&v->lock);
++    return (s32)CELL_VDEC_ERROR_EMPTY;
+ }
+ 
+-/* cellVdecGetPicture(handle, format, outBuff): copy the next picture out in
+- * the requested format and consume it. format is a guest CellVdecPicFormat
+- * { u32 formatType; u32 colorMatrixType; u8 alpha; }; formatType 0 ARGB32,
+- * 1 RGBA32, 2 UYVY422, 3 YUV420 planar.
+- * With libavcodec the picture is the decoded one (vdec_take_picture). Without
+- * it the picture is black at the item's size (1280x720 unless set); titles
+- * that only pace playback on PICOUT/GetPicture run as they should. */
++/* Copy the next picture out in the requested format and consume it. formatType
++ * 0 ARGB32, 1 RGBA32, 2 UYVY422, 3 YUV420 planar; a NULL dst is a skip. */
+ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alpha)
+ {
+-    if (!v->qCount)
++    AcquireSRWLockExclusive(&v->lock);
++    if (v->seq == VDEC_SEQ_CLOSED) {
++        ReleaseSRWLockExclusive(&v->lock);
++        return (s32)CELL_VDEC_ERROR_SEQ;
++    }
++    if (!v->qCount) {
++        ReleaseSRWLockExclusive(&v->lock);
+         return (s32)CELL_VDEC_ERROR_EMPTY;
+-    VdecPic* q = &v->queue[v->qHead];
+-    v->qHead = (v->qHead + 1) % VDEC_QUEUE;
++    }
++    while (v->queue[v->qHead].converting)
++        SleepConditionVariableSRW(&v->converted, &v->lock, INFINITE, 0);
++    VdecPic pic = v->queue[v->qHead];
++    v->qHead = (v->qHead + 1) % VDEC_PIC_MAX;
+     v->qCount--;
+-    /* VDEC_PICLOG=1: the first pictures handed out, with where they went, then
+-     * every 1000th and the last few before the AU count. */
+-    { static int s_pl = -1; static unsigned s_n = 0;
+-      if (s_pl < 0) s_pl = getenv("VDEC_PICLOG") ? 1 : 0;
+-      s_n++;
+-      if (s_pl && (s_n <= 16 || s_n % 1000 == 0 || v->auCount < s_n + 4))
+-          printf("[cellVdec] GetPicture #%u (AUs %u) %ux%u type=%u matrix=%u alpha=%u -> 0x%08X\n",
+-                 s_n, v->auCount, q->item.width, q->item.height, type, matrix, alpha, dst); }
+-    if (dst)                                           /* NULL: a skip */
+-        vdec_store_picture(dst, q->yuv, q->item.width, q->item.height,
+-                           type, matrix, alpha);
+-    free(q->yuv);
+-    q->yuv = NULL;
+-    return CELL_OK;
++    v->fmtKnown = 1;
++    v->fmtType = type;
++    v->fmtMatrix = matrix;
++    v->fmtAlpha = alpha;
++    v->nGetPic++;
++    const size_t bytes = vdec_picture_bytes(pic.width, pic.height, type);
++    u8* buf = NULL;
++    const int ready = pic.conv && pic.conv_key == vdec_fmt_key(type, matrix, alpha) &&
++                      pic.conv_bytes == bytes;
++    if (dst && !ready && type < 3) {
++        buf = vdec_buf_get(v, bytes);
++        v->nLateConv++;
++    }
++    WakeAllConditionVariable(&v->wake);
++    ReleaseSRWLockExclusive(&v->lock);
++
++    s32 rc = CELL_OK;
++    if (dst) {
++        if (ready) {
++            vm_memcpy_to(dst, pic.conv, bytes);
++        } else if (type >= 3) {
++            vdec_store_picture(dst, pic.yuv, pic.width, pic.height, type, matrix, alpha);
++        } else if (buf) {
++            /* A picture from before the title's first GetPicture, or a new format. */
++            AcquireSRWLockExclusive(&v->conv_lock);
++            int r = vdec_ff_convert(v->ff, pic.yuv, pic.width, pic.height, type, matrix, alpha, buf);
++            ReleaseSRWLockExclusive(&v->conv_lock);
++            if (r == 0)
++                vm_memcpy_to(dst, buf, bytes);
++            else
++                rc = (s32)CELL_VDEC_ERROR_FATAL;
++        } else {
++            rc = (s32)CELL_VDEC_ERROR_FATAL;
++        }
++    }
++
++    AcquireSRWLockExclusive(&v->lock);
++    vdec_pic_free(v, &pic);
++    vdec_buf_put(v, buf, bytes);
++    ReleaseSRWLockExclusive(&v->lock);
++    return rc;
+ }
+ 
++/* format is a guest CellVdecPicFormat { u32 formatType; u32 colorMatrixType;
++ * u8 alpha; }. */
+ s32 cellVdecGetPicture(CellVdecHandle handle, const void* format, void* outBuff)
+ {
+-    handle = VDEC_SLOT_OF(handle);
+-    u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
+-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !fmt_ea)
++    VdecSlot* v = vdec_of(handle);
++    u32 fmt_ea = GUEST_EA(format);
++    if (!v || !fmt_ea)
+         return (s32)CELL_VDEC_ERROR_ARG;
+-    VdecSlot* v = &s_vdec[handle];
+-    if (v->ff) {
+-        VDEC_LOCK();
+-        s32 rc = vdec_take_picture(v, dst, vm_read32(fmt_ea + 0),
+-                                   vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 8));
+-        VDEC_UNLOCK();
+-        return rc;
+-    }
+-    if (!v->hasPic)
+-        return (s32)CELL_VDEC_ERROR_EMPTY;
+-    v->hasPic = 0;
+-    if (!dst)
+-        return CELL_OK;                                /* a skip: consume only */
+-
+-    u32 type  = vm_read32(fmt_ea + 0);
+-    u8  alpha = vm_read8(fmt_ea + 8);
+-    u32 w = v->lastPic.width, h = v->lastPic.height;
+-    u8 row[4096 * 4];
+-    u32 rowlen;
+-    switch (type) {
+-    case 0: case 1:                                    /* ARGB32 / RGBA32 */
+-        rowlen = w * 4; memset(row, 0, rowlen);
+-        for (u32 x = 0; x < w; x++) row[x * 4 + (type == 0 ? 0 : 3)] = alpha;
+-        break;
+-    case 2:                                            /* UYVY: U Y V Y */
+-        rowlen = w * 2;
+-        for (u32 x = 0; x < rowlen; x += 2) { row[x] = 0x80; row[x + 1] = 0x10; }
+-        break;
+-    default: {                                         /* YUV420 planar */
+-        memset(row, 0x10, w);
+-        for (u32 y = 0; y < h; y++) guest_struct_store(dst + y * w, row, w);
+-        memset(row, 0x80, w / 2);
+-        u32 c = dst + w * h;
+-        for (u32 y = 0; y < h; y++) guest_struct_store(c + y * (w / 2), row, w / 2);
+-        return CELL_OK; }
+-    }
+-    for (u32 y = 0; y < h; y++) guest_struct_store(dst + y * rowlen, row, rowlen);
+-    return CELL_OK;
++    return vdec_take_picture(v, GUEST_EA(outBuff), vm_read32(fmt_ea + 0),
++                             vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 8));
+ }
+ 
+ /* cellVdecGetPictureExt(handle, format2, outBuff, arg4): GetPicture with a
+- * CellVdecPicFormat2. ASSUMPTION (SDK field order): +0 u32 formatType,
+- * +4 u32 colorMatrixType, +8 u32 unk0, +0xC u8 alpha; arg4 is unused here.
+- * Without a decoder this does what the call did before it was implemented
+- * (an unregistered import): return CELL_OK and touch nothing. */
++ * CellVdecPicFormat2: +0 u32 formatType, +4 u32 colorMatrixType, +8 u32 unk0,
++ * +0xC u8 alpha; arg4 is unused here. */
+ s32 cellVdecGetPictureExt(CellVdecHandle handle, const void* format,
+                           void* outBuff, u32 arg4)
+ {
+     (void)arg4;
+-    handle = VDEC_SLOT_OF(handle);
+-    u32 fmt_ea = (u32)(uintptr_t)format, dst = (u32)(uintptr_t)outBuff;
+-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use || !s_vdec[handle].ff)
+-        return CELL_OK;
+-    if (!fmt_ea)
++    VdecSlot* v = vdec_of(handle);
++    u32 fmt_ea = GUEST_EA(format);
++    if (!v || !fmt_ea)
+         return (s32)CELL_VDEC_ERROR_ARG;
+-    VDEC_LOCK();
+-    s32 rc = vdec_take_picture(&s_vdec[handle], dst, vm_read32(fmt_ea + 0),
+-                               vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 0xC));
+-    VDEC_UNLOCK();
+-    return rc;
++    return vdec_take_picture(v, GUEST_EA(outBuff), vm_read32(fmt_ea + 0),
++                             vm_read32(fmt_ea + 4), vm_read8(fmt_ea + 0xC));
+ }
+ 
+ s32 cellVdecSetFrameRate(CellVdecHandle handle, u32 frameRateCode)
+ {
+-    printf("[cellVdec] SetFrameRate(handle=%u, code=%u)\n",
+-           handle, frameRateCode);
+-    handle = VDEC_SLOT_OF(handle);
+-
+-    if (handle >= MAX_VDEC || !s_vdec[handle].in_use)
++    fprintf(stderr, "[cellVdec] SetFrameRate(handle=%u, code=%u)\n", handle, frameRateCode);
++    if (!vdec_of(handle))
+         return (s32)CELL_VDEC_ERROR_ARG;
+-
+     return CELL_OK;
+ }
+diff --git a/libs/codec/ffmpeg_runtime.c b/libs/codec/ffmpeg_runtime.c
+index 4a848e76..34f112b6 100644
+--- a/libs/codec/ffmpeg_runtime.c
++++ b/libs/codec/ffmpeg_runtime.c
+@@ -29,15 +29,19 @@ static void   ff_close(ff_lib l) { dlclose(l); }
+  * read: libavcodec.so.63 / avcodec-63.dll / libavcodec.63.dylib. */
+ #define FF_MAJ_C AV_STRINGIFY(LIBAVCODEC_VERSION_MAJOR)
+ #define FF_MAJ_U AV_STRINGIFY(LIBAVUTIL_VERSION_MAJOR)
++#define FF_MAJ_S AV_STRINGIFY(LIBSWSCALE_VERSION_MAJOR)
+ #if defined(_WIN32)
+ #define FF_AVCODEC_NAME "avcodec-" FF_MAJ_C ".dll"
+ #define FF_AVUTIL_NAME  "avutil-" FF_MAJ_U ".dll"
++#define FF_SWSCALE_NAME "swscale-" FF_MAJ_S ".dll"
+ #elif defined(__APPLE__)
+ #define FF_AVCODEC_NAME "libavcodec." FF_MAJ_C ".dylib"
+ #define FF_AVUTIL_NAME  "libavutil." FF_MAJ_U ".dylib"
++#define FF_SWSCALE_NAME "libswscale." FF_MAJ_S ".dylib"
+ #else
+ #define FF_AVCODEC_NAME "libavcodec.so." FF_MAJ_C
+ #define FF_AVUTIL_NAME  "libavutil.so." FF_MAJ_U
++#define FF_SWSCALE_NAME "libswscale.so." FF_MAJ_S
+ #endif
+ 
+ static PS3FFmpeg s_ff;
+@@ -49,6 +53,12 @@ static const char* env_or(const char* name, const char* dflt)
+     return (v && *v) ? v : dflt;
+ }
+ 
++int ps3_ffmpeg_config_allowed(const char* configuration)
++{
++    return !strstr(configuration, "--enable-gpl") &&
++           !strstr(configuration, "--enable-nonfree");
++}
++
+ static int ff_load(void)
+ {
+     const char* off = getenv("PS3RECOMP_FFMPEG");
+@@ -58,13 +68,17 @@ static int ff_load(void)
+     }
+     const char* util_path  = env_or("PS3RECOMP_FFMPEG_AVUTIL", FF_AVUTIL_NAME);
+     const char* codec_path = env_or("PS3RECOMP_FFMPEG_AVCODEC", FF_AVCODEC_NAME);
++    const char* sws_path   = env_or("PS3RECOMP_FFMPEG_SWSCALE", FF_SWSCALE_NAME);
+     /* avutil first: avcodec depends on it, and on Windows the loader finds an
+      * already-loaded avutil by name. */
+     ff_lib util = ff_open(util_path);
+     ff_lib codec = util ? ff_open(codec_path) : NULL;
+-    if (!util || !codec) {
+-        printf("[ffmpeg] %s not found; decoders stay callback-only\n",
+-               util ? codec_path : util_path);
++    ff_lib sws = codec ? ff_open(sws_path) : NULL;
++    if (!util || !codec || !sws) {
++        fprintf(stderr, "[ffmpeg] %s not found: cellVdec and cellAdec will fail to open "
++                        "(see tools/fetch_ffmpeg.ps1)\n",
++                !util ? util_path : !codec ? codec_path : sws_path);
++        if (codec) ff_close(codec);
+         if (util) ff_close(util);
+         return -1;
+     }
+@@ -74,6 +88,8 @@ static int ff_load(void)
+     do { *(void**)&s_ff.fn = ff_sym(lib, #fn); \
+          if (!s_ff.fn) { printf("[ffmpeg] missing %s\n", #fn); missing = 1; } } while (0)
+     FF_RESOLVE(codec, avcodec_version);
++    FF_RESOLVE(codec, avcodec_configuration);
++    FF_RESOLVE(codec, avcodec_license);
+     FF_RESOLVE(codec, avcodec_find_decoder);
+     FF_RESOLVE(codec, avcodec_alloc_context3);
+     FF_RESOLVE(codec, avcodec_open2);
+@@ -88,6 +104,11 @@ static int ff_load(void)
+     FF_RESOLVE(util, av_frame_free);
+     FF_RESOLVE(util, av_frame_unref);
+     FF_RESOLVE(util, av_log_set_level);
++    FF_RESOLVE(sws, sws_getCachedContext);
++    FF_RESOLVE(sws, sws_freeContext);
++    FF_RESOLVE(sws, sws_scale);
++    FF_RESOLVE(sws, sws_setColorspaceDetails);
++    FF_RESOLVE(sws, sws_getCoefficients);
+ #undef FF_RESOLVE
+ 
+     if (!missing && ((s_ff.avcodec_version() >> 16) != LIBAVCODEC_VERSION_MAJOR ||
+@@ -100,13 +121,23 @@ static int ff_load(void)
+     }
+     if (missing) {
+         memset(&s_ff, 0, sizeof(s_ff));
++        ff_close(sws);
+         ff_close(codec);
+         ff_close(util);
+         return -1;
+     }
++    const char* conf = s_ff.avcodec_configuration();
++    if (!ps3_ffmpeg_config_allowed(conf)) {
++        fprintf(stderr, "[ffmpeg] FATAL: %s was built with --enable-gpl or --enable-nonfree "
++                        "and may not be loaded by this program. Stopping.\n[ffmpeg] %s\n",
++                codec_path, conf);
++        fflush(stderr);
++        exit(3);
++    }
+     s_ff.av_log_set_level(AV_LOG_ERROR);
+     unsigned v = s_ff.avcodec_version();
+-    printf("[ffmpeg] libavcodec %u.%u.%u loaded\n", v >> 16, (v >> 8) & 0xFF, v & 0xFF);
++    fprintf(stderr, "[ffmpeg] libavcodec %u.%u.%u loaded (%s)\n", v >> 16, (v >> 8) & 0xFF,
++            v & 0xFF, s_ff.avcodec_license());
+     /* The libraries stay loaded for the life of the process. */
+     return 1;
+ }
+diff --git a/libs/codec/ffmpeg_runtime.h b/libs/codec/ffmpeg_runtime.h
+index 6ec3bbcc..57c7d80a 100644
+--- a/libs/codec/ffmpeg_runtime.h
++++ b/libs/codec/ffmpeg_runtime.h
+@@ -17,10 +17,14 @@
+  * the major the headers describe (libavcodec.so.63 / avcodec-63.dll for
+  * FFmpeg 9.0) and is rejected if avcodec_version() reports another one.
+  *
++ * A library built with --enable-gpl or --enable-nonfree stops the process
++ * (ps3_ffmpeg_config_allowed): this binary is not licensed to load one.
++ *
+  * Run-time switches:
+- *   PS3RECOMP_FFMPEG=0          never load FFmpeg (callback-only behaviour)
++ *   PS3RECOMP_FFMPEG=0          never load FFmpeg (the decoders fail to open)
+  *   PS3RECOMP_FFMPEG_AVCODEC=p  open libavcodec from path p instead
+  *   PS3RECOMP_FFMPEG_AVUTIL=p   open libavutil from path p instead
++ *   PS3RECOMP_FFMPEG_SWSCALE=p  open libswscale from path p instead
+  */
+ 
+ #ifndef PS3RECOMP_FFMPEG_RUNTIME_H
+@@ -30,6 +34,7 @@
+ 
+ #include <libavcodec/avcodec.h>
+ #include <libavutil/frame.h>
++#include <libswscale/swscale.h>
+ 
+ #ifdef __cplusplus
+ extern "C" {
+@@ -37,6 +42,8 @@ extern "C" {
+ 
+ typedef struct PS3FFmpeg {
+     unsigned (*avcodec_version)(void);
++    const char* (*avcodec_configuration)(void);
++    const char* (*avcodec_license)(void);
+     const AVCodec* (*avcodec_find_decoder)(enum AVCodecID id);
+     AVCodecContext* (*avcodec_alloc_context3)(const AVCodec* codec);
+     int  (*avcodec_open2)(AVCodecContext* ctx, const AVCodec* codec, AVDictionary** opts);
+@@ -51,6 +58,17 @@ typedef struct PS3FFmpeg {
+     void (*av_frame_free)(AVFrame** frame);
+     void (*av_frame_unref)(AVFrame* frame);
+     void (*av_log_set_level)(int level);
++    SwsContext* (*sws_getCachedContext)(SwsContext* ctx, int src_w, int src_h,
++                                        enum AVPixelFormat src_fmt, int dst_w, int dst_h,
++                                        enum AVPixelFormat dst_fmt, int flags, SwsFilter* src_filter,
++                                        SwsFilter* dst_filter, const double* param);
++    void (*sws_freeContext)(SwsContext* ctx);
++    int  (*sws_scale)(SwsContext* ctx, const uint8_t* const src[], const int src_stride[],
++                      int slice_y, int slice_h, uint8_t* const dst[], const int dst_stride[]);
++    int  (*sws_setColorspaceDetails)(SwsContext* ctx, const int inv_table[4], int src_range,
++                                     const int table[4], int dst_range, int brightness,
++                                     int contrast, int saturation);
++    const int* (*sws_getCoefficients)(int colorspace);
+ } PS3FFmpeg;
+ 
+ /* The function table, loading FFmpeg on the first call. NULL when the build
+@@ -58,6 +76,10 @@ typedef struct PS3FFmpeg {
+  * outcome is printed once and then cached. */
+ const PS3FFmpeg* ps3_ffmpeg_get(void);
+ 
++/* 0 when an avcodec_configuration() string names --enable-gpl or
++ * --enable-nonfree. */
++int ps3_ffmpeg_config_allowed(const char* configuration);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/codec/vdec_ffmpeg.c b/libs/codec/vdec_ffmpeg.c
+index 5bea1a96..0ea5a8ae 100644
+--- a/libs/codec/vdec_ffmpeg.c
++++ b/libs/codec/vdec_ffmpeg.c
+@@ -17,6 +17,13 @@
+ 
+ static inline u8 clamp_u8(int v) { return (u8)(v < 0 ? 0 : v > 255 ? 255 : v); }
+ 
++size_t vdec_picture_bytes(u32 w, u32 h, u32 format_type)
++{
++    if (format_type <= 1) return (size_t)w * h * 4;
++    if (format_type == 2) return (size_t)w * h * 2;
++    return (size_t)w * h + 2 * (size_t)((w + 1) / 2) * ((h + 1) / 2);
++}
++
+ void vdec_store_picture(u32 dst, const u8* yuv, u32 w, u32 h,
+                         u32 format_type, u32 color_matrix, u8 alpha)
+ {
+@@ -90,6 +97,8 @@ struct VdecFf {
+     AVFrame* frame;
+     u8* buf;          /* the AU plus FFmpeg's zeroed input padding */
+     u32 buf_cap;
++    SwsContext* sws;  /* I420 -> the title's format */
++    int sws_key;      /* format and matrix sws is set to, plus one */
+ };
+ 
+ VdecFf* vdec_ff_open(u32 codec_type)
+@@ -131,6 +140,7 @@ void vdec_ff_close(VdecFf* d)
+     if (d->ctx) d->ff->avcodec_free_context(&d->ctx);
+     if (d->pkt) d->ff->av_packet_free(&d->pkt);
+     if (d->frame) d->ff->av_frame_free(&d->frame);
++    if (d->sws) d->ff->sws_freeContext(d->sws);
+     free(d->buf);
+     free(d);
+ }
+@@ -222,6 +232,40 @@ void vdec_ff_reset(VdecFf* d)
+     d->ff->avcodec_flush_buffers(d->ctx);
+ }
+ 
++int vdec_ff_convert(VdecFf* d, const u8* yuv, u32 w, u32 h, u32 format_type,
++                    u32 color_matrix, u8 alpha, u8* out)
++{
++    const enum AVPixelFormat dst_fmt =
++        format_type == 0 ? AV_PIX_FMT_ARGB : format_type == 1 ? AV_PIX_FMT_RGBA :
++        format_type == 2 ? AV_PIX_FMT_UYVY422 : AV_PIX_FMT_NONE;
++    if (dst_fmt == AV_PIX_FMT_NONE) return -1;
++
++    const int cw = (int)(w + 1) / 2, ch = (int)(h + 1) / 2;
++    const u8* src[4] = { yuv, yuv + (size_t)w * h, yuv + (size_t)w * h + (size_t)cw * ch, NULL };
++    const int src_stride[4] = { (int)w, cw, cw, 0 };
++    u8* dst[4] = { out, NULL, NULL, NULL };
++    const int dst_stride[4] = { (int)w * (format_type == 2 ? 2 : 4), 0, 0, 0 };
++
++    /* Same size in and out; SWS_POINT is what RPCS3 asks for. */
++    SwsContext* was = d->sws;
++    d->sws = d->ff->sws_getCachedContext(d->sws, (int)w, (int)h, AV_PIX_FMT_YUV420P,
++                                         (int)w, (int)h, dst_fmt, SWS_POINT, NULL, NULL, NULL);
++    if (!d->sws) return -1;
++    const int key = (int)(format_type << 8 | (color_matrix == 1)) + 1;
++    if (d->sws != was || d->sws_key != key) {
++        /* Limited-range input, full-range output, in the title's matrix. */
++        const int* cs = d->ff->sws_getCoefficients(color_matrix == 1 ? SWS_CS_ITU709 : SWS_CS_ITU601);
++        d->ff->sws_setColorspaceDetails(d->sws, cs, 0, cs, 1, 0, 1 << 16, 1 << 16);
++        d->sws_key = key;
++    }
++    d->ff->sws_scale(d->sws, src, src_stride, 0, (int)h, dst, dst_stride);
++    if (format_type <= 1 && alpha != 0xFF) {           /* swscale writes opaque */
++        const size_t n = (size_t)w * h * 4;
++        for (size_t i = format_type == 0 ? 0 : 3; i < n; i += 4) out[i] = alpha;
++    }
++    return 0;
++}
++
+ #else /* !PS3RECOMP_FFMPEG_RUNTIME */
+ 
+ VdecFf* vdec_ff_open(u32 codec_type) { (void)codec_type; return NULL; }
+@@ -232,5 +276,9 @@ int  vdec_ff_decode(VdecFf* d, const u8* au, u32 size, u32 token,
+ void vdec_ff_drain(VdecFf* d, vdec_ff_emit_fn emit, void* ctx)
+ { (void)d; (void)emit; (void)ctx; }
+ void vdec_ff_reset(VdecFf* d) { (void)d; }
++int  vdec_ff_convert(VdecFf* d, const u8* yuv, u32 w, u32 h, u32 format_type,
++                     u32 color_matrix, u8 alpha, u8* out)
++{ (void)d; (void)yuv; (void)w; (void)h; (void)format_type; (void)color_matrix;
++  (void)alpha; (void)out; return -1; }
+ 
+ #endif /* PS3RECOMP_FFMPEG_RUNTIME */
+diff --git a/libs/codec/vdec_ffmpeg.h b/libs/codec/vdec_ffmpeg.h
+index eb769bbc..8191913d 100644
+--- a/libs/codec/vdec_ffmpeg.h
++++ b/libs/codec/vdec_ffmpeg.h
+@@ -51,6 +51,15 @@ void vdec_ff_drain(VdecFf* d, vdec_ff_emit_fn emit, void* ctx);
+ /* Drop everything held and start over (cellVdecStartSeq). */
+ void vdec_ff_reset(VdecFf* d);
+ 
++/* Bytes of one picture in a cellVdecGetPicture formatType. */
++size_t vdec_picture_bytes(u32 w, u32 h, u32 format_type);
++
++/* Convert an I420 picture to formatType 0-2 and colorMatrixType with
++ * libswscale, into out. The scaler is not reentrant: one caller at a time.
++ * Returns 0, or -1 for formatType 3 (no conversion) or no scaler. */
++int  vdec_ff_convert(VdecFf* d, const u8* yuv, u32 w, u32 h, u32 format_type,
++                     u32 color_matrix, u8 alpha, u8* out);
++
+ /* Store an I420 picture at guest address dst as cellVdecGetPicture's
+  * formatType (0 ARGB32, 1 RGBA32, 2 UYVY422, 3 YUV420 planar) with
+  * colorMatrixType (0 BT.601, 1 BT.709) and the given alpha. */

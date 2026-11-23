@@ -1,0 +1,158 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index c669a4ba..2a5b0219 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -740,12 +740,20 @@ static void audio_backend_shutdown(void)
+     if (s_dev_quit) { CloseHandle(s_dev_quit); s_dev_quit = NULL; }
+ }
+ 
++volatile float g_port_master_volume = 1.0f;   /* Re:Fine 0159 (port_overlay.h) */
++
+ static void audio_device_write(AudioDevice* d, const float* stereo_samples, u32 num_samples)
+ {
+     BYTE* buf = NULL;
+     HRESULT hr = d->render->lpVtbl->GetBuffer(d->render, num_samples, &buf);
+     if (SUCCEEDED(hr) && buf) {
+-        memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
++        const float gain = g_port_master_volume;
++        if (gain >= 0.9999f) {
++            memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
++        } else {   /* Re:Fine 0159: the menu's Master volume, on the host side only */
++            float* o = (float*)buf;
++            for (u32 i = 0; i < num_samples * 2; i++) o[i] = stereo_samples[i] * gain;
++        }
+         d->render->lpVtbl->ReleaseBuffer(d->render, num_samples,
+                                          audio_muted() ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+     }
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index b12c4567..fa85694b 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -89,6 +89,12 @@ static double pad_clock(unsigned long long t0_ms)
+ #include "../video/port_overlay.h"   /* Re:Fine 0158 */
+ 
+ volatile long g_port_overlay_gate;
++/* Re:Fine 0159 (port_overlay.h). */
++void (*g_port_overlay_watch)(unsigned port, uint16_t mask);
++volatile long g_port_overlay_inject;
++volatile long g_port_overlay_touchpad;
++volatile long g_port_rumble_off;
++char g_port_pad_name[128];
+ int (*g_port_overlay_pad)(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly);
+ 
+ #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
+@@ -880,6 +886,13 @@ static void pad_sdl3_read(SDL_Gamepad* gp, PadHostState* hs, int port)
+     u16 btns = 0;
+     for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
+         if (SDL_GetGamepadButton(gp, map[i].b)) btns |= map[i].cell;
++    /* Re:Fine 0159: the touchpad's click is no PS3 button; it opens the port's quick bar. */
++    {
++        static int s_touch[PAD_MAX_HOST_PORTS];
++        const int t = SDL_GetGamepadButton(gp, SDL_GAMEPAD_BUTTON_TOUCHPAD);
++        if (t && !s_touch[port]) g_port_overlay_touchpad = 1;
++        s_touch[port] = t;
++    }
+ 
+     pad_host_release(hs);
+     hs->connected = 1;
+@@ -1024,6 +1037,10 @@ static void pad_sdl3_open(SDL_JoystickID id)
+     if (!gp) { fprintf(stderr, "[cellPad] SDL gamepad %u: open failed: %s%c", (unsigned)id, SDL_GetError(), 10); return; }
+     s_sdl3_pad[port] = gp;
+     s_sdl3_id[port] = id;
++    if (port == 0) {   /* Re:Fine 0159: shown in the port's menu */
++        const char* nm = SDL_GetGamepadName(gp);
++        snprintf(g_port_pad_name, sizeof g_port_pad_name, "%s", nm ? nm : "Controller");
++    }
+     const SDL_PropertiesID pr = SDL_GetGamepadProperties(gp);
+     fprintf(stderr, "[cellPad] SDL gamepad connected on port %d: '%s' type=%s conn=%d south=%s east=%s west=%s north=%s rumble=%d%c",
+             port, SDL_GetGamepadName(gp), SDL_GetGamepadStringForType(SDL_GetGamepadType(gp)),
+@@ -1038,6 +1055,7 @@ static void pad_sdl3_close(SDL_JoystickID id)
+     for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
+         if (!s_sdl3_pad[p] || s_sdl3_id[p] != id) continue;
+         fprintf(stderr, "[cellPad] SDL gamepad disconnected from port %d%c", p, 10);
++        if (p == 0) g_port_pad_name[0] = 0;   /* Re:Fine 0159 */
+         SDL_CloseGamepad(s_sdl3_pad[p]);
+         s_sdl3_pad[p] = NULL;
+         s_sdl3_id[p] = 0;
+@@ -1059,7 +1077,8 @@ static void pad_sdl3_rumble(int p, int focused)
+ {
+     static u16 sent_lo[PAD_MAX_HOST_PORTS], sent_hi[PAD_MAX_HOST_PORTS];
+     PadRumble* r = &s_rumble[p];
+-    const u16 lo = focused ? r->lo : 0, hi = focused ? r->hi : 0;
++    const int give = focused && !g_port_rumble_off;   /* Re:Fine 0159: the menu's Vibration */
++    const u16 lo = give ? r->lo : 0, hi = give ? r->hi : 0;
+     const unsigned long long now = pad_now_ms();
+     const int on = lo || hi;
+     if (lo == sent_lo[p] && hi == sent_hi[p] && (!on || now - r->sent_ms < PAD_RUMBLE_RENEW_MS)) return;
+@@ -1604,6 +1623,11 @@ skip_inject: ;
+     }
+     /* Re:Fine 0158: the port's overlay (its menu) holds the pad while it is open, before a
+      * system screen: the menu is drawn over everything. */
++    /* Re:Fine 0159: the port watches every read (its quick bar's long SELECT), and while its
++     * bar is open it may press a button for the title (START: the game's own pause). */
++    if (g_port_overlay_watch)
++        g_port_overlay_watch(port_no, (u16)((data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8) |
++                                            (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xFF)));
+     if (g_port_overlay_gate && g_port_overlay_pad) {
+         const u16 mask = (u16)((data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8) |
+                                (data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & 0xFF));
+@@ -1617,6 +1641,11 @@ skip_inject: ;
+                 data->button[_i] = 0;
+         }
+     }
++    if (g_port_overlay_inject && port_no == 0) {
++        const u16 m = (u16)g_port_overlay_inject;
++        data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= m & 0xFF;
++        data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= m >> 8;
++    }
+     /* A system screen holds the pad, after every source above has had its say:
+      * PAD_SCRIPT and PAD_FILE press its buttons the way a controller does. */
+     if (g_sysui_gate) {
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+index a791ebb4..b34c222b 100644
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -33,6 +33,21 @@ extern int (*g_port_overlay_wndproc)(void* hwnd, unsigned msg, uint64_t wp, int6
+ extern volatile long g_port_overlay_gate;
+ extern int (*g_port_overlay_pad)(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly);
+ 
++/* Re:Fine 0159. Once, on the thread that makes the swap chain, right after: the device. */
++extern void (*g_port_overlay_device_ready)(void* device, uint32_t rtv_format, uint32_t frame_count);
++/* Re:Fine 0159. Guest thread, every cellPadGetData, before the gate: the pad as read. */
++extern void (*g_port_overlay_watch)(unsigned port, uint16_t mask);
++/* Buttons (mask as above) pressed for the title on port 0 while set, through the gate. */
++extern volatile long g_port_overlay_inject;
++/* Set to 1 by the SDL thread on a touchpad click; the port clears it. */
++extern volatile long g_port_overlay_touchpad;
++/* Nonzero: no vibration is sent to the controllers. */
++extern volatile long g_port_rumble_off;
++/* The controller on port 0 ("" without one), for the port's menu. */
++extern char g_port_pad_name[128];
++/* Output gain, 0-1, applied by cellAudio to what it hands to WASAPI. */
++extern volatile float g_port_master_volume;
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index f8a0b4a6..ebb6b72e 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -1093,6 +1093,9 @@ static int init_d3d12(u32 width, u32 height)
+     }
+ 
+     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
++    /* Re:Fine 0159: the port's overlay gets the device now, to build its menu off the frame. */
++    if (g_port_overlay_device_ready)
++        g_port_overlay_device_ready(s_d3d.device, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM, FRAME_COUNT);
+ 
+     /* Create RTV descriptor heap */
+     D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc = {0};
+@@ -5290,6 +5293,7 @@ static struct {
+ /* Re:Fine 0158 (port_overlay.h): set by the port, never by the runtime. */
+ volatile long g_port_overlay_active;
+ void (*g_port_overlay_draw)(const port_overlay_frame* f);
++void (*g_port_overlay_device_ready)(void* device, uint32_t rtv_format, uint32_t frame_count);   /* 0159 */
+ int (*g_port_overlay_wndproc)(void* hwnd, unsigned msg, uint64_t wp, int64_t lp);
+ 
+ static int present_blit_init(void)

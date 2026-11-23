@@ -1,0 +1,101 @@
+Re:Fine 0120: D3D12, un clear por otra vista de los mismos bytes no recrea la superficie.
+
+F limpia 0x1F80000 como 512x144 A8R8G8B8 y la dibuja como 256x144 F16 (2048 bytes por fila en las dos). Cada
+clear rehacia el recurso, seis veces por frame. RTG_TIME=1 da los tiempos de off_rt_get. Evidencia en
+docs/STATUS.md (4i).
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index e9d47e8..ae5af4c 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -3914,8 +3914,14 @@ static int off_rt_find(u32 off)
+ 
+ /* Ensure an RT resource exists for this surface; (re)creates the RTV at
+  * rt_rtv_heap[i] and the SRV at srv_heap[RT_SRV_BASE+i]. */
++/* RTG_TIME=1: one line per (re)creation, in ms: the wait for the GPU, the
++ * resource, the initial load from guest memory, and how many came before. */
+ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+ {
++    static int rtg = -1; static u32 rtg_n = 0;
++    if (rtg < 0) rtg = getenv("RTG_TIME") ? 1 : 0;
++    double t_w0 = 0, t_w1 = 0, t_c0 = 0, t_c1 = 0, t_u1 = 0;
++    u32 prev_w = 0, prev_h = 0;
+     if (!off || !s_d3d.rt_rtv_heap || !s_d3d.srv_heap) return -1;
+     if (!w) w = s_d3d.width;
+     if (!h) h = s_d3d.height;
+@@ -3937,7 +3943,10 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+          * and every draw recorded against it silently lands nowhere while the
+          * replacement reads back empty. Let the GPU finish first. Recreations are
+          * rare (a surface changing size), so the stall costs nothing. */
++        prev_w = r->w; prev_h = r->h;
++        if (rtg) t_w0 = perf_now();
+         wait_for_gpu();
++        if (rtg) t_w1 = perf_now();
+         r->res->lpVtbl->Release(r->res); r->res = NULL;   /* dims/format changed */
+         if (r->up) { r->up->lpVtbl->Release(r->up); r->up = NULL; }
+     } else {
+@@ -3966,11 +3975,13 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+     td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+     D3D12_CLEAR_VALUE cv = {0};
+     cv.Format = td.Format;
++    if (rtg) t_c0 = perf_now();
+     if (FAILED(s_d3d.device->lpVtbl->CreateCommittedResource(
+             s_d3d.device, &hp, D3D12_HEAP_FLAG_NONE, &td,
+             D3D12_RESOURCE_STATE_COPY_DEST, &cv,
+             &IID_ID3D12Resource, (void**)&r->res)))
+         return -1;
++    if (rtg) t_c1 = perf_now();
+     r->off = off; r->w = w; r->h = h; r->dxgi = (u32)want_fmt;
+     r->st = D3D12_RESOURCE_STATE_COPY_DEST;
+     r->used = 1;
+@@ -4072,6 +4083,10 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+     sh.ptr += (u64)(RT_SRV_BASE + slot) * s_d3d.srv_inc;
+     s_d3d.device->lpVtbl->CreateShaderResourceView(s_d3d.device, r->res, &sv, sh);
+ 
++    if (rtg) { t_u1 = perf_now(); rtg_n++;
++        fprintf(stderr, "[RTG] #%u off=%X %ux%u (antes %ux%u) fmt=%X slot=%d wait=%.2f create=%.2f load=%.2f ms%c",
++                rtg_n, off, w, h, prev_w, prev_h, rsx_fmt, slot, (t_w1 - t_w0) * 1000.0,
++                (t_c1 - t_c0) * 1000.0, (t_u1 - t_c1) * 1000.0, 10); }
+     static int _log = 0;
+     if (PS3_LOG_FIRST(_log, 8))
+         printf("[D3D12] offscreen RT %d: off=0x%X %ux%u (render-to-texture)\n",
+@@ -4079,6 +4094,30 @@ static int off_rt_get(u32 off, u32 w, u32 h, u32 rsx_fmt)
+     return slot;
+ }
+ 
++/* Re:Fine 0120: a clear through another view of the same bytes. F clears its
++ * bloom scratch 0x1F80000 as 512x144 A8R8G8B8 and draws it as 256x144 F16: 2048
++ * bytes a row both ways, one surface in guest memory. Taken for a new size, the
++ * resource went away six times a frame (PV600: 40719 times in 235 s, 21 s in
++ * all). A zero clear reads the same in either format, so it stays on the
++ * resource. Any other value is not the same bytes, and goes the usual way. */
++static u32 dxgi_bytes(u32 f)
++{
++    return f == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8u : f == DXGI_FORMAT_R32G32B32A32_FLOAT ? 16u : 4u;
++}
++
++static int off_rt_clear_view(const D3D12DrawRecord* dr)
++{
++    if (!dr->is_clear || dr->cc[0] || dr->cc[1] || dr->cc[2] || dr->cc[3]) return 0;
++    const int slot = off_rt_find(dr->rt_off);
++    if (slot < 0) return 0;
++    OffRT* r = &s_d3d.off_rt[slot];
++    const u32 want = (u32)rsx_surface_dxgi(dr->rt_fmt);
++    if (r->h != dr->rt_h || (r->w == dr->rt_w && r->dxgi == want) ||
++        r->w * dxgi_bytes(r->dxgi) != dr->rt_w * dxgi_bytes(want)) return 0;
++    r->used = 1;
++    return 1;
++}
++
+ static D3D12_CPU_DESCRIPTOR_HANDLE off_rt_rtv(int slot)
+ {
+     D3D12_CPU_DESCRIPTOR_HANDLE rh;
+@@ -4883,7 +4922,7 @@ static void render_frame(void)
+     for (int _i = 0; _i < MAX_OFF_RTS; _i++) s_d3d.off_rt[_i].used = 0;
+     for (u32 _d = 0; _d < s_d3d.draw_count && _d < MAX_DRAWS; _d++) {
+         D3D12DrawRecord* dr = &s_d3d.draws[_d];
+-        if (dr->is_vp && dr->rt_off)
++        if (dr->is_vp && dr->rt_off && !off_rt_clear_view(dr))
+             off_rt_get(dr->rt_off, dr->rt_w, dr->rt_h, dr->rt_fmt);
+         for (int _m = 0; _m < 3; _m++)
+             if (dr->is_vp && dr->rt_mrt[_m])

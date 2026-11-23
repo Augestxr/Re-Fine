@@ -1,0 +1,170 @@
+diff --git a/libs/video/cellVideoOut.c b/libs/video/cellVideoOut.c
+index c67a6eaa6709cad9b9d6f1eeb2e873a615161cfa..d7a205fada0549c855deab48890fe06169dcc7fd 100644
+--- a/libs/video/cellVideoOut.c
++++ b/libs/video/cellVideoOut.c
+@@ -194,40 +194,62 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
+     info = GUEST_PTR(info, CellVideoOutDeviceInfo*);
+     memset(info, 0, sizeof(CellVideoOutDeviceInfo));
+ 
+-    info->portType       = CELL_VIDEO_OUT_OUTPUT_HDMI;
++    /* Same values as RPCS3's cellVideoOutGetDeviceInfo (rpcs3/Emu/Cell/Modules/
++     * cellVideoOut.cpp, master 1f59f0f2): an HDMI RGB device, AVAILABLE, with
++     * the colorInfo block filled and the mode list of the configured output.
++     * Multi-byte fields are big-endian in guest memory. */
++    info->portType       = 0x01; /* CELL_VIDEO_OUT_PORT_HDMI (not CELL_VIDEO_OUT_OUTPUT_HDMI = 5) */
+     info->colorSpace     = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
+-    info->latency        = 0;
+-    info->state          = 2; /* connected */
++    info->latency        = ps3_bswap16(100);
++    info->state          = 1; /* CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE */
+     info->rgbOutputRange = 1;
++    info->colorInfo.redX   = 0xFFFF; info->colorInfo.redY   = 0xFFFF;
++    info->colorInfo.greenX = 0xFFFF; info->colorInfo.greenY = 0xFFFF;
++    info->colorInfo.blueX  = 0xFFFF; info->colorInfo.blueY  = 0xFFFF;
++    info->colorInfo.whiteX = 0xFFFF; info->colorInfo.whiteY = 0xFFFF;
++    info->colorInfo.gamma  = ps3_bswap32(100);
+ 
+-    /* Report supported modes */
+     int idx = 0;
+-
+-    /* 480p */
+-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_480;
+-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+-    idx++;
+-
+-    /* 576p */
+-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_576;
+-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+-    idx++;
+-
+-    /* 720p */
+-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_720;
+-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+-    idx++;
+-
+-    /* 1080p */
+-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_1080;
+-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+-    idx++;
++#define ADD_MODE(res, conv, asp) do {                                              \
++        info->availableModes[idx].resolutionId = (u8)(res);                        \
++        info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE; \
++        info->availableModes[idx].conversion   = (u8)(conv);                       \
++        info->availableModes[idx].aspect       = (u8)(asp);                        \
++        /* CELL_VIDEO_OUT_REFRESH_RATE_60HZ (0x4) | _59_94HZ (0x1) */              \
++        info->availableModes[idx].refreshRates = ps3_bswap16(0x0005);              \
++        idx++;                                                                     \
++    } while (0)
++
++    /* The modes RPCS3 lists for each configured resolution (progressive,
++     * 16:9 output). 0x05 = CELL_VIDEO_OUT_DISPLAY_CONVERSION_TO_1080. */
++    switch (s_resolution_id) {
++    case CELL_VIDEO_OUT_RESOLUTION_1080:
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_1080,      0x00, CELL_VIDEO_OUT_ASPECT_16_9);
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_1600x1080, 0x05, CELL_VIDEO_OUT_ASPECT_16_9);
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_1440x1080, 0x05, CELL_VIDEO_OUT_ASPECT_16_9);
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_1280x1080, 0x05, CELL_VIDEO_OUT_ASPECT_16_9);
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_960x1080,  0x05, CELL_VIDEO_OUT_ASPECT_16_9);
++        break;
++    case CELL_VIDEO_OUT_RESOLUTION_480:
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_480, 0x00, CELL_VIDEO_OUT_ASPECT_4_3);
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_480, 0x00, CELL_VIDEO_OUT_ASPECT_16_9);
++        break;
++    case CELL_VIDEO_OUT_RESOLUTION_576:
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_576, 0x00, CELL_VIDEO_OUT_ASPECT_4_3);
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_480, 0x00, CELL_VIDEO_OUT_ASPECT_4_3);
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_576, 0x00, CELL_VIDEO_OUT_ASPECT_16_9);
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_480, 0x00, CELL_VIDEO_OUT_ASPECT_16_9);
++        break;
++    case CELL_VIDEO_OUT_RESOLUTION_720:
++    default:
++        ADD_MODE(CELL_VIDEO_OUT_RESOLUTION_720, 0x00, CELL_VIDEO_OUT_ASPECT_16_9);
++        break;
++    }
++#undef ADD_MODE
+ 
+     info->availableModeCount = (u8)idx;
++    printf("[cellVideoOut] GetDeviceInfo -> %d mode(s), first resolutionId=%u\n",
++           idx, info->availableModes[0].resolutionId);
+ 
+     return CELL_OK;
+ }
+@@ -248,8 +270,18 @@ s32 cellVideoOutGetNumberOfDevice(u32 videoOut)
+ s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
+                                           u32 aspect, u32 option)
+ {
+-    (void)aspect; (void)option;
+-    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> 1\n",
+-           videoOut, resolutionId);
+-    return (videoOut == CELL_VIDEO_OUT_PRIMARY) ? 1 : 0;
++    /* RPCS3's semantics (cellVideoOut.cpp, master 1f59f0f2): a boolean, 1 only
++     * for the configured resolution with a matching (or AUTO) aspect. Stereo
++     * output is off, so the 3D frame-packing ids (0x81..) are not available --
++     * answering 1 for every id sent Project DIVA F down its 3D path
++     * (cellSysmoduleLoadModule(AVCONF_EXT) + cellVideoOutGetScreenSize). */
++    (void)option;
++    s32 avail = 0;
++    if (videoOut == CELL_VIDEO_OUT_PRIMARY &&
++        (aspect == CELL_VIDEO_OUT_ASPECT_AUTO || aspect == s_aspect) &&
++        resolutionId == s_resolution_id)
++        avail = 1;
++    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u, aspect=%u) -> %d\n",
++           videoOut, resolutionId, aspect, avail);
++    return avail;
+ }
+diff --git a/libs/video/cellVideoOut.h b/libs/video/cellVideoOut.h
+index 5aa7e27f7a58323e81df420e7642259f30cbb47b..d91e3322f62e6fd1ea33862bc817fd788d7bc003 100644
+--- a/libs/video/cellVideoOut.h
++++ b/libs/video/cellVideoOut.h
+@@ -117,6 +117,27 @@ typedef struct CellVideoOutDisplayMode {
+     u16 refreshRates;
+ } CellVideoOutDisplayMode;
+ 
++/* SDK layout (RPCS3 rpcs3/Emu/Cell/Modules/cellVideoOut.h). Multi-byte fields are
++ * big-endian in guest memory. Without colorInfo the modes landed 20 bytes before
++ * where the title reads them (Project DIVA F: FUN_005888cc reads them at +0x20). */
++typedef struct CellVideoOutColorInfo {
++    u16 redX;
++    u16 redY;
++    u16 greenX;
++    u16 greenY;
++    u16 blueX;
++    u16 blueY;
++    u16 whiteX;
++    u16 whiteY;
++    u32 gamma;
++} CellVideoOutColorInfo;
++
++typedef struct CellVideoOutKSVList {
++    u8  ksv[32 * 5];
++    u8  reserved[4];
++    u32 count;
++} CellVideoOutKSVList;
++
+ typedef struct CellVideoOutDeviceInfo {
+     u8  portType;
+     u8  colorSpace;
+@@ -125,9 +146,19 @@ typedef struct CellVideoOutDeviceInfo {
+     u8  state;
+     u8  rgbOutputRange;
+     u8  reserved[5];
++    CellVideoOutColorInfo   colorInfo;
+     CellVideoOutDisplayMode availableModes[32];
++    CellVideoOutKSVList     ksvList;
+ } CellVideoOutDeviceInfo;
+ 
++#ifdef __cplusplus
++static_assert(sizeof(CellVideoOutColorInfo) == 20, "CellVideoOutColorInfo is 20 bytes");
++static_assert(sizeof(CellVideoOutDeviceInfo) == 456, "CellVideoOutDeviceInfo is 456 bytes");
++#else
++_Static_assert(sizeof(CellVideoOutColorInfo) == 20, "CellVideoOutColorInfo is 20 bytes");
++_Static_assert(sizeof(CellVideoOutDeviceInfo) == 456, "CellVideoOutDeviceInfo is 456 bytes");
++#endif
++
+ /* ---------------------------------------------------------------------------
+  * Configuration
+  * -----------------------------------------------------------------------*/

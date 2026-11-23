@@ -1,0 +1,19 @@
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -872,10 +872,14 @@ static VkTex* vk_tex_get(VkCommandBuffer c, uint32_t f, const rsx_vk_tex* t)
+     rsx_tex_layout tl;
+     rsx_texture_layout(t->fmt, t->w, t->h, &tl);
+     const u32 src_bytes = tl.face_bytes;
+-    const u64 cs = vk_hash_bytes(vm_base + t->off, src_bytes);
+     VkTex* e = NULL;
+     for (u32 i = 0; i < s_ntex; i++)
+         if (s_tex[i].off == t->off && s_tex[i].w == t->w && s_tex[i].h == t->h && s_tex[i].fmt == t->fmt && s_tex[i].map == t->map) { e = &s_tex[i]; break; }
++    /* Re:Fine 0182: looked at once per batch. The same texture is bound by many draws of a frame, and hashing
++     * its guest bytes again for each one was most of the executor's time (the batch is recorded: the guest
++     * memory it reads does not change while it runs). */
++    if (e && e->s.img && e->last == s_batch) return e;
++    const u64 cs = vk_hash_bytes(vm_base + t->off, src_bytes);
+     if (e && e->s.img && e->csum == cs) { e->last = s_batch; return e; }
+     const u32 rows = tl.compressed ? tl.rows : t->h;
+     const u64 dst_bytes = (u64)tl.dst_row_bytes * rows;

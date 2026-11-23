@@ -1,0 +1,76 @@
+diff --git a/libs/system/sysui.c b/libs/system/sysui.c
+index b5cfcdb8dbb05e925b74008cbab97688d7eb22d1..a2ab1a970f2479126c43290099a2b4c88941c686 100644
+--- a/libs/system/sysui.c
++++ b/libs/system/sysui.c
+@@ -79,6 +79,7 @@ static Screen             s_sc;
+ static int                s_quit;
+ static uint16_t           s_held;       /* pad state last seen by the screen */
+ static uint16_t           s_swallow;    /* still down from the press that answered */
++static int                s_baseline;   /* next pad state is what is already down */
+ static uint16_t           s_rep_btn;
+ static ULONGLONG          s_rep_at;
+ static volatile long      s_gen;        /* bumped on any visible change */
+@@ -98,8 +99,9 @@ static void changed(void) { InterlockedIncrement(&s_gen); }
+ 
+ static void screen_show(int kind)
+ {
+-    /* The pad state from before the screen counts as held: a button down at
+-     * open is not a press on the screen. It is taken from s_held in gate. */
++    /* The gate sees the pad only while it is shut, so s_held says nothing about
++     * now: the press that opened the screen would count as a press on it. */
++    s_baseline = 1;
+     s_sc.kind = kind;
+     s_sc.answered = 0;
+     s_rep_btn = 0;
+@@ -363,8 +365,9 @@ int sysui_pad_gate(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly)
+     sysui_done_fn fn = NULL; void* ctx = NULL; int button = 0;
+     AcquireSRWLockExclusive(&s_lock);
+ 
+-    const uint16_t down = (uint16_t)(mask & ~s_held);
++    const uint16_t down = s_baseline ? 0 : (uint16_t)(mask & ~s_held);
+     s_held = mask;
++    s_baseline = 0;
+ 
+     if (s_sc.kind == KIND_MSG && !s_sc.answered) {
+         const int btn = s_sc.type & 0x30, no_cancel = s_sc.type & CELL_MSGDIALOG_TYPE_DISABLE_CANCEL_ON;
+diff --git a/libs/system/tests/test_sysui.c b/libs/system/tests/test_sysui.c
+index c5715d0c16f2566f0d2a2d7bb3d897fcfddbeaf4..4190a8d09e81f987455489ac756f5fb7c3066485 100644
+--- a/libs/system/tests/test_sysui.c
++++ b/libs/system/tests/test_sysui.c
+@@ -1,7 +1,7 @@
+ /*
+  * test_sysui: the model of the system screens, without a window.
+  *
+- * clang-cl -I.. -I../../.. -I../../../include test_sysui.c ../sysui.c /Fe:test_sysui.exe
++ * clang-cl -I.. -I../../.. -I../../../include -I../../../runtime test_sysui.c ../sysui.c /Fe:test_sysui.exe
+  */
+ #include "../sysui.h"
+ #include "../cellMsgDialog.h"
+@@ -40,6 +40,7 @@ static int run_list(int count, int has_new, int tail, const uint16_t* keys, int
+     s_list.has_new = has_new; s_list.new_at_tail = tail;
+     HANDLE t = CreateThread(NULL, 0, list_thread, NULL, 0, NULL);
+     wait_visible(1);
++    sysui_pad_gate(0, 0, 128, 128);   /* the pad at open: nothing down */
+     for (int i = 0; i < n; i++) press(keys[i]);
+     WaitForSingleObject(t, 5000);
+     CloseHandle(t);
+@@ -92,6 +93,19 @@ int main(void)
+       wait_visible(0);
+       sysui_pad_gate(0, 0, 128, 128); }
+ 
++    /* the press that opens a screen is not a press on it */
++    { s_done_calls = 0;
++      sysui_msg_open(0x21, "z", on_done, NULL);
++      CHECK(sysui_pad_gate(0, CROSS, 128, 128) == 1);
++      CHECK(s_done_calls == 0);
++      sysui_pad_gate(0, CROSS, 128, 128);
++      CHECK(s_done_calls == 0);
++      sysui_pad_gate(0, 0, 128, 128);
++      press(CROSS);
++      CHECK(s_done_calls == 1);
++      wait_visible(0);
++      sysui_pad_gate(0, 0, 128, 128); }
++
+     /* no buttons: only the title closes it, and Close reports NONE */
+     { s_done_calls = 0;
+       sysui_msg_open(0x01, "wait", on_done, NULL);

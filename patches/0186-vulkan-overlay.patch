@@ -1,0 +1,480 @@
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -40,6 +40,7 @@
+ #include "rsx_fp_decompiler.h"
+ #include "rsx_texture_layout.h"
+ #include "rsx_vk_exec.h"
++#include "port_overlay.h"   /* g_port_overlay_active (0186) */
+ 
+ #define FRAMES     2
+ #define MAX_IMAGES 8
+@@ -98,6 +99,7 @@ static struct {
+     VkExtent2D extent;
+     uint32_t nimg;
+     VkImage img[MAX_IMAGES];
++    VkImageView view[MAX_IMAGES];   /* 0186: the overlay draws on the presented image */
+     VkSemaphore rendered[MAX_IMAGES];
+     VkCommandPool pool;
+     VkCommandBuffer cmd[FRAMES];
+@@ -404,8 +406,10 @@ static void vk_full_barrier(VkCommandBuffer c)
+  * -----------------------------------------------------------------------*/
+ static void vk_swap_destroy(void)
+ {
+-    for (uint32_t i = 0; i < s_vk.nimg; i++)
++    for (uint32_t i = 0; i < s_vk.nimg; i++) {
+         if (s_vk.rendered[i]) { vkDestroySemaphore_(s_vk.dev, s_vk.rendered[i], NULL); s_vk.rendered[i] = VK_NULL_HANDLE; }
++        if (s_vk.view[i]) { vkDestroyImageView_(s_vk.dev, s_vk.view[i], NULL); s_vk.view[i] = VK_NULL_HANDLE; }
++    }
+     s_vk.nimg = 0;
+ }
+ 
+@@ -468,6 +472,10 @@ static int vk_swap_create(void)
+     for (uint32_t i = 0; i < n; i++) {
+         VkSemaphoreCreateInfo sc = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+         if ((r = vkCreateSemaphore_(s_vk.dev, &sc, NULL, &s_vk.rendered[i])) != VK_SUCCESS) return vk_fail("vkCreateSemaphore", r);
++        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
++        vi.image = s_vk.img[i]; vi.viewType = VK_IMAGE_VIEW_TYPE_2D; vi.format = fmt.format;
++        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; vi.subresourceRange.levelCount = 1; vi.subresourceRange.layerCount = 1;
++        if ((r = vkCreateImageView_(s_vk.dev, &vi, NULL, &s_vk.view[i])) != VK_SUCCESS) return vk_fail("vkCreateImageView (swap)", r);
+     }
+     s_vk.format = fmt.format;
+     s_vk.extent = ext;
+@@ -1105,6 +1113,8 @@ static void vk_clear_depth(VkCommandBuffer c, VkSurf* d)
+     vkCmdClearDepthStencilImage_(c, d->img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &rr);
+ }
+ 
++static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii);   /* 0186, below */
++
+ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+ {
+     if (!s_vk.dev) return;
+@@ -1311,12 +1321,13 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         bl.dstOffsets[1].x = (int32_t)s_vk.extent.width; bl.dstOffsets[1].y = (int32_t)s_vk.extent.height; bl.dstOffsets[1].z = 1;
+         vkCmdBlitImage_(c, s_vk.display.img, VK_IMAGE_LAYOUT_GENERAL, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         1, &bl, VK_FILTER_LINEAR);
+-        vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+-                       VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++        if (!vk_ui_pass(c, f, ii))   /* 0186: the port's overlay on the presented image, or straight to present */
++            vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++                           VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+     }
+     vkEndCommandBuffer_(c);
+ 
+-    const VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;
++    const VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;   /* the blit is the first use of the image */
+     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+     if (present) { si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s_vk.acquired[f]; si.pWaitDstStageMask = &wait;
+                    si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s_vk.rendered[ii]; }
+@@ -1350,4 +1361,312 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+     }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * The port's overlay (Re:Fine 0186): see rsx_vk_exec.h
++ * -----------------------------------------------------------------------*/
++#define VK_UI_TEX  256
++#define VK_UI_RING (48u << 20)   /* per frame: the meshes, their constants and the pixels of new textures */
++typedef struct { int used, ready, dying; u32 w, h; u8* px; VkSurf s; u64 die_at; } VkUiTex;
++static struct {
++    VkUiTex tex[VK_UI_TEX];      /* [0] is the white texel */
++    volatile char lock;
++    VkBuffer buf[FRAMES]; VkDeviceMemory mem[FRAMES]; u8* map[FRAMES];
++    u64 used;
++    VkPipeline pipe, grad;
++    VkFormat pipe_format;
++    int state;                   /* 0 not made, 1 ready, -1 failed (said once) */
++    VkCommandBuffer c; uint32_t f, ii;
++    int in_pass;
++    VkPipeline bound;
++    u64 frame_no;
++    unsigned long long draws, skipped;
++} s_ui;
++void (*g_rsx_vk_ui)(u32 w, u32 h);
++
++static void vk_ui_lock(void)   { while (__atomic_test_and_set(&s_ui.lock, __ATOMIC_ACQUIRE)) YieldProcessor(); }
++static void vk_ui_unlock(void) { __atomic_clear(&s_ui.lock, __ATOMIC_RELEASE); }
++
++u32 rsx_vk_ui_texture(const unsigned char* rgba, u32 w, u32 h)
++{
++    if (!rgba || !w || !h || w > 8192 || h > 8192) return 0;
++    u8* px = (u8*)malloc((size_t)w * h * 4);
++    if (!px) return 0;
++    memcpy(px, rgba, (size_t)w * h * 4);
++    u32 id = 0;
++    vk_ui_lock();
++    for (u32 i = 1; i < VK_UI_TEX; i++)
++        if (!s_ui.tex[i].used) { id = i; s_ui.tex[i].used = 1; s_ui.tex[i].ready = 0; s_ui.tex[i].dying = 0;
++                                 s_ui.tex[i].w = w; s_ui.tex[i].h = h; s_ui.tex[i].px = px; break; }
++    vk_ui_unlock();
++    if (!id) free(px);
++    return id;
++}
++
++void rsx_vk_ui_texture_free(u32 id)
++{
++    if (!id || id >= VK_UI_TEX) return;
++    vk_ui_lock();
++    if (s_ui.tex[id].used && !s_ui.tex[id].dying) { s_ui.tex[id].dying = 1; s_ui.tex[id].die_at = s_ui.frame_no + FRAMES + 1; }
++    vk_ui_unlock();
++}
++
++static const char s_ui_vs[] =
++    "cbuffer C : register(b0) { float4x4 M; float2 T; };\n"
++    "struct VI { float2 p : POSITION; float4 c : COLOR; float2 uv : TEXCOORD; };\n"
++    "struct VO { float4 p : SV_Position; float4 c : COLOR; float2 uv : TEXCOORD; };\n"
++    "VO main(VI i) { VO o; o.p = mul(M, float4(i.p + T, 0, 1)); o.c = i.c; o.uv = i.uv; return o; }\n";
++static const char s_ui_ps[] =
++    "struct VO { float4 p : SV_Position; float4 c : COLOR; float2 uv : TEXCOORD; };\n"
++    "Texture2D tex : register(t0);\n"
++    "SamplerState smp : register(s0);\n"
++    "float4 main(VO i) : SV_Target { return i.c * tex.Sample(smp, i.uv); }\n";
++/* The gradients of the port's menu (src/port_menu: the same block and the same maths as its D3D12 shader). */
++static const char s_ui_ps_grad[] =
++    "struct VO { float4 p : SV_Position; float4 c : COLOR; float2 uv : TEXCOORD; };\n"
++    "cbuffer G : register(b1) { float4 PV; int4 FN; float4 POS[4]; float4 COL[16]; };\n"
++    "float stop_pos(int k) { return POS[k >> 2][k & 3]; }\n"
++    "float4 main(VO i) : SV_Target {\n"
++    "    float2 P = PV.xy, V = PV.zw;\n"
++    "    int f = FN.x, n = FN.y;\n"
++    "    float t;\n"
++    "    if (f == 0 || f == 3) { float2 d = i.uv - P; t = dot(V, d) / dot(V, V); }\n"
++    "    else if (f == 1 || f == 4) { t = length(V * (i.uv - P)); }\n"
++    "    else { float2 d = i.uv - P; float2 r = float2(V.x * d.x + V.y * d.y, -V.y * d.x + V.x * d.y); t = 0.5 + atan2(-r.x, r.y) / 6.2831853; }\n"
++    "    if (f >= 3) { float t0 = stop_pos(0), t1 = stop_pos(n - 1); t = t0 + (t - t0) - (t1 - t0) * floor((t - t0) / (t1 - t0)); }\n"
++    "    float4 c = COL[0];\n"
++    "    for (int k = 1; k < n; k++) c = lerp(c, COL[k], smoothstep(stop_pos(k - 1), stop_pos(k), t));\n"
++    "    return i.c * c;\n"
++    "}\n";
++
++static VkPipeline vk_ui_pipeline(VkShaderModule vs, VkShaderModule fs)
++{
++    VkPipelineShaderStageCreateInfo st[2] = { { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
++                                              { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO } };
++    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT; st[0].module = vs; st[0].pName = "main";
++    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
++    VkVertexInputBindingDescription vb = { 0, 20, VK_VERTEX_INPUT_RATE_VERTEX };
++    VkVertexInputAttributeDescription va[3] = { { 0, 0, VK_FORMAT_R32G32_SFLOAT, 0 }, { 1, 0, VK_FORMAT_R8G8B8A8_UNORM, 8 },
++                                                { 2, 0, VK_FORMAT_R32G32_SFLOAT, 12 } };
++    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
++    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb;
++    vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = va;
++    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
++    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++    VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
++    vp.viewportCount = 1; vp.scissorCount = 1;
++    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
++    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE; rs.lineWidth = 1.0f;
++    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
++    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
++    VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
++    VkPipelineColorBlendAttachmentState cb; memset(&cb, 0, sizeof cb);
++    cb.blendEnable = VK_TRUE;                                   /* RmlUi hands over premultiplied colours */
++    cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
++    cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++    cb.colorBlendOp = cb.alphaBlendOp = VK_BLEND_OP_ADD;
++    cb.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
++    VkPipelineColorBlendStateCreateInfo cbs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
++    cbs.attachmentCount = 1; cbs.pAttachments = &cb;
++    const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
++    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
++    dy.dynamicStateCount = 2; dy.pDynamicStates = dyn;
++    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
++    ri.colorAttachmentCount = 1; ri.pColorAttachmentFormats = &s_vk.format;
++    VkGraphicsPipelineCreateInfo pi = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
++    pi.pNext = &ri;
++    pi.stageCount = 2; pi.pStages = st;
++    pi.pVertexInputState = &vi; pi.pInputAssemblyState = &ia; pi.pViewportState = &vp;
++    pi.pRasterizationState = &rs; pi.pMultisampleState = &ms; pi.pDepthStencilState = &ds;
++    pi.pColorBlendState = &cbs; pi.pDynamicState = &dy;
++    pi.layout = s_vk.pipe_layout_u;   /* b0, b1, one image at 16, the samplers at 32 */
++    VkPipeline p = VK_NULL_HANDLE;
++    const VkResult r = vkCreateGraphicsPipelines_(s_vk.dev, VK_NULL_HANDLE, 1, &pi, NULL, &p);
++    if (r != VK_SUCCESS) { vk_fail("vkCreateGraphicsPipelines (overlay)", r); return VK_NULL_HANDLE; }
++    return p;
++}
++
++static int vk_ui_init(void)
++{
++    if (s_ui.state == 1 && s_ui.pipe_format == s_vk.format) return 1;
++    if (s_ui.state < 0) return 0;
++    if (s_ui.state == 0) {
++        for (int f = 0; f < FRAMES; f++) {
++            VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++            bi.size = VK_UI_RING;
++            bi.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
++                       VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
++            bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++            if (vkCreateBuffer_(s_vk.dev, &bi, NULL, &s_ui.buf[f]) != VK_SUCCESS) { s_ui.state = -1; break; }
++            VkMemoryRequirements req; vkGetBufferMemoryRequirements_(s_vk.dev, s_ui.buf[f], &req);
++            VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++            ma.allocationSize = req.size;
++            ma.memoryTypeIndex = vk_mem_type(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
++            if (ma.memoryTypeIndex == UINT32_MAX || vkAllocateMemory_(s_vk.dev, &ma, NULL, &s_ui.mem[f]) != VK_SUCCESS) { s_ui.state = -1; break; }
++            vkBindBufferMemory_(s_vk.dev, s_ui.buf[f], s_ui.mem[f], 0);
++            if (vkMapMemory_(s_vk.dev, s_ui.mem[f], 0, VK_WHOLE_SIZE, 0, (void**)&s_ui.map[f]) != VK_SUCCESS) { s_ui.state = -1; break; }
++        }
++        if (s_ui.state == 0) {   /* the white texel */
++            static const u8 white[4] = { 255, 255, 255, 255 };
++            s_ui.tex[0].px = (u8*)malloc(4);
++            if (s_ui.tex[0].px) { memcpy(s_ui.tex[0].px, white, 4); s_ui.tex[0].used = 1; s_ui.tex[0].w = s_ui.tex[0].h = 1; }
++            else s_ui.state = -1;
++        }
++    }
++    if (s_ui.state >= 0) {   /* the pipelines, for the format of the presented image */
++        int bad = 0;
++        const VkShaderModule vs = vk_module(s_ui_vs, 0, "overlay vertex", 1, &bad);
++        const VkShaderModule ps = vk_module(s_ui_ps, 1, "overlay fragment", 2, &bad);
++        const VkShaderModule pg = vk_module(s_ui_ps_grad, 1, "overlay gradient", 3, &bad);
++        s_ui.pipe = vs && ps ? vk_ui_pipeline(vs, ps) : VK_NULL_HANDLE;
++        s_ui.grad = vs && pg ? vk_ui_pipeline(vs, pg) : VK_NULL_HANDLE;   /* without it the menu is flat, as in D3D12 */
++        s_ui.pipe_format = s_vk.format;
++        s_ui.state = s_ui.pipe ? 1 : -1;
++    }
++    if (s_ui.state < 0) fprintf(stderr, "[vk] the overlay's pipeline FAILED: the port's menu is not drawn%c", 10);
++    else fprintf(stderr, "[vk] overlay ready (gradients %s)%c", s_ui.grad ? "on" : "off", 10);
++    return s_ui.state == 1;
++}
++
++/* New textures to the GPU and dead ones freed. Outside a pass. */
++static void vk_ui_textures(void)
++{
++    const VkCommandBuffer c = s_ui.c;
++    int any = 0;
++    for (u32 i = 0; i < VK_UI_TEX; i++) {
++        VkUiTex* t = &s_ui.tex[i];
++        if (!t->used) continue;
++        if (t->dying) {
++            if (s_ui.frame_no < t->die_at) continue;   /* a frame in flight may still read it */
++            vk_ui_lock();
++            vk_image_free(&t->s); free(t->px);
++            memset(t, 0, sizeof *t);
++            vk_ui_unlock();
++            continue;
++        }
++        if (t->ready || !t->px) continue;
++        const u64 bytes = (u64)t->w * t->h * 4, at = (s_ui.used + 15u) & ~15ull;
++        if (at + bytes > VK_UI_RING) continue;         /* next frame */
++        VkComponentMapping id; memset(&id, 0, sizeof id);
++        if (!t->s.img && vk_tex_image(c, &t->s, t->w, t->h, VK_FORMAT_R8G8B8A8_UNORM, id, 1)) { free(t->px); t->px = NULL; continue; }
++        memcpy(s_ui.map[s_ui.f] + at, t->px, (size_t)bytes);
++        s_ui.used = at + bytes;
++        VkBufferImageCopy bc; memset(&bc, 0, sizeof bc);
++        bc.bufferOffset = at;
++        bc.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT; bc.imageSubresource.layerCount = 1;
++        bc.imageExtent.width = t->w; bc.imageExtent.height = t->h; bc.imageExtent.depth = 1;
++        vkCmdCopyBufferToImage_(c, s_ui.buf[s_ui.f], t->s.img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
++        free(t->px); t->px = NULL;
++        t->ready = 1; any = 1;
++    }
++    if (any) vk_full_barrier(c);
++}
++
++static void vk_ui_begin(void)
++{
++    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
++    ca.imageView = s_vk.view[s_ui.ii];
++    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
++    ri.renderArea.extent = s_vk.extent;
++    ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
++    vkCmdBeginRendering_(s_ui.c, &ri);
++    s_ui.in_pass = 1; s_ui.bound = VK_NULL_HANDLE;
++}
++
++void rsx_vk_ui_draw(const rsx_vk_ui_cmd* d)
++{
++    const VkCommandBuffer c = s_ui.c;
++    if (!c || !d || !d->nidx || !d->nverts) return;
++    const VkPipeline pipe = d->grad ? s_ui.grad : s_ui.pipe;
++    if (!pipe) return;
++    VkUiTex* t = &s_ui.tex[d->tex < VK_UI_TEX && s_ui.tex[d->tex].used && !s_ui.tex[d->tex].dying ? d->tex : 0];
++    if (!t->ready) {   /* made inside this pass (a glyph atlas): to the GPU now, between two passes */
++        vkCmdEndRendering_(c);
++        vk_ui_textures();
++        vk_ui_begin();
++        if (!t->ready) t = &s_ui.tex[0];
++        if (!t->ready) return;
++    }
++    const u64 vb = (u64)d->nverts * 20u, ib = (u64)d->nidx * 4u;
++    const u64 a_vb = (s_ui.used + 15u) & ~15ull, a_ib = a_vb + vb, a_cb = (a_ib + ib + 255u) & ~255ull, a_gr = a_cb + 256u;
++    if (a_gr + 512u > VK_UI_RING) { s_ui.skipped++; return; }
++    u8* m = s_ui.map[s_ui.f];
++    memcpy(m + a_vb, d->verts, (size_t)vb);
++    memcpy(m + a_ib, d->idx, (size_t)ib);
++    memcpy(m + a_cb, d->mvp, 64);
++    memcpy(m + a_cb + 64, &d->tx, 4); memcpy(m + a_cb + 68, &d->ty, 4);
++    if (d->grad) memcpy(m + a_gr, d->grad, 352); else memset(m + a_gr, 0, 352);
++    s_ui.used = a_gr + 512u;
++    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
++    ai.descriptorPool = s_vk.dpool[s_ui.f]; ai.descriptorSetCount = 1; ai.pSetLayouts = &s_vk.set_layout_u;
++    VkDescriptorSet set;
++    if (vkAllocateDescriptorSets_(s_vk.dev, &ai, &set) != VK_SUCCESS) { s_ui.skipped++; return; }
++    VkDescriptorBufferInfo ub[2] = { { s_ui.buf[s_ui.f], a_cb, 80 }, { s_ui.buf[s_ui.f], a_gr, 352 } };
++    VkDescriptorImageInfo im = { VK_NULL_HANDLE, t->s.view, VK_IMAGE_LAYOUT_GENERAL };
++    VkDescriptorImageInfo sm = { s_vk.samp_linear, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
++    VkWriteDescriptorSet w[4];
++    memset(w, 0, sizeof w);
++    for (int i = 0; i < 4; i++) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].descriptorCount = 1; }
++    w[0].dstBinding = 0;  w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &ub[0];
++    w[1].dstBinding = 1;  w[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[1].pBufferInfo = &ub[1];
++    w[2].dstBinding = 16; w[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;  w[2].pImageInfo = &im;
++    w[3].dstBinding = 32; w[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;        w[3].pImageInfo = &sm;
++    vkUpdateDescriptorSets_(s_vk.dev, 4, w, 0, NULL);
++    if (pipe != s_ui.bound) {
++        vkCmdBindPipeline_(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe); s_ui.bound = pipe;
++        /* D3D's y: the port's projection puts y = 0 at the top with +1 up */
++        const VkViewport vp = { 0.0f, (float)s_vk.extent.height, (float)s_vk.extent.width, -(float)s_vk.extent.height, 0.0f, 1.0f };
++        vkCmdSetViewport_(c, 0, 1, &vp);
++    }
++    int x0 = d->sx > 0 ? d->sx : 0, y0 = d->sy > 0 ? d->sy : 0;
++    int x1 = d->sx + d->sw, y1 = d->sy + d->sh;
++    if (x1 > (int)s_vk.extent.width) x1 = (int)s_vk.extent.width;
++    if (y1 > (int)s_vk.extent.height) y1 = (int)s_vk.extent.height;
++    if (x1 <= x0 || y1 <= y0) return;
++    const VkRect2D sc = { { x0, y0 }, { (uint32_t)(x1 - x0), (uint32_t)(y1 - y0) } };
++    vkCmdSetScissor_(c, 0, 1, &sc);
++    const VkDeviceSize vo = a_vb;
++    vkCmdBindVertexBuffers_(c, 0, 1, &s_ui.buf[s_ui.f], &vo);
++    vkCmdBindIndexBuffer_(c, s_ui.buf[s_ui.f], a_ib, VK_INDEX_TYPE_UINT32);
++    vkCmdBindDescriptorSets_(c, VK_PIPELINE_BIND_POINT_GRAPHICS, s_vk.pipe_layout_u, 0, 1, &set, 0, NULL);
++    vkCmdDrawIndexed_(c, d->nidx, 1, 0, 0, 0);
++    s_ui.draws++;
++}
++
++/* The overlay on the image about to be presented (in TRANSFER_DST after the blit). 1: drawn, and the image left
++ * in PRESENT_SRC; 0: nothing done. */
++static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii)
++{
++    if (!g_rsx_vk_ui || !g_port_overlay_active || !s_vk.view[ii] || !vk_ui_init()) return 0;
++    s_ui.c = c; s_ui.f = f; s_ui.ii = ii; s_ui.used = 0;
++    s_ui.frame_no++;
++    vk_ui_textures();
++    vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
++    vk_ui_begin();
++    g_rsx_vk_ui(s_vk.extent.width, s_vk.extent.height);
++    vkCmdEndRendering_(c);
++    s_ui.in_pass = 0; s_ui.c = VK_NULL_HANDLE;
++    vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++    return 1;
++}
++
++void rsx_vk_launcher_frame(void)
++{
++    if (!s_vk.dev) return;
++    rsx_vk_exec_wait();
++    rsx_vk_frame fr;
++    memset(&fr, 0, sizeof fr);
++    fr.present = 1;
++    fr.clear[0] = 0.043f; fr.clear[1] = 0.047f; fr.clear[2] = 0.063f; fr.clear[3] = 1.0f;   /* the D3D12 start screen's dark */
++    fr.width = fr.rw = s_vk.win_w ? s_vk.win_w : 1280;
++    fr.height = fr.rh = s_vk.win_h ? s_vk.win_h : 720;
++    fr.rs = 1.0f;
++    rsx_vk_exec_frame(&fr);
++    if (!s_vk.vsync) Sleep(6);   /* without vsync nothing else paces this loop */
++}
++
+ #endif /* _WIN32 && REFINE_VULKAN */
+diff --git a/libs/video/rsx_vk_exec.h b/libs/video/rsx_vk_exec.h
+--- a/libs/video/rsx_vk_exec.h
++++ b/libs/video/rsx_vk_exec.h
+@@ -59,6 +59,27 @@ void rsx_vk_exec_wait(void);
+ void rsx_vk_exec_frame(const rsx_vk_frame* f);
+ void rsx_vk_exec_resize(u32 w, u32 h);
+ 
++/* Re:Fine 0186: the port's overlay (its menu and start screen, RmlUi) drawn by the executor on the image it
++ * presents, at the window's size. g_rsx_vk_ui is called on the thread that runs rsx_vk_exec_frame, once per
++ * presented frame while g_port_overlay_active (port_overlay.h); inside it, rsx_vk_ui_draw adds one indexed mesh.
++ * Textures are RGBA8, premultiplied; rsx_vk_ui_texture may be called from any thread, at any time (the pixels
++ * are copied and reach the GPU on the next overlay pass). 0 = the white texel. */
++typedef struct rsx_vk_ui_cmd {
++    const void* verts; u32 nverts;   /* 20 bytes each: float x, y; u8 r, g, b, a; float u, v */
++    const int*  idx;   u32 nidx;
++    float mvp[16];                   /* column-major, as RmlUi's Matrix4f::data() */
++    float tx, ty;
++    u32   tex;
++    int   sx, sy, sw, sh;            /* scissor, in pixels of the presented image */
++    const void* grad;                /* NULL, or the 352 bytes of the gradient block (b1) */
++} rsx_vk_ui_cmd;
++u32  rsx_vk_ui_texture(const unsigned char* rgba, u32 w, u32 h);
++void rsx_vk_ui_texture_free(u32 id);
++void rsx_vk_ui_draw(const rsx_vk_ui_cmd* c);
++extern void (*g_rsx_vk_ui)(u32 w, u32 h);
++/* One presented frame with no game draws, a dark background and the overlay: the start screen. */
++void rsx_vk_launcher_frame(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -576,6 +576,18 @@ static u32 s_dbg_last_draws = 0;
+  * buffers it writes are the Vulkan executor's (rsx_vk_win.c), no D3D12 device is made, and render_frame hands
+  * each batch to the executor. */
+ static int s_vk_on;
++/* Re:Fine 0186: which renderer this run uses, for the port too (its menu draws through the same one). One place
++ * decides: REFINE_RENDERER=vulkan or d3d12; without it, the default below. */
++int rsx_renderer_is_vulkan(void)
++{
++#ifdef REFINE_VULKAN
++    static int v = -1;
++    if (v < 0) { const char* rr = getenv("REFINE_RENDERER"); v = rr && *rr ? !_stricmp(rr, "vulkan") : 0; }
++    return v;
++#else
++    return 0;
++#endif
++}
+ #ifdef REFINE_VULKAN
+ #include "rsx_vk_exec.h"
+ #endif
+@@ -6343,6 +6355,14 @@ static void guest_fb_present(u32 fi)
+ void (*g_port_launcher)(void);
+ void rsx_d3d12_launcher_frame(void)
+ {
++#ifdef REFINE_VULKAN
++    if (s_vk_on) {   /* 0186: the same screen, presented by the Vulkan executor */
++        const LONG wh = InterlockedExchange(&s_d3d.want_wh, 0);
++        if (wh) rsx_vk_exec_resize((u32)wh >> 16, (u32)wh & 0xFFFFu);
++        rsx_vk_launcher_frame();
++        return;
++    }
++#endif
+     if (!s_d3d.swap_chain) return;
+     wait_for_gpu();
+     swap_chain_resize();
+@@ -10143,7 +10163,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+     }
+ 
+ #ifdef REFINE_VULKAN
+-    { const char* rr = getenv("REFINE_RENDERER"); s_vk_on = rr && !_stricmp(rr, "vulkan"); }
++    s_vk_on = rsx_renderer_is_vulkan();
+     if (s_vk_on) {   /* N1 V2b: no D3D12 device; the recording writes the executor's buffers */
+         const u64 sizes[RSX_VK_NBUF] = {
+             (u64)MAX_VERTICES * VERTEX_STRIDE,        /* the same sizes as init_d3d12's upload buffers */
+@@ -10195,7 +10215,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+     s_d3d.last_fps_time = GetTickCount64();
+ 
+     printf("[D3D12] Backend ready: %ux%u\n", width, height);
+-    if (g_port_launcher && !s_vk_on) g_port_launcher();   /* Re:Fine 0164; N1: the launcher draws with D3D12 */
++    if (g_port_launcher) g_port_launcher();   /* Re:Fine 0164; 0186: with either renderer */
+     return 0;
+ }
+ 
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -55,6 +55,9 @@ extern void (*g_port_launcher)(void);
+ /* One frame of the overlay (g_port_overlay_draw) over a dark background, presented. Only from the
+  * g_port_launcher hook. */
+ void rsx_d3d12_launcher_frame(void);
++/* Re:Fine 0186: 1 when this run draws with Vulkan (REFINE_RENDERER, or the default). The overlay then draws
++ * through rsx_vk_exec.h's g_rsx_vk_ui instead of g_port_overlay_draw; the start screen is the same call. */
++int rsx_renderer_is_vulkan(void);
+ 
+ /* Re:Fine 0165. Picture quality from the port's menu, read by the renderer each frame (hot).
+  * g_port_aniso: 0 or 1 = as the game asks, else the least maximum anisotropy (2-16) for linear samplers.

@@ -1,0 +1,152 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -129,6 +129,21 @@
+ }
+ unsigned pad_raw_sources(void) { return (unsigned)s_raw_sources; }
+ 
++/* Re:Fine 0172: one short vibration asked by the port (port_overlay.h), sent by the SDL thread to port 0.
++ * Packed in one 64-bit word with a sequence number, so a pulse is never read half written. */
++static volatile long long s_pulse;   /* seq << 48 | ms << 32 | hi << 16 | lo */
++void pad_pulse(unsigned short lo, unsigned short hi, int ms)
++{
++    if (ms <= 0 || (!lo && !hi)) return;
++    if (ms > 2000) ms = 2000;
++    for (;;) {
++        long long old = s_pulse;
++        const long long seq = ((old >> 48) + 1) & 0xFFFF;
++        const long long v = seq << 48 | (long long)ms << 32 | (long long)hi << 16 | lo;
++        if (__atomic_compare_exchange_n(&s_pulse, &old, v, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) return;
++    }
++}
++
+ #define PAD_MAX_HOST_PORTS  4  /* XInput supports max 4; SDL may support more */
+ 
+ typedef struct {
+@@ -1184,6 +1199,23 @@
+     const int give = focused && !g_port_rumble_off;   /* Re:Fine 0159: the menu's Vibration */
+     const u16 lo = give ? r->lo : 0, hi = give ? r->hi : 0;
+     const unsigned long long now = pad_now_ms();
++    /* Re:Fine 0172: a pulse from the port, on port 0, over what the title asks while it lasts; the title's
++     * own state is sent again when it ends. */
++    if (p == 0) {
++        static long long seen; static unsigned long long pulse_end;
++        const long long v = __atomic_load_n(&s_pulse, __ATOMIC_ACQUIRE);
++        if ((v >> 48) != (seen >> 48)) {
++            seen = v;
++            const u16 plo = (u16)(v & 0xFFFF), phi = (u16)(v >> 16 & 0xFFFF);
++            const int ms = (int)(v >> 32 & 0xFFFF);
++            if (give) {
++                SDL_RumbleGamepad(s_sdl3_pad[p], plo > lo ? plo : lo, phi > hi ? phi : hi, (Uint32)ms);
++                pulse_end = now + (unsigned long long)ms;
++                sent_lo[p] = 0xFFFF; sent_hi[p] = 0xFFFF;   /* anything else differs: resent after */
++            }
++        }
++        if (pulse_end) { if (now < pulse_end) return; pulse_end = 0; }
++    }
+     const int on = lo || hi;
+     if (lo == sent_lo[p] && hi == sent_hi[p] && (!on || now - r->sent_ms < PAD_RUMBLE_RENEW_MS)) return;
+     SDL_RumbleGamepad(s_sdl3_pad[p], lo, hi, on ? PAD_RUMBLE_HOLD_MS : 0);
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -371,7 +371,8 @@
+     return d;
+ }
+ 
+-/* The fixed device: the exact id, or a piece of its name, in any case. */
++/* The fixed device: the exact id, its exact name, or a piece of its name, in any case. Re:Fine 0172: the
++ * exact name first, so "Speakers" does not land on "Speakers 2" because that one is listed first. */
+ static IMMDevice* audio_device_fixed(IMMDeviceEnumerator* en, const char* want)
+ {
+     WCHAR w[128]; IMMDeviceCollection* all = NULL; UINT n = 0; IMMDevice* found = NULL;
+@@ -381,22 +382,64 @@
+     all->lpVtbl->GetCount(all, &n);
+     char low[96];
+     snprintf(low, sizeof low, "%s", want); _strlwr(low);
+-    for (UINT i = 0; i < n && !found; i++) {
+-        IMMDevice* d = NULL; char name[96];
+-        if (FAILED(all->lpVtbl->Item(all, i, &d))) continue;
+-        audio_device_name(d, name, sizeof name); _strlwr(name);
+-        if (strstr(name, low)) found = d; else d->lpVtbl->Release(d);
+-    }
++    for (int exact = 1; exact >= 0 && !found; exact--)
++        for (UINT i = 0; i < n && !found; i++) {
++            IMMDevice* d = NULL; char name[96];
++            if (FAILED(all->lpVtbl->Item(all, i, &d))) continue;
++            audio_device_name(d, name, sizeof name); _strlwr(name);
++            if (exact ? !strcmp(name, low) : strstr(name, low) != NULL) found = d; else d->lpVtbl->Release(d);
++        }
+     all->lpVtbl->Release(all);
+     return found;
+ }
+ 
++/* Re:Fine 0172: the port's menu picks the output live (port_overlay.h). Until it does, REFINE_AUDIO_DEVICE. */
++static SRWLOCK s_want_lock = SRWLOCK_INIT;
++static char s_want[256];
++static int s_want_set;
++void port_audio_set_device(const char* want)
++{
++    AcquireSRWLockExclusive(&s_want_lock);
++    snprintf(s_want, sizeof s_want, "%s", want ? want : "auto");
++    s_want_set = 1;
++    ReleaseSRWLockExclusive(&s_want_lock);
++    fprintf(stderr, "[audio-dev] output asked: '%s'%c", s_want, 10);
++    audio_dev_poke(AUDIO_WHY_STATE);
++}
++int port_audio_outputs(char* names, int stride, int max)
++{
++    const HRESULT co = CoInitializeEx(NULL, COINIT_MULTITHREADED);
++    IMMDeviceEnumerator* en = NULL; IMMDeviceCollection* all = NULL; UINT n = 0;
++    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL, &IID_IMMDeviceEnumerator, (void**)&en))) {
++        if (SUCCEEDED(en->lpVtbl->EnumAudioEndpoints(en, eRender, DEVICE_STATE_ACTIVE, &all))) {
++            all->lpVtbl->GetCount(all, &n);
++            for (UINT i = 0; i < n && (int)i < max; i++) {
++                IMMDevice* d = NULL;
++                names[i * stride] = 0;
++                if (FAILED(all->lpVtbl->Item(all, i, &d))) continue;
++                char name[96];
++                audio_device_name(d, name, sizeof name);
++                snprintf(names + i * stride, (size_t)stride, "%s", name);
++                d->lpVtbl->Release(d);
++            }
++            all->lpVtbl->Release(all);
++        }
++        en->lpVtbl->Release(en);
++    }
++    if (SUCCEEDED(co)) CoUninitialize();
++    return (int)n;
++}
++
+ /* What the stream should be on right now. NULL with no output to use. */
+ static IMMDevice* audio_device_pick(IMMDeviceEnumerator* en)
+ {
+     IMMDevice* d = NULL;
+     if (s_test_off) return NULL;
++    char want[256];
+     const char* fixed = getenv("REFINE_AUDIO_DEVICE");
++    AcquireSRWLockShared(&s_want_lock);   /* Re:Fine 0172: the menu's choice wins */
++    if (s_want_set) { snprintf(want, sizeof want, "%s", s_want); fixed = want; }
++    ReleaseSRWLockShared(&s_want_lock);
+     if (fixed && *fixed && _stricmp(fixed, "auto")) {
+         if ((d = audio_device_fixed(en, fixed)) != NULL) return d;
+         { static int _n = 0; if (PS3_LOG_FIRST(_n, 2))
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -83,6 +83,15 @@
+ /* Port 0's controller as pressed right now (bit n = source n), before any binding. */
+ unsigned pad_raw_sources(void);
+ 
++/* Re:Fine 0172. One vibration of <ms> on port 0's controller (motors 0-65535), sent by the SDL thread, only
++ * while the window has the focus and g_port_rumble_off is 0. */
++void pad_pulse(unsigned short lo, unsigned short hi, int ms);
++/* Re:Fine 0172. The output device, live: "auto" (the Windows default) or an output's exact name, else a
++ * piece of one, else its endpoint id. port_audio_outputs fills <max> names of <stride> bytes (UTF-8) of the
++ * active outputs and returns how many there are. */
++void port_audio_set_device(const char* want);
++int port_audio_outputs(char* names, int stride, int max);
++
+ #ifdef __cplusplus
+ }
+ #endif

@@ -1,0 +1,485 @@
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -49,7 +49,7 @@
+ static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr_;
+ #define VKF(name) static PFN_##name name##_
+ VKF(vkCreateInstance); VKF(vkEnumerateInstanceExtensionProperties); VKF(vkEnumerateInstanceVersion);
+-VKF(vkDestroyInstance); VKF(vkEnumeratePhysicalDevices); VKF(vkGetPhysicalDeviceProperties);
++VKF(vkDestroyInstance); VKF(vkEnumeratePhysicalDevices); VKF(vkGetPhysicalDeviceProperties); VKF(vkGetPhysicalDeviceFeatures);
+ VKF(vkGetPhysicalDeviceQueueFamilyProperties); VKF(vkCreateDevice); VKF(vkGetDeviceProcAddr);
+ VKF(vkEnumerateDeviceExtensionProperties); VKF(vkCreateWin32SurfaceKHR); VKF(vkDestroySurfaceKHR);
+ VKF(vkGetPhysicalDeviceSurfaceSupportKHR); VKF(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+@@ -108,6 +108,7 @@ static struct {
+     VkDescriptorPool dpool[FRAMES];
+     uint32_t frame;
+     int vsync, need_resize, flip_front;
++    int aniso_ok; float aniso_max;   /* 0187: samplerAnisotropy is on, and the device's limit */
+     u32 win_w, win_h;
+     VkBuffer buf[RSX_VK_NBUF];
+     VkDeviceMemory mem[RSX_VK_NBUF];
+@@ -177,7 +178,7 @@ static int vk_instance(HWND hwnd)
+     VkResult r = vkCreateInstance_(&ci, NULL, &s_vk.inst);
+     if (r != VK_SUCCESS) return vk_fail("vkCreateInstance", r);
+ #define INST(n) n##_ = (PFN_##n)vkGetInstanceProcAddr_(s_vk.inst, #n); if (!n##_) return vk_fail(#n " lookup", VK_ERROR_INITIALIZATION_FAILED)
+-    INST(vkDestroyInstance); INST(vkEnumeratePhysicalDevices); INST(vkGetPhysicalDeviceProperties);
++    INST(vkDestroyInstance); INST(vkEnumeratePhysicalDevices); INST(vkGetPhysicalDeviceProperties); INST(vkGetPhysicalDeviceFeatures);
+     INST(vkGetPhysicalDeviceQueueFamilyProperties); INST(vkCreateDevice); INST(vkGetDeviceProcAddr);
+     INST(vkEnumerateDeviceExtensionProperties); INST(vkCreateWin32SurfaceKHR); INST(vkDestroySurfaceKHR);
+     INST(vkGetPhysicalDeviceSurfaceSupportKHR); INST(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+@@ -238,6 +239,7 @@ static int vk_device(void)
+     s_vk.qfam = best_q;
+     VkPhysicalDeviceProperties p;
+     vkGetPhysicalDeviceProperties_(s_vk.gpu, &p);
++    s_vk.aniso_max = p.limits.maxSamplerAnisotropy;
+     snprintf(s_vk.gpu_name, sizeof s_vk.gpu_name, "%s", p.deviceName);
+     vkGetPhysicalDeviceMemoryProperties_(s_vk.gpu, &s_vk.memp);
+ 
+@@ -249,8 +251,14 @@ static int vk_device(void)
+     const char* ext[] = { VK_KHR_SWAPCHAIN_EXTENSION_NAME };
+     VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
+     f13.dynamicRendering = VK_TRUE;
++    /* 0187: anisotropic filtering, where the device has it (the game asks for it and so does the port's menu) */
++    VkPhysicalDeviceFeatures have, want_f;
++    memset(&want_f, 0, sizeof want_f);
++    vkGetPhysicalDeviceFeatures_(s_vk.gpu, &have);
++    if (have.samplerAnisotropy) { want_f.samplerAnisotropy = VK_TRUE; s_vk.aniso_ok = 1; }
+     VkDeviceCreateInfo di = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+     di.pNext = &f13;
++    di.pEnabledFeatures = &want_f;
+     di.queueCreateInfoCount = 1;
+     di.pQueueCreateInfos = &qi;
+     di.enabledExtensionCount = 1;
+@@ -755,9 +763,10 @@ static int vk_layouts(void)
+ /* Re:Fine 0184: the sampler of a draw's unit, one per distinct guest state (the D3D12 backend's vp_sampler and
+  * rsx_sampler_desc): wrap modes from TEXTURE_ADDRESS, min/mag from TEXTURE_FILTER, the border as the nearest of
+  * Vulkan's three fixed colours. A unit the guest gave no state: point/clamp for unit 0, linear/wrap for the rest.
+- * Not done: anisotropy (the device feature is not enabled) and the LOD bias (textures have one level here). */
++ * 0187: anisotropy as rsx_sampler_desc: the game's (TEXTURE_CONTROL0 [6:4]) or the port menu's least (g_port_aniso),
++ * the larger, for a unit with linear min and mag. Not done: the LOD bias (textures have one level here). */
+ #define VK_SAMP_MAX 256
+-static struct { u32 k[3]; VkSampler s; } s_samp[VK_SAMP_MAX];
++static struct { u32 k[4]; VkSampler s; } s_samp[VK_SAMP_MAX];
+ static u32 s_nsamp;
+ static VkSamplerAddressMode vk_wrap(u32 w)
+ {
+@@ -771,9 +780,18 @@ static VkSamplerAddressMode vk_wrap(u32 w)
+ }
+ static VkSampler vk_sampler(const rsx_vk_tex* t, u32 u)
+ {
+-    u32 k[3];
++    u32 k[4];
+     if (t->set) { k[0] = t->addr & 0x000F0F0Fu; k[1] = t->filter & 0x07070000u; k[2] = t->border; }
+     else { k[0] = u == 0 ? 0x00030303u : 0x00010101u; k[1] = u == 0 ? 0x01010000u : 0x02020000u; k[2] = 0; }
++    {   static const u8 an[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
++        const u32 mn = (k[1] >> 16) & 7u, mg = (k[1] >> 24) & 7u;
++        const int lin = (mn == 2 || mn == 4 || mn == 6 || mn == 7) && (mg == 2 || mg == 4);
++        u32 want = t->set ? an[(t->ctrl0 >> 4) & 7u] : 1u;
++        const int port = g_port_aniso;
++        if (port > 1 && (u32)port > want) want = (u32)port;
++        if ((float)want > s_vk.aniso_max) want = (u32)s_vk.aniso_max;
++        k[3] = (lin && s_vk.aniso_ok && want > 1) ? want : 1u;
++    }
+     for (u32 i = 0; i < s_nsamp; i++) if (!memcmp(s_samp[i].k, k, sizeof k)) return s_samp[i].s;
+     if (s_nsamp >= VK_SAMP_MAX) return s_vk.samp_linear;
+     const u32 minf = (k[1] >> 16) & 7u, magf = (k[1] >> 24) & 7u;
+@@ -786,6 +804,7 @@ static VkSampler vk_sampler(const rsx_vk_tex* t, u32 u)
+         si.borderColor = a < 128 ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
+                        : lum >= 384 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; }
+     si.maxLod = VK_LOD_CLAMP_NONE;
++    if (k[3] > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = (float)k[3]; }
+     VkSampler s = VK_NULL_HANDLE;
+     if (vkCreateSampler_(s_vk.dev, &si, NULL, &s) != VK_SUCCESS) return s_vk.samp_linear;
+     memcpy(s_samp[s_nsamp].k, k, sizeof k); s_samp[s_nsamp].s = s; s_nsamp++;
+@@ -1021,14 +1040,38 @@ static VkTex* vk_tex_get(VkCommandBuffer c, uint32_t f, const rsx_vk_tex* t, u32
+ /* ---------------------------------------------------------------------------
+  * Public entry points (rsx_d3d12_backend.c with REFINE_RENDERER=vulkan)
+  * -----------------------------------------------------------------------*/
++/* 0188: an init that fails leaves nothing on the window, so the caller can start Direct3D 12 on it. */
++static int vk_init_fail(void)
++{
++    if (s_vk.dev) {
++        vkDeviceWaitIdle_(s_vk.dev);
++        vk_swap_destroy();
++        if (s_vk.swap) vkDestroySwapchainKHR_(s_vk.dev, s_vk.swap, NULL);
++        vkDestroyDevice_(s_vk.dev, NULL);
++    }
++    if (s_vk.inst) {
++        if (s_vk.surface) vkDestroySurfaceKHR_(s_vk.inst, s_vk.surface, NULL);
++        vkDestroyInstance_(s_vk.inst, NULL);
++    }
++    memset(&s_vk, 0, sizeof s_vk);
++    return -1;
++}
++
+ int rsx_vk_exec_init(void* hwnd, u32 w, u32 h, const u64 sizes[RSX_VK_NBUF], void* maps[RSX_VK_NBUF])
+ {
+     memset(&s_vk, 0, sizeof s_vk);
+     { const char* v = getenv("D3D12_VSYNC"); s_vk.vsync = !(v && *v == '0'); }
+     { const char* v = getenv("REFINE_VK_FLIP_FRONT"); s_vk.flip_front = v && *v == '1'; }   /* diagnostic */
+     s_vk.win_w = w; s_vk.win_h = h;
+-    if (vk_load() || vk_instance((HWND)hwnd) || vk_device()) return -1;
+-    if (vk_swap_create() < 0 || vk_layouts()) return -1;
++    if (vk_load() || vk_instance((HWND)hwnd) || vk_device()) return vk_init_fail();
++    {   /* every program goes through the HLSL to SPIR-V compiler: without it nothing would be drawn */
++        static const char probe[] = "float4 main() : SV_Position { return float4(0, 0, 0, 1); }";
++        void* spv = NULL; size_t n = 0; char err[256];
++        const int bad = rsx_vk_spirv(probe, sizeof probe - 1, 0, &spv, &n, err, sizeof err);
++        free(spv);
++        if (bad) { fprintf(stderr, "[vk] no SPIR-V compiler (%s)%c", err, 10); return vk_init_fail(); }
++    }
++    if (vk_swap_create() < 0 || vk_layouts()) return vk_init_fail();
+     const VkBufferUsageFlags use[RSX_VK_NBUF] = {
+         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,                                      /* RSX_VK_VB (fixed-function) */
+         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, /* RSX_VK_VP_VB */
+@@ -1038,10 +1081,10 @@ int rsx_vk_exec_init(void* hwnd, u32 w, u32 h, const u64 sizes[RSX_VK_NBUF], voi
+     };
+     u64 total = 0;
+     for (int i = 0; i < RSX_VK_NBUF; i++) {
+-        if (vk_host_buffer(i, sizes[i], use[i], &maps[i])) return -1;
++        if (vk_host_buffer(i, sizes[i], use[i], &maps[i])) return vk_init_fail();
+         total += sizes[i];
+     }
+-    if (vk_image(&s_vk.white, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 0) || vk_stage_init()) return -1;
++    if (vk_image(&s_vk.white, 1, 1, VK_FORMAT_R8G8B8A8_UNORM, 0) || vk_stage_init()) return vk_init_fail();
+     fprintf(stderr, "[vk] Vulkan executor on %s (V2c1: surfaces, pipelines and draws; guest textures not yet); "
+                     "%llu MB of upload buffers; depth %s%c", s_vk.gpu_name, (unsigned long long)(total >> 20),
+             s_vk.depth_format == VK_FORMAT_D24_UNORM_S8_UINT ? "D24S8" : "D32S8", 10);
+@@ -1113,7 +1156,8 @@ static void vk_clear_depth(VkCommandBuffer c, VkSurf* d)
+     vkCmdClearDepthStencilImage_(c, d->img, VK_IMAGE_LAYOUT_GENERAL, &v, 1, &rr);
+ }
+ 
+-static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii);   /* 0186, below */
++static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii, int in_color);   /* 0186, below */
++static int vk_present_shader(VkCommandBuffer c, uint32_t f, uint32_t ii);          /* 0187, below */
+ 
+ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+ {
+@@ -1183,7 +1227,9 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+             texof[d][u] = NULL;
+             if (!r->is_vp || r->is_clear || !((r->tex_mask >> u) & 1u) || !r->tex[u].set) continue;
+             if (vk_rt_find(r->tex[u].raw)) continue;
+-            for (u32 i = 0; i < s_vk.nds; i++) if (s_vk.ds[i].off == r->tex[u].raw) { s_vk.ds_sampled++; break; }   /* not done: reads guest memory */
++            for (u32 i = 0; i < s_vk.nds; i++) if (s_vk.ds[i].off == r->tex[u].raw) {   /* not done: it reads guest memory instead (D3D12: ds_convert) */
++                if (!s_vk.ds_sampled++) fprintf(stderr, "[vk] NOT DONE: a draw samples depth surface %08X as a texture (unit %u); it reads guest memory%c", r->tex[u].raw, u, 10);
++                break; }
+             texof[d][u] = vk_tex_get(c, f, &r->tex[u], r->tex[u].cube && ((r->cube_mask >> u) & 1u));
+         }
+     }
+@@ -1312,22 +1358,32 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+ 
+     if (present) {
+         vk_full_barrier(c);
+-        vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-                       0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+-        VkImageBlit bl; memset(&bl, 0, sizeof bl);
+-        bl.srcSubresource.aspectMask = bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+-        bl.srcSubresource.layerCount = bl.dstSubresource.layerCount = 1;
+-        bl.srcOffsets[1].x = (int32_t)s_vk.display.pw; bl.srcOffsets[1].y = (int32_t)s_vk.display.ph; bl.srcOffsets[1].z = 1;
+-        bl.dstOffsets[1].x = (int32_t)s_vk.extent.width; bl.dstOffsets[1].y = (int32_t)s_vk.extent.height; bl.dstOffsets[1].z = 1;
+-        vkCmdBlitImage_(c, s_vk.display.img, VK_IMAGE_LAYOUT_GENERAL, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+-                        1, &bl, VK_FILTER_LINEAR);
+-        if (!vk_ui_pass(c, f, ii))   /* 0186: the port's overlay on the presented image, or straight to present */
+-            vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+-                           VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++        /* 0187: with the port's sharpening or area resampling the picture goes through the present shader (the
++         * D3D12 backend's); else the plain linear blit, as before. Then the port's overlay (0186). */
++        const int shaded = vk_present_shader(c, f, ii);
++        if (!shaded) {
++            vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                           0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
++            VkImageBlit bl; memset(&bl, 0, sizeof bl);
++            bl.srcSubresource.aspectMask = bl.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            bl.srcSubresource.layerCount = bl.dstSubresource.layerCount = 1;
++            bl.srcOffsets[1].x = (int32_t)s_vk.display.pw; bl.srcOffsets[1].y = (int32_t)s_vk.display.ph; bl.srcOffsets[1].z = 1;
++            bl.dstOffsets[1].x = (int32_t)s_vk.extent.width; bl.dstOffsets[1].y = (int32_t)s_vk.extent.height; bl.dstOffsets[1].z = 1;
++            vkCmdBlitImage_(c, s_vk.display.img, VK_IMAGE_LAYOUT_GENERAL, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++                            1, &bl, VK_FILTER_LINEAR);
++        }
++        if (!vk_ui_pass(c, f, ii, shaded)) {
++            if (shaded)
++                vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++                               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++            else
++                vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
++                               VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
++        }
+     }
+     vkEndCommandBuffer_(c);
+ 
+-    const VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT;   /* the blit is the first use of the image */
++    const VkPipelineStageFlags wait = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;   /* the blit or the present shader */
+     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+     if (present) { si.waitSemaphoreCount = 1; si.pWaitSemaphores = &s_vk.acquired[f]; si.pWaitDstStageMask = &wait;
+                    si.signalSemaphoreCount = 1; si.pSignalSemaphores = &s_vk.rendered[ii]; }
+@@ -1372,7 +1428,8 @@ static struct {
+     volatile char lock;
+     VkBuffer buf[FRAMES]; VkDeviceMemory mem[FRAMES]; u8* map[FRAMES];
+     u64 used;
+-    VkPipeline pipe, grad;
++    VkPipeline pipe, grad, blit;   /* blit: the present shader (0187) */
++    u64 ring_frame;              /* s_vk.frames when this frame's ring was reset */
+     VkFormat pipe_format;
+     int state;                   /* 0 not made, 1 ready, -1 failed (said once) */
+     VkCommandBuffer c; uint32_t f, ii;
+@@ -1438,7 +1495,7 @@ static const char s_ui_ps_grad[] =
+     "    return i.c * c;\n"
+     "}\n";
+ 
+-static VkPipeline vk_ui_pipeline(VkShaderModule vs, VkShaderModule fs)
++static VkPipeline vk_ui_pipeline(VkShaderModule vs, VkShaderModule fs, int present)
+ {
+     VkPipelineShaderStageCreateInfo st[2] = { { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO },
+                                               { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO } };
+@@ -1448,8 +1505,10 @@ static VkPipeline vk_ui_pipeline(VkShaderModule vs, VkShaderModule fs)
+     VkVertexInputAttributeDescription va[3] = { { 0, 0, VK_FORMAT_R32G32_SFLOAT, 0 }, { 1, 0, VK_FORMAT_R8G8B8A8_UNORM, 8 },
+                                                 { 2, 0, VK_FORMAT_R32G32_SFLOAT, 12 } };
+     VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+-    vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb;
+-    vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = va;
++    if (!present) {   /* the present shader makes its triangle from the vertex index */
++        vi.vertexBindingDescriptionCount = 1; vi.pVertexBindingDescriptions = &vb;
++        vi.vertexAttributeDescriptionCount = 3; vi.pVertexAttributeDescriptions = va;
++    }
+     VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+     VkPipelineViewportStateCreateInfo vp = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+@@ -1460,7 +1519,7 @@ static VkPipeline vk_ui_pipeline(VkShaderModule vs, VkShaderModule fs)
+     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+     VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+     VkPipelineColorBlendAttachmentState cb; memset(&cb, 0, sizeof cb);
+-    cb.blendEnable = VK_TRUE;                                   /* RmlUi hands over premultiplied colours */
++    cb.blendEnable = present ? VK_FALSE : VK_TRUE;              /* RmlUi hands over premultiplied colours */
+     cb.srcColorBlendFactor = cb.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+     cb.dstColorBlendFactor = cb.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+     cb.colorBlendOp = cb.alphaBlendOp = VK_BLEND_OP_ADD;
+@@ -1517,8 +1576,8 @@ static int vk_ui_init(void)
+         const VkShaderModule vs = vk_module(s_ui_vs, 0, "overlay vertex", 1, &bad);
+         const VkShaderModule ps = vk_module(s_ui_ps, 1, "overlay fragment", 2, &bad);
+         const VkShaderModule pg = vk_module(s_ui_ps_grad, 1, "overlay gradient", 3, &bad);
+-        s_ui.pipe = vs && ps ? vk_ui_pipeline(vs, ps) : VK_NULL_HANDLE;
+-        s_ui.grad = vs && pg ? vk_ui_pipeline(vs, pg) : VK_NULL_HANDLE;   /* without it the menu is flat, as in D3D12 */
++        s_ui.pipe = vs && ps ? vk_ui_pipeline(vs, ps, 0) : VK_NULL_HANDLE;
++        s_ui.grad = vs && pg ? vk_ui_pipeline(vs, pg, 0) : VK_NULL_HANDLE;   /* without it the menu is flat, as in D3D12 */
+         s_ui.pipe_format = s_vk.format;
+         s_ui.state = s_ui.pipe ? 1 : -1;
+     }
+@@ -1636,15 +1695,24 @@ void rsx_vk_ui_draw(const rsx_vk_ui_cmd* d)
+ 
+ /* The overlay on the image about to be presented (in TRANSFER_DST after the blit). 1: drawn, and the image left
+  * in PRESENT_SRC; 0: nothing done. */
+-static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii)
++static void vk_ui_ring(uint32_t f)   /* this frame's ring from its start, once a frame */
++{
++    if (s_ui.ring_frame != s_vk.frames) { s_ui.ring_frame = s_vk.frames; s_ui.used = 0; }
++    s_ui.f = f;
++}
++
++/* in_color: the image is already a colour attachment (the present shader drew it), else in TRANSFER_DST. */
++static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii, int in_color)
+ {
+     if (!g_rsx_vk_ui || !g_port_overlay_active || !s_vk.view[ii] || !vk_ui_init()) return 0;
+-    s_ui.c = c; s_ui.f = f; s_ui.ii = ii; s_ui.used = 0;
++    vk_ui_ring(f);
++    s_ui.c = c; s_ui.ii = ii;
+     s_ui.frame_no++;
+     vk_ui_textures();
+-    vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+-                   VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+-                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
++    if (!in_color)
++        vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                       VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
++                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+     vk_ui_begin();
+     g_rsx_vk_ui(s_vk.extent.width, s_vk.extent.height);
+     vkCmdEndRendering_(c);
+@@ -1654,6 +1722,97 @@ static int vk_ui_pass(VkCommandBuffer c, uint32_t f, uint32_t ii)
+     return 1;
+ }
+ 
++/* Re:Fine 0187: the port's sharpening and area resampling (its menu: g_port_sharpen, g_port_area), with the D3D12
++ * backend's present shader (present_blit_init: the same source and constants). 1: the picture was drawn on the
++ * image, left as a colour attachment; 0: nothing asked (or no pipeline): the caller blits. */
++static const char s_blit_vs[] =
++    "struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };\n"
++    "O main(uint id : SV_VertexID) {\n"
++    "    O o;\n"
++    "    o.uv = float2((id << 1) & 2, id & 2);\n"
++    "    o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1);\n"
++    "    return o;\n"
++    "}\n";
++static const char s_blit_ps[] =
++    "Texture2D<float4> t : register(t0);\n"
++    "SamplerState s : register(s0);\n"
++    "cbuffer K : register(b0) { float2 px; float sharp; float area; };\n"
++    "float3 S(float2 uv) {\n"
++    "    if (area <= 1.0) return t.SampleLevel(s, uv, 0).rgb;\n"
++    "    int n = (int)min(ceil(area), 4.0);\n"
++    "    float3 a = 0;\n"
++    "    for (int j = 0; j < n; j++) for (int i = 0; i < n; i++)\n"
++    "        a += t.SampleLevel(s, uv + (float2(i, j) + 0.5) / n * px - 0.5 * px, 0).rgb;\n"
++    "    return a / (n * n);\n"
++    "}\n"
++    "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
++    "    float3 e = S(uv);\n"
++    "    if (sharp <= 0.0) return float4(e, 1.0);\n"
++    "    /* Contrast-adaptive sharpen after AMD FidelityFX CAS (MIT), own implementation. */\n"
++    "    float3 b = S(uv + float2(0, -px.y)), d = S(uv + float2(-px.x, 0));\n"
++    "    float3 f = S(uv + float2(px.x, 0)),  h = S(uv + float2(0, px.y));\n"
++    "    float3 mn = min(min(min(d, e), min(f, b)), h), mx = max(max(max(d, e), max(f, b)), h);\n"
++    "    float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4)));\n"
++    "    float3 w = amp * (-1.0 / lerp(8.0, 5.0, sharp));\n"
++    "    return float4(saturate((w * (b + d + f + h) + e) / (1.0 + 4.0 * w)), 1.0);\n"
++    "}\n";
++
++static int vk_present_shader(VkCommandBuffer c, uint32_t f, uint32_t ii)
++{
++    float sh = g_port_sharpen; if (sh < 0.0f) sh = 0.0f; if (sh > 1.0f) sh = 1.0f;
++    const float area = (g_port_area && s_vk.display.pw > s_vk.extent.width) ? (float)s_vk.display.pw / (float)s_vk.extent.width : 0.0f;
++    if (sh <= 0.0f && area <= 1.0f) return 0;
++    if (!s_vk.view[ii] || !s_vk.display.view || !vk_ui_init()) return 0;
++    static int failed;
++    if (!s_ui.blit && !failed) {
++        int bad = 0;
++        const VkShaderModule vs = vk_module(s_blit_vs, 0, "present vertex", 4, &bad);
++        const VkShaderModule ps = vk_module(s_blit_ps, 1, "present fragment", 5, &bad);
++        s_ui.blit = vs && ps ? vk_ui_pipeline(vs, ps, 1) : VK_NULL_HANDLE;
++        if (!s_ui.blit) { failed = 1; fprintf(stderr, "[vk] the present shader FAILED: sharpening and area resampling are off%c", 10); }
++    }
++    if (!s_ui.blit) return 0;
++    vk_ui_ring(f);
++    const u64 a_cb = (s_ui.used + 255u) & ~255ull;
++    if (a_cb + 256u > VK_UI_RING) return 0;
++    const float k[4] = { 1.0f / (float)s_vk.display.pw, 1.0f / (float)s_vk.display.ph, sh, area };
++    memcpy(s_ui.map[f] + a_cb, k, sizeof k);
++    s_ui.used = a_cb + 256u;
++    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
++    ai.descriptorPool = s_vk.dpool[f]; ai.descriptorSetCount = 1; ai.pSetLayouts = &s_vk.set_layout_u;
++    VkDescriptorSet set;
++    if (vkAllocateDescriptorSets_(s_vk.dev, &ai, &set) != VK_SUCCESS) return 0;
++    VkDescriptorBufferInfo ub = { s_ui.buf[f], a_cb, 16 };
++    VkDescriptorImageInfo im = { VK_NULL_HANDLE, s_vk.display.view, VK_IMAGE_LAYOUT_GENERAL };
++    VkDescriptorImageInfo sm = { s_vk.samp_linear, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED };
++    VkWriteDescriptorSet w[3];
++    memset(w, 0, sizeof w);
++    for (int i = 0; i < 3; i++) { w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET; w[i].dstSet = set; w[i].descriptorCount = 1; }
++    w[0].dstBinding = 0;  w[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER; w[0].pBufferInfo = &ub;
++    w[1].dstBinding = 16; w[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;  w[1].pImageInfo = &im;
++    w[2].dstBinding = 32; w[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;        w[2].pImageInfo = &sm;
++    vkUpdateDescriptorSets_(s_vk.dev, 3, w, 0, NULL);
++    vk_barrier_img(c, s_vk.img[ii], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
++                   0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
++    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
++    ca.imageView = s_vk.view[ii];
++    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
++    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE; ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
++    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
++    ri.renderArea.extent = s_vk.extent;
++    ri.layerCount = 1; ri.colorAttachmentCount = 1; ri.pColorAttachments = &ca;
++    vkCmdBeginRendering_(c, &ri);
++    vkCmdBindPipeline_(c, VK_PIPELINE_BIND_POINT_GRAPHICS, s_ui.blit);
++    const VkViewport vp = { 0.0f, (float)s_vk.extent.height, (float)s_vk.extent.width, -(float)s_vk.extent.height, 0.0f, 1.0f };
++    const VkRect2D sc = { { 0, 0 }, s_vk.extent };
++    vkCmdSetViewport_(c, 0, 1, &vp);
++    vkCmdSetScissor_(c, 0, 1, &sc);
++    vkCmdBindDescriptorSets_(c, VK_PIPELINE_BIND_POINT_GRAPHICS, s_vk.pipe_layout_u, 0, 1, &set, 0, NULL);
++    vkCmdDraw_(c, 3, 1, 0, 0);
++    vkCmdEndRendering_(c);
++    return 1;
++}
++
+ void rsx_vk_launcher_frame(void)
+ {
+     if (!s_vk.dev) return;
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -578,12 +578,21 @@ static u32 s_dbg_last_draws = 0;
+ static int s_vk_on;
+ /* Re:Fine 0186: which renderer this run uses, for the port too (its menu draws through the same one). One place
+  * decides: REFINE_RENDERER=vulkan or d3d12; without it, the default below. */
+-int rsx_renderer_is_vulkan(void)
++/* Re:Fine 0188: Vulkan is the default. REFINE_RENDERER=d3d12 (or refine.ini renderer = d3d12) asks for Direct3D 12;
++ * =vulkan asks for Vulkan and fails if it does not start. With neither, Vulkan is tried and, if it does not start
++ * (no vulkan-1.dll, no device, no dxcompiler.dll), the run draws with Direct3D 12 and says so. */
++static int s_vk_decided;
++static int renderer_wanted(int* asked)
++{
++    const char* rr = getenv("REFINE_RENDERER");
++    *asked = rr && *rr;
++    return *asked ? !_stricmp(rr, "vulkan") : 1;
++}
++int rsx_renderer_is_vulkan(void)   /* before the backend's init: what will be tried */
+ {
+ #ifdef REFINE_VULKAN
+-    static int v = -1;
+-    if (v < 0) { const char* rr = getenv("REFINE_RENDERER"); v = rr && *rr ? !_stricmp(rr, "vulkan") : 0; }
+-    return v;
++    int asked;
++    return s_vk_decided ? s_vk_on : renderer_wanted(&asked);
+ #else
+     return 0;
+ #endif
+@@ -10163,8 +10172,10 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+     }
+ 
+ #ifdef REFINE_VULKAN
+-    s_vk_on = rsx_renderer_is_vulkan();
+-    if (s_vk_on) {   /* N1 V2b: no D3D12 device; the recording writes the executor's buffers */
++    int vk_asked = 0;
++    const int vk_want = renderer_wanted(&vk_asked);
++    s_vk_on = 0;
++    if (vk_want) {   /* N1 V2b: no D3D12 device; the recording writes the executor's buffers */
+         const u64 sizes[RSX_VK_NBUF] = {
+             (u64)MAX_VERTICES * VERTEX_STRIDE,        /* the same sizes as init_d3d12's upload buffers */
+             (u64)MAX_VERTICES * 256 * 2,
+@@ -10174,16 +10185,26 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+         };
+         void* maps[RSX_VK_NBUF] = {0};
+         if (rsx_vk_exec_init(s_d3d.hwnd, width, height, sizes, maps) != 0) {
+-            printf("[D3D12] ERROR: REFINE_RENDERER=vulkan and Vulkan did not start\n");
+-            return -1;
++            if (vk_asked) {
++                printf("[D3D12] ERROR: REFINE_RENDERER=vulkan and Vulkan did not start\n");
++                return -1;
++            }
++            fprintf(stderr, "[renderer] Vulkan did not start: drawing with Direct3D 12 (renderer = d3d12 in refine.ini skips this try)\n");
++        } else {
++            s_d3d.vb_mapped = maps[RSX_VK_VB];
++            s_d3d.vp_vb_mapped = maps[RSX_VK_VP_VB];
++            s_d3d.vp_ib_mapped = maps[RSX_VK_VP_IB];
++            s_d3d.vp_cb_mapped = maps[RSX_VK_VP_CB];
++            s_d3d.vp_fpcb_mapped = maps[RSX_VK_VP_FPCB];
++            s_d3d.pipeline_ready = 1;
++            s_vk_on = 1;
+         }
+-        s_d3d.vb_mapped = maps[RSX_VK_VB];
+-        s_d3d.vp_vb_mapped = maps[RSX_VK_VP_VB];
+-        s_d3d.vp_ib_mapped = maps[RSX_VK_VP_IB];
+-        s_d3d.vp_cb_mapped = maps[RSX_VK_VP_CB];
+-        s_d3d.vp_fpcb_mapped = maps[RSX_VK_VP_FPCB];
+-        s_d3d.pipeline_ready = 1;
+-    } else
++    }
++    s_vk_decided = 1;
++    fprintf(stderr, "[renderer] %s\n", s_vk_on ? "Vulkan" : "Direct3D 12");
++    /* the port's overlay learns which one draws it: a null device is the Vulkan executor (port_overlay.h) */
++    if (s_vk_on && g_port_overlay_device_ready) g_port_overlay_device_ready(NULL, 0, 0);
++    if (!s_vk_on)
+ #endif
+     /* Initialize D3D12 */
+     if (init_d3d12(width, height) != 0) {
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -33,7 +33,8 @@ extern int (*g_port_overlay_wndproc)(void* hwnd, unsigned msg, uint64_t wp, int6
+ extern volatile long g_port_overlay_gate;
+ extern int (*g_port_overlay_pad)(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly);
+ 
+-/* Re:Fine 0159. Once, on the thread that makes the swap chain, right after: the device. */
++/* Re:Fine 0159. Once, on the thread that makes the swap chain, right after: the device.
++ * 0188: device NULL = this run draws with the Vulkan executor (the overlay then draws through g_rsx_vk_ui). */
+ extern void (*g_port_overlay_device_ready)(void* device, uint32_t rtv_format, uint32_t frame_count);
+ /* Re:Fine 0159. Guest thread, every cellPadGetData, before the gate: the pad as read. */
+ extern void (*g_port_overlay_watch)(unsigned port, uint16_t mask);

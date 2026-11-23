@@ -1,0 +1,37 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -133,6 +133,13 @@ unsigned pad_raw_sources(void) { return (unsigned)s_raw_sources; }
+ 
+ /* Re:Fine 0173 (port_overlay.h): set by the port for the frames the game does not step. */
+ volatile long g_port_pad_hold;
++/* Re:Fine 0193: set by the port for the frames of a song that are no 30 Hz tick. The song's logic runs every
++ * frame, but the pause menu's (16TaskPauseManager) waits for the ticks: a tap of START between two ticks was
++ * read and gone before the pause logic ran, and the pause did not open (seen at 120 fps, 2026-11-21). On those
++ * frames START and SELECT keep the state of the last packet the game got, so their edges land on a tick, as at
++ * 30 fps; the note buttons are untouched and reach the judge on the next frame. */
++volatile long g_port_pad_hold_sys;
++#define PAD_SYS_BUTTONS ((u16)(CELL_PAD_CTRL_START | CELL_PAD_CTRL_SELECT))
+ extern volatile long g_port_draw_tick;   /* libs/video: this guest frame runs the game's logic (a 30 Hz tick) */
+ extern volatile long g_port_draw_ticks;  /* libs/video: how many 30 Hz ticks since boot */
+ extern unsigned int ppu_active_lr(void);  /* runtime: the guest return address of the call being served */
+@@ -2031,6 +2038,7 @@ emit:
+                             continue;
+                         }
+                         if (!s_tap_n[port_no][b]) continue;
++                        if (g_port_pad_hold_sys && (bit & PAD_SYS_BUTTONS)) continue;   /* 0193: kept for the next tick */
+                         if (cur & bit) {                      /* the game sees it down right now */
+                             s_tap_held += s_tap_n[port_no][b];
+                             s_tap_n[port_no][b] = 0;
+@@ -2049,6 +2057,11 @@ emit:
+                     pad_unlock();
+                     lat16 = give;
+                 }
++                if (g_port_pad_hold_sys && s_have_pkt[port_no]) {   /* 0193: START and SELECT change on ticks only */
++                    const u16 keep = (u16)(s_last_pkt[port_no].button[CELL_PAD_BTN_OFFSET_DIGITAL1] & PAD_SYS_BUTTONS);
++                    data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] = (u16)((data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] & ~PAD_SYS_BUTTONS) | keep);
++                    lat16 &= (u16)~PAD_SYS_BUTTONS;
++                }
+                 const long lat = (long)lat16;
+                 const u16 l1 = (u16)(lat & 0xFF), l2 = (u16)((lat >> 8) & 0xFF);
+                 /* Re:Fine 0191c: a read whose buttons differ from the last packet the game got is a report

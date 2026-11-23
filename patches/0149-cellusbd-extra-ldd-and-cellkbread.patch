@@ -1,0 +1,222 @@
+diff --git a/libs/hardware/cellUsbd.c b/libs/hardware/cellUsbd.c
+--- a/libs/hardware/cellUsbd.c
++++ b/libs/hardware/cellUsbd.c
+@@ -7,6 +7,8 @@
+  */
+ 
+ #include "cellUsbd.h"
++#include "../../runtime/ppu/ppu_context.h"
++#include <stdint.h>
+ #include <stdio.h>
+ #include <string.h>
+ #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_read/vm_write: guest EA -> host */
+@@ -104,3 +106,41 @@ s32 cellUsbdControlTransfer(CellUsbdPipeId pipeId, u8 requestType,
+     (void)value; (void)index; (void)data; (void)length; (void)transferred;
+     return (s32)CELL_USBD_ERROR_PIPE_NOT_FOUND;
+ }
++
++/* Re:Fine 0149. An extra LDD is an LDD with a vendor and product of its own, in the same
++ * table as cellUsbdRegisterLdd. F registers "HORI DIVA-F LARGE" (0x0F0D:0x0048) and
++ * ignores both returns (0x39DFC, 0x399C8). No device is ever enumerated, so attach never
++ * runs: the same as RPCS3 without that controller, whose libusbd only reaches
++ * sys_usbd_register_extra_ldd and sys_usbd_unregister_extra_ldd. */
++s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops, u16 vendorId, u16 productId)
++{
++    printf("[cellUsbd] RegisterExtraLdd(vendor=0x%04X, product=0x%04X)\n", vendorId, productId);
++    return cellUsbdRegisterLdd(ops);
++}
++
++s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops)
++{
++    printf("[cellUsbd] UnregisterExtraLdd()\n");
++    return cellUsbdUnregisterLdd(ops);
++}
++
++/* Not in the generated NID table: ctx handlers, so it does not have to be regenerated. */
++extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
++
++static void hle_cellUsbdRegisterExtraLdd(ppu_context* ctx)
++{
++    ctx->gpr[3] = (u64)(s64)cellUsbdRegisterExtraLdd(
++        (const CellUsbdLddOps*)(uintptr_t)(u32)ctx->gpr[3], (u16)ctx->gpr[4], (u16)ctx->gpr[5]);
++}
++
++static void hle_cellUsbdUnregisterExtraLdd(ppu_context* ctx)
++{
++    ctx->gpr[3] = (u64)(s64)cellUsbdUnregisterExtraLdd(
++        (const CellUsbdLddOps*)(uintptr_t)(u32)ctx->gpr[3]);
++}
++
++void cellUsbd_register_ctx_handlers(void)
++{
++    ps3_hle_register_ctx(0x7FE92C54u, "cellUsbdRegisterExtraLdd", hle_cellUsbdRegisterExtraLdd);
++    ps3_hle_register_ctx(0x90460081u, "cellUsbdUnregisterExtraLdd", hle_cellUsbdUnregisterExtraLdd);
++}
+diff --git a/libs/hardware/cellUsbd.h b/libs/hardware/cellUsbd.h
+--- a/libs/hardware/cellUsbd.h
++++ b/libs/hardware/cellUsbd.h
+@@ -60,6 +60,8 @@ s32 cellUsbdInit(void);
+ s32 cellUsbdEnd(void);
+ 
+ s32 cellUsbdRegisterLdd(const CellUsbdLddOps* ops);
++s32 cellUsbdRegisterExtraLdd(const CellUsbdLddOps* ops, u16 vendorId, u16 productId);
++s32 cellUsbdUnregisterExtraLdd(const CellUsbdLddOps* ops);
+ s32 cellUsbdUnregisterLdd(const CellUsbdLddOps* ops);
+ 
+ s32 cellUsbdGetDeviceList(CellUsbdDeviceInfo* list, u32 maxDevices,
+diff --git a/libs/input/cellKb.c b/libs/input/cellKb.c
+--- a/libs/input/cellKb.c
++++ b/libs/input/cellKb.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include "cellKb.h"
++#include "../../runtime/ppu/ppu_context.h"
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdint.h>
+@@ -134,8 +135,9 @@ s32 cellKbInit(u32 max_connect)
+     s_kb_max_connect = max_connect;
+     memset(s_kb_ports, 0, sizeof(s_kb_ports));
+ 
+-    /* Assume keyboard 0 is always connected on the host */
+-    s_kb_ports[0].connected = 1;
++    /* Re:Fine 0149: no keyboard until cellKb_keyEvent reports one. The PC keyboard
++     * goes to cellPad (patches/0142), and RPCS3 with Keyboard: Null reports none
++     * either, so F never calls cellKbRead there. */
+     s_kb_ports[0].rmode = CELL_KB_RMODE_INPUTCHAR;
+     s_kb_ports[0].codetype = CELL_KB_CODETYPE_ASCII;
+ 
+@@ -206,6 +208,22 @@ s32 cellKbGetData(u32 port_no, CellKbData* data)
+     return CELL_OK;
+ }
+ 
++/* cellKbRead, the name the import really has; behaviour of RPCS3 1f59f0f2, no code
++ * copied: a port without a keyboard gives NO_DEVICE and leaves the buffer alone. */
++s32 cellKbRead(u32 port_no, CellKbData* data)
++{
++    if (!s_kb_initialized)
++        return CELL_KB_ERROR_UNINITIALIZED;
++
++    if (port_no >= CELL_KB_MAX_KEYBOARDS || !data)
++        return CELL_KB_ERROR_INVALID_PARAMETER;
++
++    if (!s_kb_ports[port_no].connected)
++        return CELL_KB_ERROR_NO_DEVICE;
++
++    return cellKbGetData(port_no, data);
++}
++
+ /* Guest CellKbInfo layout (big-endian): +0x00 max_connect u32, +0x04
+  * now_connect u32, +0x08 info u32, +0x0C status[] u8 PER KEYBOARD (bytes,
+  * not u32s -- SDK/RPCS3 layout). */
+@@ -279,3 +297,16 @@ s32 cellKbClearBuf(u32 port_no)
+     s_kb_ports[port_no].event_count = 0;
+     return CELL_OK;
+ }
++
++/* Not in the generated NID table: a ctx handler, so it does not have to be regenerated. */
++extern void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
++
++static void hle_cellKbRead(ppu_context* ctx)
++{
++    ctx->gpr[3] = (u64)(s64)cellKbRead((u32)ctx->gpr[3], (CellKbData*)(uintptr_t)(u32)ctx->gpr[4]);
++}
++
++void cellKb_register_ctx_handlers(void)
++{
++    ps3_hle_register_ctx(0xFF0A21B7u, "cellKbRead", hle_cellKbRead);
++}
+diff --git a/libs/input/cellKb.h b/libs/input/cellKb.h
+--- a/libs/input/cellKb.h
++++ b/libs/input/cellKb.h
+@@ -148,6 +148,7 @@ typedef struct CellKbInfo {
+ s32 cellKbInit(u32 max_connect);
+ s32 cellKbEnd(void);
+ s32 cellKbGetData(u32 port_no, CellKbData* data);
++s32 cellKbRead(u32 port_no, CellKbData* data);
+ s32 cellKbGetInfo(CellKbInfo* info);
+ s32 cellKbSetReadMode(u32 port_no, u32 rmode);
+ s32 cellKbSetCodeType(u32 port_no, u32 codetype);
+diff --git a/libs/input/tests/test_cellKb.c b/libs/input/tests/test_cellKb.c
+new file mode 100644
+--- /dev/null
++++ b/libs/input/tests/test_cellKb.c
+@@ -0,0 +1,56 @@
++/* clang-cl /O1 -w -Iinclude -Ilibs/input libs/input/tests/test_cellKb.c libs/input/cellKb.c \
++ *     /link /force:unresolved /out:test_cellKb.exe
++ *
++ * cellKbRead with RPCS3's return codes and order; the guest is a plain array. */
++#include "../cellKb.h"
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++
++static uint8_t guest[0x1000];
++static int failed;
++
++void vm_write8(unsigned long long a, unsigned char v) { guest[a] = v; }
++void vm_write16(unsigned long long a, unsigned short v) { guest[a] = v >> 8; guest[a + 1] = (uint8_t)v; }
++void vm_write32(unsigned long long a, unsigned int v)
++{
++    vm_write16(a, (unsigned short)(v >> 16));
++    vm_write16(a + 2, (unsigned short)v);
++}
++static u32 rd32(u32 a) { return (u32)guest[a] << 24 | guest[a + 1] << 16 | guest[a + 2] << 8 | guest[a + 3]; }
++
++#define CHECK(c) do { if (!(c)) { printf("[cellKb] FAILED line %d: %s\n", __LINE__, #c); failed++; } } while (0)
++#define INFO ((CellKbInfo*)(uintptr_t)0x100)
++#define DATA ((CellKbData*)(uintptr_t)0x200)
++
++int main(void)
++{
++    CHECK(cellKbRead(0, DATA) == CELL_KB_ERROR_UNINITIALIZED);
++    CHECK(cellKbInit(1) == CELL_OK);
++
++    /* No keyboard, as RPCS3 with Keyboard: Null: F sees status 0 and never reads. */
++    CHECK(cellKbGetInfo(INFO) == CELL_OK);
++    CHECK(rd32(0x100) == 1);
++    CHECK(rd32(0x104) == 0);
++    CHECK(guest[0x10C] == 0);
++
++    memset(guest + 0x200, 0xAB, 16);
++    CHECK(cellKbRead(0, DATA) == CELL_KB_ERROR_NO_DEVICE);
++    CHECK(guest[0x200] == 0xAB);
++    CHECK(cellKbRead(1, DATA) == CELL_KB_ERROR_NO_DEVICE);
++    CHECK(cellKbRead(CELL_KB_MAX_KEYBOARDS, DATA) == CELL_KB_ERROR_INVALID_PARAMETER);
++    CHECK(cellKbRead(0, NULL) == CELL_KB_ERROR_INVALID_PARAMETER);
++
++    /* A key from the host connects the port. */
++    cellKb_keyEvent(0, CELL_KEYC_A, 1);
++    CHECK(cellKbGetInfo(INFO) == CELL_OK);
++    CHECK(rd32(0x104) == 1);
++    CHECK(guest[0x10C] == CELL_KB_STATUS_CONNECTED);
++    CHECK(cellKbRead(0, DATA) == CELL_OK);
++    CHECK(rd32(0x208) == 1);
++    CHECK(guest[0x20C] == 0 && guest[0x20D] == 'a');
++
++    CHECK(cellKbEnd() == CELL_OK);
++    printf("[cellKb] %s (%d failed)\n", failed ? "FAILED" : "PASS", failed);
++    return failed != 0;
++}
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -714,6 +714,8 @@ static void hle_cellGcmInitBody(ppu_context* ctx)
+ extern "C" void ps3_net_host_register(unsigned int (*guest_alloc)(unsigned int, unsigned int));
+ extern "C" void np_score_register_ctx(void);   /* libs/network/sceNpScore.c */
+ extern "C" void cellSaveData_register_ctx_handlers(void); /* libs/system/cellSaveData.c */
++extern "C" void cellKb_register_ctx_handlers(void);       /* libs/input/cellKb.c */
++extern "C" void cellUsbd_register_ctx_handlers(void);     /* libs/hardware/cellUsbd.c */
+ extern "C" void cellSearch_register_ctx_handlers(unsigned int (*guest_alloc)(unsigned int, unsigned int)); /* libs/system/cellSearch.c */
+ extern "C" void avconf_register_ctx(void);     /* libs/misc/cellAvconfExt.c */
+ static uint32_t g_net_errno_ea = 0;
+@@ -1050,6 +1052,8 @@ extern "C" void ppu_sysprx_register(void)
+      * (userdata) is on the guest stack, so they need the full context too.
+      * Registered here so no project has to remember the call. */
+     cellSaveData_register_ctx_handlers();
++    cellKb_register_ctx_handlers();
++    cellUsbd_register_ctx_handlers();
+     cellSearch_register_ctx_handlers(gcm_guest_alloc);
+     /* cellVideoOutSetGamma's float argument is in f1. */
+     avconf_register_ctx();

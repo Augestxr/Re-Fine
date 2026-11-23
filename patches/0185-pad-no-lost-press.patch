@@ -1,0 +1,91 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -179,6 +179,9 @@ static u32           s_port_setting[CELL_PAD_MAX_PORT_NUM];
+ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
+ /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
+ static int s_data_fresh[PAD_MAX_HOST_PORTS];
++/* Re:Fine 0185: the buttons seen down in any poll since the last read the game used (cellPadGetData). */
++static volatile long s_btn_latch[PAD_MAX_HOST_PORTS];
++static int s_pad_log = -1;   /* REFINE_PAD_LOG=1: every change of port 0's buttons, as polled and as the game reads it */
+ 
+ #if PAD_BACKEND_SDL2
+ /* PS3 port i's controller, by SDL instance id (-1 = none); the port keeps the
+@@ -424,6 +427,7 @@ static u8 pad_key_axis(int neg, int pos, int* was_neg, int* was_pos, int* last)
+ static void pad_poll_keyboard(void)
+ {
+     static int off = -1;
++    static int s_vk_primed;   /* 0185 */
+     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+     if (off) return;
+     if (s_key_script < 0) pad_keys_parse();
+@@ -440,6 +444,7 @@ static void pad_poll_keyboard(void)
+             hs->analog_rx = hs->analog_ry = 128;
+             hs->connected = 1;
+         }
++        s_vk_primed = 0;
+         return;
+     }
+ 
+@@ -466,13 +471,17 @@ static void pad_poll_keyboard(void)
+     };
+     const PadKeyBinds* kb = __atomic_load_n(&s_key_binds, __ATOMIC_ACQUIRE);
+     if (!kb) kb = &def;
+-#define PAD_VK(a) (focused && ((kb->vk[a][0] && (GetAsyncKeyState(kb->vk[a][0]) & 0x8000)) || \
+-                               (kb->vk[a][1] && (GetAsyncKeyState(kb->vk[a][1]) & 0x8000))))
++    /* Re:Fine 0185: a key pressed and let go between two polls counts as down in this one (GetAsyncKeyState's
++     * low bit: pressed since the last call). The keys are read without focus too, so that bit never carries a
++     * press typed in another window into the game; the first sweep only clears it. */
++#define PAD_VK1(v) ((v) && (GetAsyncKeyState(v) & (s_vk_primed ? 0x8001 : 0x8000)))
++#define PAD_VK(a) ((PAD_VK1(kb->vk[a][0]) | PAD_VK1(kb->vk[a][1])) && focused)
+ #define PAD_SCRIPTED(c) (s_key_script && pad_key_scripted(c))
+ 
+     u16 btns = 0;
+     for (int a = 0; a < PORT_BIND_PAD_COUNT; a++)
+         if (PAD_VK(a)) btns |= s_bind_btn[a];
++    s_vk_primed = 1;
+     if (s_key_script)
+         for (unsigned i = 0; i < sizeof script / sizeof script[0]; i++)
+             if (pad_key_scripted(script[i].letter)) btns |= script[i].btn;
+@@ -1440,6 +1449,11 @@ static void pad_poll_backend(void)
+ #ifdef _WIN32
+     pad_poll_keyboard();
+ #endif
++    if (s_pad_log < 0) s_pad_log = getenv("REFINE_PAD_LOG") != NULL;
++    if (s_pad_log) { static u16 lb; if (s_host_state[0].buttons != lb) { lb = s_host_state[0].buttons;
++        fprintf(stderr, "[pad-poll] %llu ms buttons %04X%c", now, lb, 10); } }
++    for (int _i = 0; _i < PAD_MAX_HOST_PORTS; _i++)   /* 0185 */
++        if (s_host_state[_i].buttons) __atomic_fetch_or(&s_btn_latch[_i], (long)s_host_state[_i].buttons, __ATOMIC_RELAXED);
+     pad_track_assign();
+     pad_unlock();
+ }
+@@ -1912,9 +1926,28 @@ emit:
+     {
+         static CellPadData s_last_pkt[CELL_PAD_MAX_PORT_NUM];
+         static int s_have_pkt[CELL_PAD_MAX_PORT_NUM];
++        /* Re:Fine 0185: no press is lost. The polls happen more often than the reads the game uses (in the
++         * menus those are 33 ms apart, and a poll can also come from cellPadGetInfo or the window thread), so a
++         * key down in one poll and up in the next never reached the game. Every poll adds its buttons to
++         * s_btn_latch; the next read the game uses (not a held one) carries them and clears it: the tap is
++         * down in that read and up in the one after. REFINE_PAD_LATCH=0 turns it off. */
++        static int s_latch = -1;
++        if (s_latch < 0) { const char* e = getenv("REFINE_PAD_LATCH"); s_latch = !(e && *e == '0'); }
+         if (port_no < CELL_PAD_MAX_PORT_NUM) {
+             if (g_port_pad_hold && s_have_pkt[port_no]) *data = s_last_pkt[port_no];
+-            else { s_last_pkt[port_no] = *data; s_have_pkt[port_no] = 1; }
++            else {
++                const long lat = (s_latch && port_no < PAD_MAX_HOST_PORTS) ? __atomic_exchange_n(&s_btn_latch[port_no], 0, __ATOMIC_RELAXED) : 0;
++                const u16 l1 = (u16)(lat & 0xFF), l2 = (u16)((lat >> 8) & 0xFF);
++                if ((l1 & ~data->button[CELL_PAD_BTN_OFFSET_DIGITAL1]) | (l2 & ~data->button[CELL_PAD_BTN_OFFSET_DIGITAL2])) {
++                    data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] |= l1;
++                    data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] |= l2;
++                    if (!data->len) data->len = s_have_pkt[port_no] && s_last_pkt[port_no].len ? s_last_pkt[port_no].len : CELL_PAD_LEN_CHANGE_DEFAULT;
++                }
++                if (s_pad_log > 0 && port_no == 0) { static u32 lg = ~0u;
++                    const u32 g = (u32)data->button[CELL_PAD_BTN_OFFSET_DIGITAL1] | (u32)data->button[CELL_PAD_BTN_OFFSET_DIGITAL2] << 8;
++                    if (data->len && g != lg) { lg = g; fprintf(stderr, "[pad-game] %llu ms buttons %04X len %d latched %04lX%c", pad_now_ms(), g, (int)data->len, lat, 10); } }
++                s_last_pkt[port_no] = *data; s_have_pkt[port_no] = 1;
++            }
+         }
+     }
+     {

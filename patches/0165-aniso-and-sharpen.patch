@@ -1,0 +1,109 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2460,6 +2460,9 @@ static D3D12_TEXTURE_ADDRESS_MODE rsx_wrap(u32 w)
+ /* Sampler from the guest's TEXTURE_ADDRESS (wrap S [3:0], T [11:8], R [19:16]),
+  * TEXTURE_FILTER (LOD bias [12:0] signed x/256, min [18:16], mag [26:24]) and
+  * TEXTURE_CONTROL0 (max anisotropy [6:4]) and BORDER_COLOR (ARGB). */
++volatile int   g_port_aniso;     /* Re:Fine 0165 */
++volatile float g_port_sharpen;
++static int s_aniso_applied;
+ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
+ {
+     const u32 addr = k[0], filter = k[1], ctrl0 = k[2], border = k[3];
+@@ -2469,9 +2472,11 @@ static void rsx_sampler_desc(const u32 k[4], D3D12_SAMPLER_DESC* s)
+     const int mag_lin = magf == 2 || magf == 4;
+     static const u8 aniso[8] = { 1, 2, 4, 6, 8, 10, 12, 16 };
+     memset(s, 0, sizeof *s);
+-    if (aniso[(ctrl0 >> 4) & 7u] > 1 && min_lin && mag_lin) {
++    u32 want = aniso[(ctrl0 >> 4) & 7u];
++    if (s_aniso_applied > 1 && min_lin && mag_lin && (u32)s_aniso_applied > want) want = (u32)s_aniso_applied;   /* 0165 */
++    if (want > 1 && min_lin && mag_lin) {
+         s->Filter = D3D12_FILTER_ANISOTROPIC;
+-        s->MaxAnisotropy = aniso[(ctrl0 >> 4) & 7u];
++        s->MaxAnisotropy = want;
+     } else {
+         s->Filter = (D3D12_FILTER)((min_lin << 4) | (mag_lin << 2) | mip_lin);
+         s->MaxAnisotropy = 1;
+@@ -5313,8 +5318,18 @@ static int present_blit_init(void)
+     static const char ps[] =
+         "Texture2D<float4> t : register(t0);\n"
+         "SamplerState s : register(s0);\n"
++        "cbuffer K : register(b0) { float2 px; float sharp; float pad; };\n"
++        "float3 S(float2 uv) { return t.SampleLevel(s, uv, 0).rgb; }\n"
+         "float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+-        "    return t.SampleLevel(s, uv, 0);\n"
++        "    float3 e = S(uv);\n"
++        "    if (sharp <= 0.0) return float4(e, 1.0);\n"
++        "    /* Contrast-adaptive sharpen after AMD FidelityFX CAS (MIT), own implementation. */\n"
++        "    float3 b = S(uv + float2(0, -px.y)), d = S(uv + float2(-px.x, 0));\n"
++        "    float3 f = S(uv + float2(px.x, 0)),  h = S(uv + float2(0, px.y));\n"
++        "    float3 mn = min(min(min(d, e), min(f, b)), h), mx = max(max(max(d, e), max(f, b)), h);\n"
++        "    float3 amp = sqrt(saturate(min(mn, 1.0 - mx) / max(mx, 1e-4)));\n"
++        "    float3 w = amp * (-1.0 / lerp(8.0, 5.0, sharp));\n"
++        "    return float4(saturate((w * (b + d + f + h) + e) / (1.0 + 4.0 * w)), 1.0);\n"
+         "}\n";
+     ID3DBlob *vb = NULL, *pb = NULL, *err = NULL, *sig = NULL;
+     if (FAILED(sc_compile(vs, sizeof vs - 1, "blit_vs", NULL, NULL, "main", "vs_5_0", 0, 0, &vb, &err)) ||
+@@ -5325,17 +5340,20 @@ static int present_blit_init(void)
+     D3D12_DESCRIPTOR_RANGE rg = {0};
+     rg.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+     rg.NumDescriptors = 1;
+-    D3D12_ROOT_PARAMETER rp = {0};
+-    rp.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+-    rp.DescriptorTable.NumDescriptorRanges = 1;
+-    rp.DescriptorTable.pDescriptorRanges = &rg;
+-    rp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_ROOT_PARAMETER rp[2] = {{0}};
++    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    rp[0].DescriptorTable.NumDescriptorRanges = 1;
++    rp[0].DescriptorTable.pDescriptorRanges = &rg;
++    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;   /* Re:Fine 0165: texel size, sharpness */
++    rp[1].Constants.Num32BitValues = 4;
++    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+     D3D12_STATIC_SAMPLER_DESC ss = {0};
+     ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+     ss.AddressU = ss.AddressV = ss.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+     ss.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+     D3D12_ROOT_SIGNATURE_DESC rd = {0};
+-    rd.NumParameters = 1; rd.pParameters = &rp;
++    rd.NumParameters = 2; rd.pParameters = rp;
+     rd.NumStaticSamplers = 1; rd.pStaticSamplers = &ss;
+     ID3D12Device* dev = s_d3d.device;
+     if (FAILED(D3D12SerializeRootSignature(&rd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err)) ||
+@@ -5409,6 +5427,9 @@ static void present_blit(u32 fi)
+     D3D12_GPU_DESCRIPTOR_HANDLE gh;
+     s_blit.heap->lpVtbl->GetGPUDescriptorHandleForHeapStart(s_blit.heap, &gh);
+     cl->lpVtbl->SetGraphicsRootDescriptorTable(cl, 0, gh);
++    { float sh = g_port_sharpen; if (sh < 0.0f) sh = 0.0f; if (sh > 1.0f) sh = 1.0f;   /* Re:Fine 0165 */
++      const float kc[4] = { 1.0f / (float)vw, 1.0f / (float)vh, sh, 0.0f };
++      cl->lpVtbl->SetGraphicsRoot32BitConstants(cl, 1, 4, kc, 0); }
+     cl->lpVtbl->IASetPrimitiveTopology(cl, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     cl->lpVtbl->DrawInstanced(cl, 3, 1, 0, 0);
+     /* Re:Fine 0158: the port's overlay on top of the finished picture, at the window's size. */
+@@ -5756,6 +5777,8 @@ static void render_frame(void)
+     wait_for_gpu();
+     swap_chain_resize();
+     render_height_apply();   /* Re:Fine 0161 */
++    /* Re:Fine 0165: a new anisotropy level starts the sampler cache over (the GPU is idle here). */
++    if (s_aniso_applied != g_port_aniso) { s_aniso_applied = g_port_aniso; if (s_d3d.samp_n > 2) s_d3d.samp_n = 2; }
+     u32 fi = s_d3d.frame_index;
+     const double _fp1 = g_frame_prof_on ? perf_now() : 0.0;
+     if (g_frame_prof_on) { fp_init(); fp_read_gpu(); g_frame_prof.draws += s_d3d.draw_count; }
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -56,6 +56,12 @@ extern void (*g_port_launcher)(void);
+  * g_port_launcher hook. */
+ void rsx_d3d12_launcher_frame(void);
+ 
++/* Re:Fine 0165. Picture quality from the port's menu, read by the renderer each frame (hot).
++ * g_port_aniso: 0 or 1 = as the game asks, else the least maximum anisotropy (2-16) for linear samplers.
++ * g_port_sharpen: 0 = off, else 0-1 strength of a contrast-adaptive sharpen at the present. */
++extern volatile int   g_port_aniso;
++extern volatile float g_port_sharpen;
++
+ #ifdef __cplusplus
+ }
+ #endif

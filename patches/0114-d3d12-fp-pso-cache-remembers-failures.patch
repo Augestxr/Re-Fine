@@ -1,0 +1,94 @@
+Re:Fine 0114: la cache de vp_get_fp_pso recuerda los programas que fallan.
+
+Parche de RENDIMIENTO, no arreglo. Un FP que falla (en F, PSO con E_INVALIDARG porque usa mas de
+4 unidades de textura y la root signature solo declara t0-t3) no se guardaba: cada draw repetia
+decompilacion + D3DCompile + CreateGraphicsPipelineState, 38 veces por frame en la PV600, ~1 frame/s.
+Ahora el fallo entra en la cache con pso NULL y el draw usa el pipeline de reserva, igual que antes:
+la imagen sigue mal hasta subir las unidades de textura (D9). Cada programa se registra una vez en
+stderr, con fase, id y hr. Evidencia en docs/STATUS.md (4g).
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2324,6 +2324,24 @@
+     return m;
+ }
+ 
++/* Re:Fine 0114: a program that cannot become a pipeline is reported once, by its
++ * microcode hash, with the stage and the HRESULT. Its failure stays in the
++ * cache below, so nothing here runs per draw. */
++static void vp_fp_fail_once(u32 fp_addr, u32 uhash, const char* stage, HRESULT hr, const char* detail)
++{
++    static u32 seen[VP_FP_CACHE];
++    static int n = 0, full = 0;
++    for (int i = 0; i < n; i++) if (seen[i] == uhash) return;
++    if (n == VP_FP_CACHE) {
++        if (!full) { full = 1; fprintf(stderr, "[FP] FAIL log full: later programs not named\n"); fflush(stderr); }
++        return;
++    }
++    seen[n++] = uhash;
++    fprintf(stderr, "[FP] FAIL %s fp=0x%08X ucode=0x%08X hr=0x%08lX%s%s\n", stage, fp_addr, uhash,
++            (unsigned long)hr, detail ? " " : "", detail ? detail : "");
++    fflush(stderr);
++}
++
+ static ID3D12PipelineState* vp_get_fp_pso(int vs_idx, u32 fp_addr, u32 blend, int nrt,
+                                           DXGI_FORMAT rtfmt, u32 ctrl, u32 cmask, u32 cull,
+                                           u32 cube_mask, u64 zs)
+@@ -2388,6 +2406,10 @@
+             s_d3d.vp_fp[i].cube_mask == cube_mask && s_d3d.vp_fp[i].zs == zs)
+             return s_d3d.vp_fp[i].pso;
+     s_perf_pso_miss++;      /* falls through to a full decompile + D3DCompile */
++    /* Re:Fine 0114: a failure is cached too, with pso NULL. The caller then draws
++     * with its fallback pipeline; without this every draw repeated the decompile
++     * and D3DCompile only to fail again (PV600: 38 per frame, ~1 frame/s). */
++    ID3D12PipelineState* pso = NULL;
+     /* PSOMISSDBG=1: on a miss, name the key field that differs from an existing
+      * entry for the same program. "the cache misses" is not actionable; "it
+      * misses on ucode_hash" is. */
+@@ -2450,7 +2472,7 @@
+     if (ctrl_auto < 0) ctrl_auto = getenv("RSX_FP_CTRL_AUTO") ? 1 : 0;
+     u32 fp_ctrl = ctrl_auto ? RSX_FP_CTRL_AUTO : ctrl;
+     int n = rsx_fp_decompile(vm_base + off, 4096, fp_ctrl, hlsl, sizeof(hlsl));
+-    if (n <= 0) { static int _e=0; if(PS3_LOG_FIRST(_e, 16)) printf("[FP] decompile fail (fp=0x%08X)\n", fp_addr); return NULL; }
++    if (n <= 0) { vp_fp_fail_once(fp_addr, uhash, "decompile", (HRESULT)n, NULL); goto remember; }
+     /* FP_LIST=1: every program the title actually compiles, with its size. A
+      * fragment program that hangs the GPU shows up here as an implausible
+      * instruction count long before it shows up as a TDR. */
+@@ -2650,11 +2672,10 @@
+     HRESULT hr = D3DCompile(hlsl, strlen(hlsl), "guest_fp", NULL, NULL,
+                             "main", "ps_5_0", 0, 0, &pb, &e);
+     if (FAILED(hr) || !pb) {
+-        static int _e2=0; if (PS3_LOG_FIRST(_e2, 16))
+-            printf("[FP] PS compile FAIL (fp=0x%08X): %s\n", fp_addr,
+-                   e ? (const char*)e->lpVtbl->GetBufferPointer(e) : "?");
++        vp_fp_fail_once(fp_addr, uhash, "PS compile", hr,
++                        e ? (const char*)e->lpVtbl->GetBufferPointer(e) : NULL);
+         if (e) e->lpVtbl->Release(e);
+-        return NULL;
++        goto remember;
+     }
+     if (e) e->lpVtbl->Release(e);
+ 
+@@ -2753,17 +2774,18 @@
+                   pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO; } }
+     pd.SampleDesc.Count = 1;
+ 
+-    ID3D12PipelineState* pso = NULL;
+     hr = s_d3d.device->lpVtbl->CreateGraphicsPipelineState(
+         s_d3d.device, &pd, &IID_ID3D12PipelineState, (void**)&pso);
+     pb->lpVtbl->Release(pb);
+     if (FAILED(hr)) {
+-        static int _e3=0; if (PS3_LOG_FIRST(_e3, 16)) printf("[FP] PSO FAIL (fp=0x%08X, 0x%08lX)\n", fp_addr, hr);
+-        return NULL;
++        pso = NULL;
++        vp_fp_fail_once(fp_addr, uhash, "PSO", hr, NULL);
++        goto remember;
+     }
+     { static int _ok=0; if (PS3_LOG_FIRST(_ok, 32)) printf("[FP] guest FP pipeline ready (fp=0x%08X)\n", fp_addr); }
+     rdoc_name((ID3D12Object*)pso, "pso fp 0x%08X ucode %08X vs %d", fp_addr, uhash, vs_idx);
+ 
++remember:
+     /* insert (evict oldest when full) */
+     if (s_d3d.vp_fp_n >= VP_FP_CACHE) {
+         if (s_d3d.vp_fp[0].pso) s_d3d.vp_fp[0].pso->lpVtbl->Release(s_d3d.vp_fp[0].pso);

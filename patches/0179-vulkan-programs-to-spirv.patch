@@ -1,0 +1,252 @@
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -3,6 +3,9 @@
+  *
+  * Chosen at run time with REFINE_RENDERER=vulkan (src/main.cpp); Direct3D 12 stays the default until this one
+  * matches it. Built only with REFINE_VULKAN (the top CMakeLists.txt, with tools/fetch_vulkan.ps1's headers).
++ *
++ * V2a: every program a draw uses goes through the decompilers (the same HLSL as D3D12: rsx_d3d12_backend.c
++ * vp_get_vs and vp_get_fp_pso) and DXC to SPIR-V (rsx_vk_spirv.cpp), once per program; counted and logged.
+  *
+  * V1: the loader (vulkan-1.dll at run time, so the exe still starts on a PC without Vulkan), instance, device,
+  * a window of its own on its own thread (as 0157 does for D3D12), the swap chain and its recreation on a resize,
+@@ -26,6 +29,8 @@
+ #include <vulkan/vulkan.h>
+ 
+ #include "rsx_commands.h"
++#include "rsx_fp_decompiler.h"
++#include "rsx_vp_decompiler.h"
+ 
+ #define FRAMES     2
+ #define MAX_IMAGES 8
+@@ -345,7 +350,107 @@
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * The guest's commands (V1: clears and the count of draws)
++ * V2a: the programs to SPIR-V
++ * -----------------------------------------------------------------------*/
++int rsx_vk_spirv(const char* hlsl, size_t len, int stage, void** out, size_t* out_len, char* err, size_t err_cap);
++extern uint8_t* vm_base;
++extern u32 cellGcmResolveLocated(int local, u32 offset);
++
++#define VK_PROG_MAX 4096
++typedef struct { u64 key; int stage, ok; void* spv; size_t n; } VkProg;
++static VkProg s_prog[VK_PROG_MAX];
++static u32 s_nprog;
++static const rsx_state* s_st;                  /* the state the last setter was handed */
++static u32 s_cube_mask;                        /* units bound to a cube texture (SET_TEXTURE_FORMAT bit 2) */
++static struct { u32 vs_ok, vs_bad, fs_ok, fs_bad, full; double ms; } s_sh;
++
++static u64 vk_fnv(const void* p, size_t n, u64 h)
++{
++    const u8* b = (const u8*)p;
++    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001B3ull; }
++    return h;
++}
++
++static VkProg* vk_prog_find(u64 key, int stage)
++{
++    for (u32 i = 0; i < s_nprog; i++) if (s_prog[i].key == key && s_prog[i].stage == stage) return &s_prog[i];
++    return NULL;
++}
++
++static double vk_now_ms(void)
++{
++    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
++    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
++}
++
++/* hlsl to SPIR-V into a new entry; a failure is kept too, so it is tried once. */
++static VkProg* vk_prog_add(u64 key, int stage, const char* hlsl)
++{
++    if (s_nprog >= VK_PROG_MAX) { s_sh.full++; return NULL; }
++    VkProg* p = &s_prog[s_nprog++];
++    p->key = key; p->stage = stage;
++    char err[1024];
++    const double t0 = vk_now_ms();
++    p->ok = rsx_vk_spirv(hlsl, strlen(hlsl), stage, &p->spv, &p->n, err, sizeof err) == 0;
++    s_sh.ms += vk_now_ms() - t0;
++    if (p->ok) { if (stage) s_sh.fs_ok++; else s_sh.vs_ok++; return p; }
++    if (stage) s_sh.fs_bad++; else s_sh.vs_bad++;
++    {   static int told;
++        if (told++ < 8) {
++            char* nl = strchr(err, 10); if (nl) *nl = 0;
++            fprintf(stderr, "[vk] %s program %016llX: no SPIR-V: %s%c", stage ? "fragment" : "vertex", (unsigned long long)key, err, 10);
++        }
++        const char* dir = getenv("REFINE_VK_SHADER_DUMP");   /* the HLSL that failed, to look at it */
++        if (dir) {
++            char path[512]; snprintf(path, sizeof path, "%s/%s_%016llX.hlsl", dir, stage ? "fs" : "vs", (unsigned long long)key);
++            FILE* f = fopen(path, "wb"); if (f) { fwrite(hlsl, 1, strlen(hlsl), f); fclose(f); }
++        }
++    }
++    return p;
++}
++
++/* The draw's vertex program, as vp_get_vs (D3D12) reads it: from SET_TRANSFORM_PROGRAM_START, to its end bit. */
++static void vk_draw_vs(const rsx_state* st)
++{
++    if (!st || st->vp_ucode_bytes < 16) return;
++    u32 vstart = st->transform_program_start * 16u;
++    if (vstart >= st->vp_ucode_bytes) vstart = 0;
++    const u8* uc = st->vp_ucode + vstart;
++    u32 len = st->vp_ucode_bytes - vstart;
++    const u32 instrs = rsx_vp_program_size_instrs(uc, len);
++    if (instrs) len = instrs * 16u;
++    const u64 key = vk_fnv(uc, len, 0xCBF29CE484222325ull);
++    if (vk_prog_find(key, 0)) return;
++    static char hlsl[262144];
++    if (rsx_vp_decompile(uc, len, hlsl, sizeof hlsl) <= 0) { vk_prog_add(key, 0, "/* decompile failed */"); return; }
++    vk_prog_add(key, 0, hlsl);
++}
++
++/* The draw's fragment program, as vp_get_fp_pso (D3D12) builds it: the buffered form (constants in b1), the
++ * SET_SHADER_CONTROL export bits, the cube units, the alpha test. */
++static void vk_draw_fs(const rsx_state* st)
++{
++    if (!st || !st->shader_program || !vm_base) return;
++    const u32 fa = st->shader_program;
++    const u32 off = cellGcmResolveLocated((fa & 3u) == 1, fa & ~3u);
++    if (off == 0xFFFFFFFFu) return;
++    const u32 ctrl = st->shader_control & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT);
++    const u32 f = 0x200u | (st->alpha_func & 0xFFu);
++    const u32 afunc = st->alpha_test_enable && f != 0x207u ? f : 0;
++    const u32 code = rsx_fp_code_hash(vm_base + off, 4096);
++    u64 key = 0xCBF29CE484222325ull;
++    key = vk_fnv(&code, 4, key); key = vk_fnv(&ctrl, 4, key); key = vk_fnv(&s_cube_mask, 4, key); key = vk_fnv(&afunc, 4, key);
++    if (vk_prog_find(key, 1)) return;
++    static char hlsl[RSX_FP_HLSL_BUFFER_SIZE];
++    u32 nk = 0;
++    int n = rsx_fp_decompile_buffered_ex(vm_base + off, 4096, ctrl, s_cube_mask, hlsl, sizeof hlsl, &nk);
++    if (n > 0 && afunc && rsx_fp_apply_alpha_test_buffered(hlsl, sizeof hlsl, afunc) < 0) n = -3;
++    if (n <= 0) { vk_prog_add(key, 1, "/* decompile failed */ float4 main() : SV_Target { return x; }"); return; }
++    vk_prog_add(key, 1, hlsl);
++}
++
++/* ---------------------------------------------------------------------------
++ * The guest's commands (V1: clears and the count of draws; V2a: their programs)
+  * -----------------------------------------------------------------------*/
+ static void vkb_noop(void* ud) { (void)ud; }
+ static int  vkb_init(void* ud, u32 w, u32 h) { (void)ud; (void)w; (void)h; return 0; }
+@@ -361,9 +466,20 @@
+     s_vk.clear[2] = (float)(color & 0xFF) / 255.0f;
+     s_vk.clear[3] = 1.0f;
+ }
+-static void vkb_state(void* ud, const rsx_state* st) { (void)ud; (void)st; }
+-static void vkb_draw(void* ud, u32 prim, u32 first, u32 count) { (void)ud; (void)prim; (void)first; (void)count; s_vk.draws++; }
+-static void vkb_texture(void* ud, u32 unit, const rsx_texture_state* t) { (void)ud; (void)unit; (void)t; }
++static void vkb_state(void* ud, const rsx_state* st) { (void)ud; s_st = st; }
++static void vkb_draw(void* ud, u32 prim, u32 first, u32 count)
++{
++    (void)ud; (void)prim; (void)first; (void)count;
++    s_vk.draws++;
++    vk_draw_vs(s_st);
++    vk_draw_fs(s_st);
++}
++static void vkb_texture(void* ud, u32 unit, const rsx_texture_state* t)
++{
++    (void)ud;
++    if (unit >= 16) return;
++    if (t && t->offset && (t->format & 0x4u)) s_cube_mask |= 1u << unit; else s_cube_mask &= ~(1u << unit);
++}
+ 
+ static rsx_backend s_vk_backend;
+ 
+@@ -484,6 +600,8 @@
+         fprintf(stderr, "[vk] %.1f presents/s, guest draws %.0f/s (not drawn yet), clear colour (%.2f %.2f %.2f)%c",
+                 (double)(s_vk.presents - p0) * 1000.0 / (double)(now - t0),
+                 (double)(s_vk.draws - d0) * 1000.0 / (double)(now - t0), s_vk.clear[0], s_vk.clear[1], s_vk.clear[2], 10);
++        fprintf(stderr, "[vk] programs to SPIR-V so far: vertex %u ok / %u failed, fragment %u ok / %u failed, %.0f ms compiling%s%c",
++                s_sh.vs_ok, s_sh.vs_bad, s_sh.fs_ok, s_sh.fs_bad, s_sh.ms, s_sh.full ? " (table full)" : "", 10);
+         t0 = now; p0 = s_vk.presents; d0 = s_vk.draws;
+     }
+ }
+diff --git a/libs/video/rsx_vk_spirv.cpp b/libs/video/rsx_vk_spirv.cpp
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_vk_spirv.cpp
+@@ -0,0 +1,83 @@
++/*
++ * Re:Fine N1 V2a (docs/plan_nativo.md): HLSL -> SPIR-V in process, for the Vulkan backend (rsx_vk_win.c).
++ *
++ * The decompilers write the same HLSL for every backend; D3D12 compiles it with D3DCompile (FXC, shader model 5),
++ * Vulkan with DXC to SPIR-V. dxcompiler.dll (tools/fetch_vulkan.ps1, copied next to the exe) is loaded at run time:
++ * without it the Vulkan backend reports it and draws nothing, nothing else fails.
++ *
++ * The options, from compiling every program of a run of F (36, 10 vertex and 26 fragment, SHADER_DUMP):
++ *   -HV 2018                 the decompilers' vector ?: (FXC's per-component select); HLSL 2021 rejects all 36
++ *   -fvk-use-dx-layout       cbuffers laid out as D3D12 packs them, so the constant blocks are the same bytes
++ *   -fvk-b/t/s-shift         b0/b1 -> bindings 0/1, t0..t15 -> 16..31, s0..s15 -> 32..47 (one descriptor set)
++ * The binding numbers are this file's contract with rsx_vk_win.c (RSX_VK_BIND_*).
++ */
++#if defined(_WIN32) && defined(REFINE_VULKAN)
++
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <unknwn.h>   /* IUnknown: WIN32_LEAN_AND_MEAN leaves the COM headers out */
++#include "dxcapi.h"
++
++static DxcCreateInstanceProc s_create;
++static IDxcCompiler3* s_compiler;
++static IDxcUtils* s_utils;
++static int s_state;   /* 0 not tried, 1 ready, -1 unavailable */
++
++static int spirv_init(void)
++{
++    if (s_state) return s_state;
++    s_state = -1;
++    HMODULE m = LoadLibraryA("dxcompiler.dll");
++    if (!m) { fprintf(stderr, "[vk] dxcompiler.dll not found next to the exe: no SPIR-V (tools/fetch_vulkan.ps1)\n"); return -1; }
++    s_create = (DxcCreateInstanceProc)(void*)GetProcAddress(m, "DxcCreateInstance");
++    if (!s_create || FAILED(s_create(CLSID_DxcCompiler, __uuidof(IDxcCompiler3), (void**)&s_compiler)) ||
++        FAILED(s_create(CLSID_DxcUtils, __uuidof(IDxcUtils), (void**)&s_utils))) {
++        fprintf(stderr, "[vk] dxcompiler.dll did not start: no SPIR-V\n");
++        return -1;
++    }
++    s_state = 1;
++    return 1;
++}
++
++/* stage 0 vertex, 1 fragment. 0 and the SPIR-V in *out (malloc'd), or -1 and the compiler's first lines in err. */
++extern "C" int rsx_vk_spirv(const char* hlsl, size_t len, int stage, void** out, size_t* out_len, char* err, size_t err_cap)
++{
++    *out = NULL; *out_len = 0;
++    if (err_cap) err[0] = 0;
++    if (spirv_init() < 0) { if (err_cap) snprintf(err, err_cap, "no dxcompiler.dll"); return -1; }
++    const wchar_t* args[] = {
++        L"-E", L"main", L"-T", stage ? L"ps_6_0" : L"vs_6_0", L"-HV", L"2018",
++        L"-spirv", L"-fspv-target-env=vulkan1.2", L"-fvk-use-dx-layout",
++        L"-fvk-b-shift", L"0", L"0", L"-fvk-t-shift", L"16", L"0", L"-fvk-s-shift", L"32", L"0",
++        L"-O3",
++    };
++    DxcBuffer src = { hlsl, len, DXC_CP_UTF8 };
++    IDxcResult* res = NULL;
++    HRESULT hr = s_compiler->Compile(&src, args, (UINT32)(sizeof args / sizeof args[0]), NULL, __uuidof(IDxcResult), (void**)&res);
++    if (FAILED(hr) || !res) { if (err_cap) snprintf(err, err_cap, "Compile hr 0x%08lX", (unsigned long)hr); return -1; }
++    HRESULT status = E_FAIL;
++    res->GetStatus(&status);
++    int rc = -1;
++    if (SUCCEEDED(status)) {
++        IDxcBlob* code = NULL;
++        if (SUCCEEDED(res->GetOutput(DXC_OUT_OBJECT, __uuidof(IDxcBlob), (void**)&code, NULL)) && code) {
++            const size_t n = code->GetBufferSize();
++            void* p = malloc(n ? n : 1);
++            if (p) { memcpy(p, code->GetBufferPointer(), n); *out = p; *out_len = n; rc = 0; }
++            code->Release();
++        }
++    } else if (err_cap) {
++        IDxcBlobUtf8* e = NULL;
++        if (SUCCEEDED(res->GetOutput(DXC_OUT_ERRORS, __uuidof(IDxcBlobUtf8), (void**)&e, NULL)) && e && e->GetStringLength()) {
++            snprintf(err, err_cap, "%.*s", (int)e->GetStringLength(), e->GetStringPointer());
++            e->Release();
++        } else snprintf(err, err_cap, "failed, no message");
++    }
++    res->Release();
++    return rc;
++}
++
++#endif /* _WIN32 && REFINE_VULKAN */

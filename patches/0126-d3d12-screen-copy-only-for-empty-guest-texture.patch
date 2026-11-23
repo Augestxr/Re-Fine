@@ -1,0 +1,39 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index c8ac6e46..cc23d4ed 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -4517,6 +4517,18 @@ static u32 draw_filter_tex(const char* e)
+     return (u32)strtoul(e, NULL, 16);
+ }
+ 
++/* Anything but zero in the first bytes of a texture's guest memory. The stride
++ * is odd, so alpha alone counts. */
++static int tex_has_guest_data(const D3D12DrawTex* t)
++{
++    extern uint8_t* vm_base;
++    if (!t->off || !vm_base) return 0;
++    const u32 sz = t->w * t->h * 4u;
++    for (u32 i = 0; i < sz && i < 0x20000u; i += 997)
++        if (vm_base[t->off + i]) return 1;
++    return 0;
++}
++
+ /* Copy the current backbuffer into s_screen_copy. Called mid-frame the moment
+  * the reduced-viewport passes finish -- this title renders its reflection into
+  * the TOP-LEFT REGION of the render target and the main scene then overwrites
+@@ -5192,9 +5204,13 @@ static void render_frame(void)
+                     continue;
+                 }
+             }
+-            /* Display-sized sampler source -> the rendered frame. */
++            /* Display-sized sampler source -> the rendered frame, but only when
++             * the guest memory behind it is empty, which is the case this is for
++             * (see SCREENTEX). A movie is display-sized too, and its RGBA lives
++             * in that memory: replaced by the frame copy it drew black. */
+             if (dr->tex[_u].set && s_screen_copy &&
+-                dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height) {
++                dr->tex[_u].w == s_d3d.width && dr->tex[_u].h == s_d3d.height &&
++                !tex_has_guest_data(&dr->tex[_u])) {
+                 static int en = -1;
+                 if (en < 0) { const char* e = getenv("SCREEN_AS_TEX"); en = e ? atoi(e) : 1; }
+                 if (en) {

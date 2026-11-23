@@ -1,0 +1,445 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -9,6 +9,7 @@
+  *   - Everywhere else / if PS3RECOMP_PAD_USE_SDL2 is defined: SDL2 GameController
+  *
+  * Define PS3RECOMP_PAD_USE_SDL2 to force SDL2 backend on Windows.
++ * Define PS3RECOMP_PAD_USE_SDL3 for SDL3 Gamepad on a thread of its own (Re:Fine).
+  */
+ 
+ #include <time.h>
+@@ -38,7 +39,11 @@ static double pad_clock(unsigned long long t0_ms)
+  * Backend selection
+  * -----------------------------------------------------------------------*/
+ 
+-#if defined(PS3RECOMP_PAD_USE_SDL2)
++#if defined(PS3RECOMP_PAD_USE_SDL3)
++  #define PAD_BACKEND_SDL3  1
++  #define PAD_BACKEND_SDL2  0
++  #define PAD_BACKEND_XINPUT 0
++#elif defined(PS3RECOMP_PAD_USE_SDL2)
+   #define PAD_BACKEND_SDL2  1
+   #define PAD_BACKEND_XINPUT 0
+ #elif defined(_WIN32)
+@@ -65,6 +70,17 @@ static double pad_clock(unsigned long long t0_ms)
+   #include <SDL2/SDL.h>
+ #endif
+ 
++#ifndef PAD_BACKEND_SDL3
++  #define PAD_BACKEND_SDL3 0
++#endif
++#if PAD_BACKEND_SDL3
++  #ifndef WIN32_LEAN_AND_MEAN
++    #define WIN32_LEAN_AND_MEAN
++  #endif
++  #include <windows.h>
++  #include <SDL3/SDL.h>
++#endif
++
+ /* ---------------------------------------------------------------------------
+  * Internal state
+  * -----------------------------------------------------------------------*/
+@@ -253,6 +269,8 @@ static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
+     return (u8)val;
+ }
+ 
++#endif /* PAD_BACKEND_XINPUT */
++
+ /* Keyboard on port 0, together with a controller if there is one: a button
+  * counts from either, and a stick follows the controller while that is off
+  * centre. Keys are read only while a window of THIS process is in the
+@@ -406,6 +424,8 @@ static void pad_poll_keyboard(void)
+ }
+ #endif
+ 
++#if PAD_BACKEND_XINPUT
++
+ /* XInputGetState on a slot with nothing plugged in costs about 140 us (2 us on
+  * a connected one), and the backend is polled at least once a frame: three
+  * empty slots beside one pad were 0.6 ms of every frame on God of War HD's
+@@ -743,6 +763,363 @@ static void pad_shutdown_backend(void)
+ 
+ #endif /* PAD_BACKEND_SDL2 */
+ 
++/* ---------------------------------------------------------------------------
++ * SDL3 backend (Re:Fine 5d.1)
++ *
++ * One way in for every controller: SDL3 reads Xbox, PlayStation, Nintendo and
++ * generic pads, so XInput is not compiled in and a pad cannot count twice.
++ *
++ * SDL lives on one host thread of its own. SDL's device windows get their
++ * messages only on the thread that created them, so hot-plug would depend on
++ * which guest thread happened to call cellPadInit; and a driver call must not
++ * land in the game's frame. That thread reads the pads and publishes one
++ * PadHostState per port; pad_poll_sdl3 only copies them. Between reads it
++ * sleeps on SDL's high-resolution timer, not a spin.
++ *
++ * Buttons go by POSITION, as on the console: SDL's SOUTH/EAST/WEST/NORTH are the
++ * places on the pad, whatever is printed there, so a Nintendo pad plays the
++ * same as a PlayStation one. The PS button and the touchpad are not mapped.
++ *
++ * Ports: a new pad takes the lowest free one. F reads port 0 only, so when the
++ * pad there goes away the lowest other pad moves up.
++ *
++ * PAD_VPAD="<sec>:+<xbox|ps4|ps5|switch>,<sec>:-,..." attaches and detaches an
++ * SDL virtual gamepad, and PAD_VKEYS="<sec>:<keys>:<ms>,..." holds it for automatic
++ * runs: S E W N are the face buttons by position, U D L R the d-pad, s start,
++ * Q and F the left stick left and right, T the R2 trigger. With PAD_VPAD the focus
++ * gate is off, like PAD_KEYS, unless PAD_VPAD_FOCUS=1. Off unless set.
++ * -----------------------------------------------------------------------*/
++
++#if PAD_BACKEND_SDL3
++
++#define PAD_SDL3_PERIOD_NS      2000000   /* with a pad open: 500 reads a second */
++#define PAD_SDL3_IDLE_NS       20000000   /* none: only waiting for one to appear */
++#define PAD_TRIGGER_THRESHOLD  30         /* 0-255: L2/R2 count as pressed above this */
++
++static SDL_Mutex*     s_sdl3_lock;
++static PadHostState   s_sdl3_pub[PAD_MAX_HOST_PORTS];
++static SDL_Thread*    s_sdl3_thread;
++static volatile int   s_sdl3_stop;
++static int            s_sdl3_nofocus;      /* PAD_VPAD: the gate is off */
++
++static u8 pad_sdl3_axis(int raw) { return (u8)((raw + 32768) >> 8); }   /* 0 -> 128, the centre */
++static u8 pad_sdl3_trigger(int raw) { const int v = raw >> 7; return (u8)(v > 255 ? 255 : v < 0 ? 0 : v); }
++
++static const char* pad_sdl3_label(SDL_Gamepad* gp, SDL_GamepadButton b)
++{
++    switch (SDL_GetGamepadButtonLabel(gp, b)) {
++    case SDL_GAMEPAD_BUTTON_LABEL_A: return "A";
++    case SDL_GAMEPAD_BUTTON_LABEL_B: return "B";
++    case SDL_GAMEPAD_BUTTON_LABEL_X: return "X";
++    case SDL_GAMEPAD_BUTTON_LABEL_Y: return "Y";
++    case SDL_GAMEPAD_BUTTON_LABEL_CROSS: return "cross";
++    case SDL_GAMEPAD_BUTTON_LABEL_CIRCLE: return "circle";
++    case SDL_GAMEPAD_BUTTON_LABEL_SQUARE: return "square";
++    case SDL_GAMEPAD_BUTTON_LABEL_TRIANGLE: return "triangle";
++    default: return "?";
++    }
++}
++
++/* One pad into a state; the rest of the struct is a release. */
++static void pad_sdl3_read(SDL_Gamepad* gp, PadHostState* hs)
++{
++    static const struct { SDL_GamepadButton b; u16 cell; } map[] = {
++        { SDL_GAMEPAD_BUTTON_SOUTH,          CELL_PAD_CTRL_CROSS },
++        { SDL_GAMEPAD_BUTTON_EAST,           CELL_PAD_CTRL_CIRCLE },
++        { SDL_GAMEPAD_BUTTON_WEST,           CELL_PAD_CTRL_SQUARE },
++        { SDL_GAMEPAD_BUTTON_NORTH,          CELL_PAD_CTRL_TRIANGLE },
++        { SDL_GAMEPAD_BUTTON_DPAD_UP,        CELL_PAD_CTRL_UP },
++        { SDL_GAMEPAD_BUTTON_DPAD_DOWN,      CELL_PAD_CTRL_DOWN },
++        { SDL_GAMEPAD_BUTTON_DPAD_LEFT,      CELL_PAD_CTRL_LEFT },
++        { SDL_GAMEPAD_BUTTON_DPAD_RIGHT,     CELL_PAD_CTRL_RIGHT },
++        { SDL_GAMEPAD_BUTTON_LEFT_SHOULDER,  CELL_PAD_CTRL_L1 },
++        { SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, CELL_PAD_CTRL_R1 },
++        { SDL_GAMEPAD_BUTTON_LEFT_STICK,     CELL_PAD_CTRL_L3 },
++        { SDL_GAMEPAD_BUTTON_RIGHT_STICK,    CELL_PAD_CTRL_R3 },
++        { SDL_GAMEPAD_BUTTON_START,          CELL_PAD_CTRL_START },
++        { SDL_GAMEPAD_BUTTON_BACK,           CELL_PAD_CTRL_SELECT },
++    };
++    u16 btns = 0;
++    for (unsigned i = 0; i < sizeof map / sizeof map[0]; i++)
++        if (SDL_GetGamepadButton(gp, map[i].b)) btns |= map[i].cell;
++
++    pad_host_release(hs);
++    hs->connected = 1;
++    hs->trigger_l2 = pad_sdl3_trigger(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
++    hs->trigger_r2 = pad_sdl3_trigger(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
++    if (hs->trigger_l2 > PAD_TRIGGER_THRESHOLD) btns |= CELL_PAD_CTRL_L2;
++    if (hs->trigger_r2 > PAD_TRIGGER_THRESHOLD) btns |= CELL_PAD_CTRL_R2;
++    hs->buttons = btns;
++
++    /* SDL's Y is already down-positive, like the PS3's. */
++    hs->analog_lx = pad_sdl3_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTX));
++    hs->analog_ly = pad_sdl3_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY));
++    hs->analog_rx = pad_sdl3_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTX));
++    hs->analog_ry = pad_sdl3_axis(SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTY));
++
++    /* Pressure: SDL has digital buttons, so 0 or 255 */
++    hs->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
++    hs->press_down     = (btns & CELL_PAD_CTRL_DOWN)     ? 255 : 0;
++    hs->press_left     = (btns & CELL_PAD_CTRL_LEFT)     ? 255 : 0;
++    hs->press_right    = (btns & CELL_PAD_CTRL_RIGHT)    ? 255 : 0;
++    hs->press_triangle = (btns & CELL_PAD_CTRL_TRIANGLE) ? 255 : 0;
++    hs->press_circle   = (btns & CELL_PAD_CTRL_CIRCLE)   ? 255 : 0;
++    hs->press_cross    = (btns & CELL_PAD_CTRL_CROSS)    ? 255 : 0;
++    hs->press_square   = (btns & CELL_PAD_CTRL_SQUARE)   ? 255 : 0;
++    hs->press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
++    hs->press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
++}
++
++/* ---- PAD_VPAD: a pad that goes through SDL's whole gamepad layer ---------- */
++#define PAD_VPAD_EVENTS 64
++static struct { double t; char op[8]; } s_vp_ev[PAD_VPAD_EVENTS];
++static struct { double from, to; char keys[12]; } s_vk_ev[1024];
++static int s_vp_n, s_vk_n, s_vp_next;
++static SDL_JoystickID s_vp_id;
++static SDL_Joystick*  s_vp_joy;
++
++static bool SDLCALL pad_vpad_rumble(void* u, Uint16 lo, Uint16 hi)
++{
++    (void)u;
++    fprintf(stderr, "[cellPad] vpad rumble lo=%u hi=%u%c", lo, hi, 10);
++    return true;
++}
++
++static void pad_vpad_parse(void)
++{
++    const char* e = getenv("PAD_VPAD");
++    if (!e || !*e) return;
++    s_sdl3_nofocus = !getenv("PAD_VPAD_FOCUS");
++    while (*e && s_vp_n < PAD_VPAD_EVENTS) {
++        double t = 0; char op[8] = ""; int used = 0;
++        if (sscanf(e, "%lf:%7[^,]%n", &t, op, &used) != 2) break;
++        s_vp_ev[s_vp_n].t = t;
++        memcpy(s_vp_ev[s_vp_n].op, op, sizeof op);
++        s_vp_n++;
++        e += used;
++        while (*e == ',' || *e == ' ') e++;
++    }
++    e = getenv("PAD_VKEYS");
++    while (e && *e && s_vk_n < 1024) {
++        double t = 0, ms = 0; char k[12] = ""; int used = 0;
++        if (sscanf(e, "%lf:%11[^:]:%lf%n", &t, k, &ms, &used) != 3) break;
++        s_vk_ev[s_vk_n].from = t;
++        s_vk_ev[s_vk_n].to = t + ms / 1000.0;
++        memcpy(s_vk_ev[s_vk_n].keys, k, sizeof k);
++        s_vk_n++;
++        e += used;
++        while (*e == ',' || *e == ' ') e++;
++    }
++    fprintf(stderr, "[cellPad] PAD_VPAD: %d change(s), %d press(es), focus gate %s%c",
++            s_vp_n, s_vk_n, s_sdl3_nofocus ? "off" : "on", 10);
++}
++
++static void pad_vpad_step(void)
++{
++    if (!s_vp_n) return;
++    if (!s_key_t0) return;   /* same clock as PAD_KEYS, or a blind schedule lands on other notes */
++    const double now = (double)(GetTickCount64() - s_key_t0) / 1000.0;
++    for (; s_vp_next < s_vp_n && now >= s_vp_ev[s_vp_next].t; s_vp_next++) {
++        const char* op = s_vp_ev[s_vp_next].op;
++        if (op[0] == '-' && s_vp_joy) {
++            SDL_CloseJoystick(s_vp_joy);
++            s_vp_joy = NULL;
++            SDL_DetachVirtualJoystick(s_vp_id);
++            s_vp_id = 0;
++        } else if (op[0] == '+' && !s_vp_joy) {
++            SDL_VirtualJoystickDesc d;
++            SDL_INIT_INTERFACE(&d);
++            d.type = SDL_JOYSTICK_TYPE_GAMEPAD;
++            d.naxes = SDL_GAMEPAD_AXIS_COUNT;
++            d.nbuttons = SDL_GAMEPAD_BUTTON_COUNT;
++            d.axis_mask = (1u << SDL_GAMEPAD_AXIS_COUNT) - 1;
++            d.button_mask = (1u << SDL_GAMEPAD_BUTTON_COUNT) - 1;
++            d.Rumble = pad_vpad_rumble;
++            d.name = op + 1;
++            if (!strcmp(op + 1, "ps4"))    { d.vendor_id = 0x054C; d.product_id = 0x09CC; }
++            if (!strcmp(op + 1, "ps5"))    { d.vendor_id = 0x054C; d.product_id = 0x0CE6; }
++            if (!strcmp(op + 1, "switch")) { d.vendor_id = 0x057E; d.product_id = 0x2009; }
++            if (!strcmp(op + 1, "xbox"))   { d.vendor_id = 0x045E; d.product_id = 0x0B12; }
++            s_vp_id = SDL_AttachVirtualJoystick(&d);
++            s_vp_joy = s_vp_id ? SDL_OpenJoystick(s_vp_id) : NULL;
++            if (!s_vp_joy) fprintf(stderr, "[cellPad] vpad failed: %s%c", SDL_GetError(), 10);
++        }
++    }
++    if (!s_vp_joy) return;
++    int hold[128] = { 0 };
++    for (int i = 0; i < s_vk_n; i++)
++        if (now >= s_vk_ev[i].from && now < s_vk_ev[i].to)
++            for (const char* k = s_vk_ev[i].keys; *k; k++) hold[(unsigned char)*k & 127] = 1;
++    static const struct { char c; int b; } vb[] = {
++        { 'S', SDL_GAMEPAD_BUTTON_SOUTH },     { 'E', SDL_GAMEPAD_BUTTON_EAST },
++        { 'W', SDL_GAMEPAD_BUTTON_WEST },      { 'N', SDL_GAMEPAD_BUTTON_NORTH },
++        { 'U', SDL_GAMEPAD_BUTTON_DPAD_UP },   { 'D', SDL_GAMEPAD_BUTTON_DPAD_DOWN },
++        { 'L', SDL_GAMEPAD_BUTTON_DPAD_LEFT }, { 'R', SDL_GAMEPAD_BUTTON_DPAD_RIGHT },
++        { 's', SDL_GAMEPAD_BUTTON_START },
++    };
++    for (unsigned i = 0; i < sizeof vb / sizeof vb[0]; i++)
++        SDL_SetJoystickVirtualButton(s_vp_joy, vb[i].b, hold[(unsigned char)vb[i].c] != 0);
++    SDL_SetJoystickVirtualAxis(s_vp_joy, SDL_GAMEPAD_AXIS_LEFTX,
++                               hold['Q'] ? -32768 : hold['F'] ? 32767 : 0);
++    /* A virtual trigger is a full-range axis: its rest is the bottom of it. */
++    SDL_SetJoystickVirtualAxis(s_vp_joy, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, -32768);
++    SDL_SetJoystickVirtualAxis(s_vp_joy, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, hold['T'] ? 32767 : -32768);
++}
++
++/* ---- the pad thread ------------------------------------------------------ */
++static SDL_Gamepad*   s_sdl3_pad[PAD_MAX_HOST_PORTS];
++static SDL_JoystickID s_sdl3_id[PAD_MAX_HOST_PORTS];
++
++static void pad_sdl3_open(SDL_JoystickID id)
++{
++    int port = -1;
++    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
++        if (s_sdl3_pad[p] && s_sdl3_id[p] == id) return;
++        if (!s_sdl3_pad[p] && port < 0) port = p;
++    }
++    if (port < 0) return;
++    SDL_Gamepad* gp = SDL_OpenGamepad(id);
++    if (!gp) { fprintf(stderr, "[cellPad] SDL gamepad %u: open failed: %s%c", (unsigned)id, SDL_GetError(), 10); return; }
++    s_sdl3_pad[port] = gp;
++    s_sdl3_id[port] = id;
++    const SDL_PropertiesID pr = SDL_GetGamepadProperties(gp);
++    fprintf(stderr, "[cellPad] SDL gamepad connected on port %d: '%s' type=%s conn=%d south=%s east=%s west=%s north=%s rumble=%d%c",
++            port, SDL_GetGamepadName(gp), SDL_GetGamepadStringForType(SDL_GetGamepadType(gp)),
++            (int)SDL_GetGamepadConnectionState(gp),
++            pad_sdl3_label(gp, SDL_GAMEPAD_BUTTON_SOUTH), pad_sdl3_label(gp, SDL_GAMEPAD_BUTTON_EAST),
++            pad_sdl3_label(gp, SDL_GAMEPAD_BUTTON_WEST), pad_sdl3_label(gp, SDL_GAMEPAD_BUTTON_NORTH),
++            (int)SDL_GetBooleanProperty(pr, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false), 10);
++}
++
++static void pad_sdl3_close(SDL_JoystickID id)
++{
++    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
++        if (!s_sdl3_pad[p] || s_sdl3_id[p] != id) continue;
++        fprintf(stderr, "[cellPad] SDL gamepad disconnected from port %d%c", p, 10);
++        SDL_CloseGamepad(s_sdl3_pad[p]);
++        s_sdl3_pad[p] = NULL;
++        s_sdl3_id[p] = 0;
++        memset(&s_rumble[p], 0, sizeof s_rumble[p]);
++        if (p == 0)
++            for (int q = 1; q < PAD_MAX_HOST_PORTS; q++)
++                if (s_sdl3_pad[q]) {
++                    s_sdl3_pad[0] = s_sdl3_pad[q]; s_sdl3_id[0] = s_sdl3_id[q];
++                    s_sdl3_pad[q] = NULL;          s_sdl3_id[q] = 0;
++                    fprintf(stderr, "[cellPad] SDL gamepad moved from port %d to port 0%c", q, 10);
++                    break;
++                }
++        return;
++    }
++}
++
++/* s_rumble says what the title wants (cellPadSetActDirect); see PAD_RUMBLE_HOLD_MS. */
++static void pad_sdl3_rumble(int p, int focused)
++{
++    static u16 sent_lo[PAD_MAX_HOST_PORTS], sent_hi[PAD_MAX_HOST_PORTS];
++    PadRumble* r = &s_rumble[p];
++    const u16 lo = focused ? r->lo : 0, hi = focused ? r->hi : 0;
++    const unsigned long long now = pad_now_ms();
++    const int on = lo || hi;
++    if (lo == sent_lo[p] && hi == sent_hi[p] && (!on || now - r->sent_ms < PAD_RUMBLE_RENEW_MS)) return;
++    SDL_RumbleGamepad(s_sdl3_pad[p], lo, hi, on ? PAD_RUMBLE_HOLD_MS : 0);
++    sent_lo[p] = lo; sent_hi[p] = hi;
++    r->sent_ms = on ? now : 0;
++}
++
++static int SDLCALL pad_sdl3_main(void* unused)
++{
++    (void)unused;
++    /* Whether a press counts is decided by the gate in pad_poll_sdl3, here always read. */
++    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
++    const Uint64 t0 = SDL_GetTicksNS();
++    if (!SDL_Init(SDL_INIT_GAMEPAD)) {
++        fprintf(stderr, "[cellPad] SDL_Init failed: %s: no pads%c", SDL_GetError(), 10);
++        return 1;
++    }
++    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
++    fprintf(stderr, "[cellPad] SDL %d.%d.%d up in %.1f ms%c", SDL_VERSIONNUM_MAJOR(SDL_GetVersion()),
++            SDL_VERSIONNUM_MINOR(SDL_GetVersion()), SDL_VERSIONNUM_MICRO(SDL_GetVersion()),
++            (double)(SDL_GetTicksNS() - t0) / 1e6, 10);
++    pad_vpad_parse();
++
++    while (!s_sdl3_stop) {
++        pad_vpad_step();
++        SDL_Event ev;
++        while (SDL_PollEvent(&ev)) {
++            if (ev.type == SDL_EVENT_GAMEPAD_ADDED)   pad_sdl3_open(ev.gdevice.which);
++            if (ev.type == SDL_EVENT_GAMEPAD_REMOVED) pad_sdl3_close(ev.gdevice.which);
++        }
++        const int focused = s_sdl3_nofocus || pad_host_window_focused();
++        PadHostState st[PAD_MAX_HOST_PORTS];
++        int open = 0;
++        for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
++            if (s_sdl3_pad[p]) {
++                pad_sdl3_read(s_sdl3_pad[p], &st[p]);
++                if (s_vp_n) { static u16 was[PAD_MAX_HOST_PORTS];
++                    if (st[p].buttons != was[p]) { was[p] = st[p].buttons;
++                        fprintf(stderr, "[cellPad] vpad port %d buttons 0x%04X t=%.3f%c", p, was[p], (double)(GetTickCount64() - s_key_t0) / 1000.0, 10); } }
++                pad_sdl3_rumble(p, focused);
++                open = 1;
++            } else {
++                pad_host_release(&st[p]);
++            }
++        }
++        SDL_LockMutex(s_sdl3_lock);
++        memcpy(s_sdl3_pub, st, sizeof st);
++        SDL_UnlockMutex(s_sdl3_lock);
++        SDL_DelayNS(open || s_vp_n ? PAD_SDL3_PERIOD_NS : PAD_SDL3_IDLE_NS);
++    }
++
++    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++)
++        if (s_sdl3_pad[p]) {
++            SDL_RumbleGamepad(s_sdl3_pad[p], 0, 0, 0);
++            SDL_CloseGamepad(s_sdl3_pad[p]);
++            s_sdl3_pad[p] = NULL;
++        }
++    SDL_Quit();
++    return 0;
++}
++
++/* The latest report; a pad does not count while the game's window is behind
++ * another one, like the keyboard, but it stays connected. */
++static void pad_poll_sdl3(void)
++{
++    if (!s_sdl3_lock) return;
++    SDL_LockMutex(s_sdl3_lock);
++    memcpy(s_host_state, s_sdl3_pub, sizeof s_host_state);
++    SDL_UnlockMutex(s_sdl3_lock);
++    const int focused = s_sdl3_nofocus || pad_host_window_focused();
++    { static int was = -1;
++      if (focused != was) { was = focused;
++          fprintf(stderr, "[cellPad] pads %s%c", focused ? "count (window in front)" : "ignored (window behind)", 10); } }
++    if (focused) return;
++    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) {
++        const int on = s_host_state[p].connected;
++        pad_host_release(&s_host_state[p]);
++        s_host_state[p].connected = on;
++    }
++}
++
++static void pad_init_backend(void)
++{
++    if (s_sdl3_thread) return;
++    if (!s_sdl3_lock) s_sdl3_lock = SDL_CreateMutex();
++    for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) pad_host_release(&s_sdl3_pub[p]);
++    s_sdl3_stop = 0;
++    s_sdl3_thread = SDL_CreateThread(pad_sdl3_main, "sdl pad", NULL);
++    if (!s_sdl3_thread) fprintf(stderr, "[cellPad] no pad thread: %s%c", SDL_GetError(), 10);
++}
++
++static void pad_shutdown_backend(void)
++{
++    if (!s_sdl3_thread) return;
++    s_sdl3_stop = 1;
++    SDL_WaitThread(s_sdl3_thread, NULL);
++    s_sdl3_thread = NULL;
++}
++
++#endif /* PAD_BACKEND_SDL3 */
++
+ /* ---------------------------------------------------------------------------
+  * Poll dispatcher
+  * -----------------------------------------------------------------------*/
+@@ -790,6 +1167,8 @@ static void pad_poll_backend(void)
+     pad_poll_xinput();
+ #elif PAD_BACKEND_SDL2
+     pad_poll_sdl2();
++#elif PAD_BACKEND_SDL3
++    pad_poll_sdl3();
+ #endif
+ #ifdef _WIN32
+     pad_poll_keyboard();
+@@ -1516,6 +1895,11 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
+     pad_unlock();
+ #endif
+ 
++    /* PAD_BACKEND_SDL3: the pad thread sends what s_rumble says. */
++    { static int said = 0;
++      if (!said && (lo || hi)) { said = 1;
++          fprintf(stderr, "[cellPad] first rumble request: lo=%u hi=%u port %u%c", lo, hi, port_no, 10); } }
++
+     return CELL_OK;
+ }
+ 

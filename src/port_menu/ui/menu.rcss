@@ -1,0 +1,306 @@
+/* Re:Fine port menu layout: "SETLIST" (2026-11-12, docs/diseno_menu.md). A sheet docked to the left with one
+ * slanted edge (12 degrees, the only angle), numbered tracks, a solid teal block for what is selected. Flat:
+ * no gradients, no rounded corners, no glass. Sizes in dp: 1 dp is 1 px at a 1080-line window, times the menu
+ * scale (port_menu.cpp sets the ratio). Colours: theme.rcss.
+ * Motion (the five rules): only transform and opacity move; 0.12-0.22 s with a strong ease-out, going away
+ * faster than coming; entrances staggered (a longer run and a longer way per row, never a delay: an element
+ * waiting for its delay would show in place first); the focus block is one element that translates from the
+ * frame of the input; everything on RmlUi's real-time clock, the same at 30 and 240 fps, nothing loops. */
+body, div, p { display: block; }
+span { display: inline; }
+body {
+    font-family: "Chakra Petch";
+    font-weight: 500;
+    font-size: 22dp;
+    width: 100%;
+    height: 100%;
+}
+@keyframes fade-in  { from { opacity: 0; } to { opacity: 1; } }
+@keyframes fade-out { from { opacity: 1; } to { opacity: 0; } }
+.closing { animation: 0.12s quadratic-in fade-out; }
+
+#dim { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: none; }
+#dim.shown { display: block; animation: 0.18s cubic-out fade-in; }
+#dim.shown.closing { animation: 0.12s quadratic-in fade-out; }
+
+/* ---- Settings: the sheet, 64 % of the width from the left edge, full height ---- */
+#panel {
+    position: absolute;
+    left: 0; top: 0;
+    width: 64%; height: 100%;
+    box-sizing: border-box;
+    display: none;
+}
+#panel.shown { display: block; }
+@keyframes panel-in {
+    from { opacity: 0; transform: translateX(-90dp); }
+    to   { opacity: 1; transform: translateX(0dp); }
+}
+@keyframes panel-out {
+    from { opacity: 1; transform: translateX(0dp); }
+    to   { opacity: 0; transform: translateX(-60dp); }
+}
+#panel.open { animation: 0.2s quintic-out panel-in; }
+#panel.shown.closing { animation: 0.12s quadratic-in panel-out; }
+/* The sheet itself and its lane edge: two skewed slabs behind the content (the content is not skewed). */
+#p_glow   { position: absolute; left: -30%; right: 0; top: -2%; height: 104%; transform: skewX(-12deg); }
+#p_accent { position: absolute; right: -14dp; width: 6dp; top: -2%; height: 104%; transform: skewX(-12deg); }
+
+/* The track index: the tabs, one under another, numbered. */
+#ptop { position: absolute; left: 0; top: 0; width: 330dp; height: 100%; }
+#tabs { position: absolute; left: 64dp; top: 150dp; width: 260dp; z-index: 2; }
+.tab {
+    display: block;
+    font-family: "Chakra Petch"; font-weight: bold; font-style: italic;
+    font-size: 30dp; letter-spacing: 1dp;
+    text-transform: uppercase;
+    height: 58dp; line-height: 58dp;
+}
+.tno { font-family: "IBM Plex Mono"; font-weight: 500; font-style: normal; font-size: 16dp; letter-spacing: 0; margin-right: 14dp; }
+#tab_ink { position: absolute; left: 0; top: 150dp; width: 318dp; height: 58dp; z-index: 1; transform: translateY(0px); }
+#tab_ink.live { transition: transform 0.16s quintic-out; }
+#xclose {
+    position: absolute; left: 64dp; top: 62dp;
+    width: 40dp; height: 40dp; line-height: 38dp; text-align: center;
+    font-family: "IBM Plex Mono"; font-size: 28dp; border-width: 1dp;
+}
+
+#cols { position: absolute; left: 356dp; right: 150dp; top: 96dp; bottom: 0; }
+#list {
+    position: absolute; left: 0; right: 0; top: 0; bottom: 330dp;
+    overflow-y: auto;
+    padding: 0 12dp 12dp 0;
+    box-sizing: border-box;
+}
+.tablist { display: none; position: relative; }
+.tablist.shown { display: block; }
+.pill {
+    position: absolute; left: 0; right: 0; top: 0; height: 44dp;
+    opacity: 0; transform: translateY(0px);
+}
+.pill.live { opacity: 1; transition: transform 0.14s quintic-out; }
+.sect {
+    position: relative;
+    font-family: "IBM Plex Mono"; font-weight: 500;
+    font-size: 15dp; letter-spacing: 3dp; text-transform: uppercase;
+    padding: 26dp 16dp 8dp 16dp;
+}
+.row {
+    position: relative;
+    height: 44dp; line-height: 44dp;
+    padding: 0 16dp;
+}
+@keyframes row-in1 { from { opacity: 0; transform: translateX(-22dp); } to { opacity: 1; transform: translateX(0dp); } }
+@keyframes row-in2 { from { opacity: 0; transform: translateX(-28dp); } to { opacity: 1; transform: translateX(0dp); } }
+@keyframes row-in3 { from { opacity: 0; transform: translateX(-34dp); } to { opacity: 1; transform: translateX(0dp); } }
+@keyframes row-in4 { from { opacity: 0; transform: translateX(-40dp); } to { opacity: 1; transform: translateX(0dp); } }
+@keyframes row-in5 { from { opacity: 0; transform: translateX(-46dp); } to { opacity: 1; transform: translateX(0dp); } }
+@keyframes row-in6 { from { opacity: 0; transform: translateX(-52dp); } to { opacity: 1; transform: translateX(0dp); } }
+@keyframes row-in7 { from { opacity: 0; transform: translateX(-58dp); } to { opacity: 1; transform: translateX(0dp); } }
+@keyframes row-in8 { from { opacity: 0; transform: translateX(-64dp); } to { opacity: 1; transform: translateX(0dp); } }
+.tablist.shown > .row, .tablist.shown > .sect { animation: 0.26s quintic-out row-in8; }
+.tablist.shown > *:nth-child(2) { animation: 0.138s quintic-out row-in1; }
+.tablist.shown > *:nth-child(3) { animation: 0.156s quintic-out row-in2; }
+.tablist.shown > *:nth-child(4) { animation: 0.174s quintic-out row-in3; }
+.tablist.shown > *:nth-child(5) { animation: 0.192s quintic-out row-in4; }
+.tablist.shown > *:nth-child(6) { animation: 0.210s quintic-out row-in5; }
+.tablist.shown > *:nth-child(7) { animation: 0.228s quintic-out row-in6; }
+.tablist.shown > *:nth-child(8) { animation: 0.246s quintic-out row-in7; }
+.tablist.shown > *:nth-child(9) { animation: 0.264s quintic-out row-in8; }
+.rlabel {
+    font-family: "Chakra Petch"; font-weight: 600;
+    font-size: 22dp; letter-spacing: 1dp; text-transform: uppercase;
+    display: inline-block; transform: translateX(0dp);
+    transition: transform 0.14s quintic-out;
+}
+.row.focus .rlabel { transform: translateX(8dp); }
+.rval { position: absolute; right: 16dp; top: 0; font-family: "IBM Plex Mono"; font-weight: 500; font-size: 19dp; }
+@keyframes bump {
+    from { transform: translateX(7dp); }
+    to   { transform: translateX(0dp); }
+}
+.rval.bump { animation: 0.12s cubic-out bump; }
+.rval .soon { font-size: 14dp; letter-spacing: 1dp; text-transform: uppercase; padding: 2dp 8dp; }
+.rval .slot { display: inline-block; min-width: 90dp; text-align: center; margin-left: 8dp; padding: 0 8dp; height: 32dp; line-height: 32dp; border-width: 1dp; }
+
+/* The liner notes: what the focused row does, under the list, behind a hairline. */
+#desc { position: absolute; left: 0; right: 0; bottom: 64dp; height: 250dp; border-top-width: 1dp; padding: 22dp 230dp 0 16dp; box-sizing: border-box; }
+@keyframes desc-in {
+    from { opacity: 0; transform: translateX(-12dp); }
+    to   { opacity: 1; transform: translateX(0dp); }
+}
+#desc.swap { animation: 0.16s cubic-out desc-in; }
+#desc_title {
+    font-family: "Chakra Petch"; font-weight: bold; font-style: italic;
+    font-size: 28dp; letter-spacing: 1dp; text-transform: uppercase;
+    margin-bottom: 10dp;
+}
+#desc_bar { display: none; }
+#desc_text { font-size: 20dp; line-height: 30dp; }
+#desc_note { font-family: "IBM Plex Mono"; font-size: 16dp; margin-top: 12dp; padding: 6dp 12dp; border-left-width: 4dp; }
+#desc_note:empty { display: none; }
+#sview { display: none; position: absolute; right: 0; top: 18dp; width: 210dp; }
+#sview.shown { display: block; animation: 0.16s cubic-out fade-in; }
+#sv_box { position: relative; width: 200dp; height: 200dp; border-width: 2dp; border-radius: 100dp; }
+#sv_leave, #sv_dz, #sv_dot { position: absolute; }
+#sv_leave { border-width: 2dp; border-radius: 100dp; }
+#sv_dz { border-width: 2dp; border-radius: 100dp; }
+#sv_dot { width: 14dp; height: 14dp; border-radius: 7dp; }
+#sv_txt { font-family: "IBM Plex Mono"; font-size: 15dp; margin-top: 6dp; }
+
+#help {
+    position: absolute; left: 372dp; right: 150dp; bottom: 0; height: 64dp; line-height: 64dp;
+    font-family: "IBM Plex Mono"; font-size: 15dp;
+}
+.hk { margin-right: 18dp; padding: 4dp 0; border-bottom-width: 2dp; }
+
+scrollbarvertical { width: 4dp; margin-right: 0; }
+scrollbarvertical slidertrack { width: 4dp; }
+scrollbarvertical sliderbar { width: 4dp; min-height: 30dp; }
+
+/* ---- Quick bar: a 56 dp strip across the top, the tabs as tracks ---- */
+#bar {
+    position: absolute; left: 0; top: 0; width: 100%; height: 56dp;
+    box-sizing: border-box;
+    padding: 0 40dp;
+    display: none;
+}
+#bar.shown { display: block; }
+@keyframes bar-in {
+    from { opacity: 0; transform: translateY(-56dp); }
+    to   { opacity: 1; transform: translateY(0dp); }
+}
+@keyframes bar-out {
+    from { opacity: 1; transform: translateY(0dp); }
+    to   { opacity: 0; transform: translateY(-56dp); }
+}
+#bar.open { animation: 0.16s quintic-out bar-in; }
+#bar.shown.closing { animation: 0.12s quadratic-in bar-out; }
+#bar_line { position: absolute; left: 0; right: 0; bottom: 0; height: 3dp; }
+#bar_tabs { position: relative; height: 56dp; }
+#bar_ink { position: absolute; top: 0; height: 53dp; width: 0; left: 0; opacity: 0; transform: translateX(0px); }
+#bar_ink.live { opacity: 1; transition: transform 0.16s quintic-out; }
+.btab {
+    position: relative;
+    display: inline-block;
+    font-family: "Chakra Petch"; font-weight: bold; font-style: italic;
+    font-size: 23dp; letter-spacing: 1dp; text-transform: uppercase;
+    height: 53dp; line-height: 53dp; padding: 0 26dp; margin-right: 6dp;
+}
+.btab .soon { font-family: "IBM Plex Mono"; font-style: normal; font-size: 12dp; letter-spacing: 1dp; margin-left: 8dp; padding: 2dp 6dp; }
+#bar_info { position: absolute; right: 40dp; top: 0; height: 53dp; line-height: 53dp; font-family: "IBM Plex Mono"; font-size: 17dp; }
+#bar_fps { margin-right: 24dp; padding: 4dp 10dp; }
+
+/* ---- FPS counter (VIDEO > Show FPS counter), with every menu closed ---- */
+#fps {
+    position: absolute; right: 14dp; top: 14dp;
+    padding: 4dp 12dp;
+    font-family: "IBM Plex Mono"; font-size: 18dp; font-weight: 500;
+    display: none;
+}
+#fps.shown { display: block; animation: 0.2s cubic-out fade-in; }
+
+/* ---- The timing of the last note and the short messages (6g) ---- */
+#timing {
+    position: absolute; left: 50%; top: 14dp;
+    width: 340dp; margin-left: -300dp;
+    padding: 4dp 0;
+    text-align: center;
+    font-family: "IBM Plex Mono"; font-size: 18dp; font-weight: 500;
+    display: none;
+}
+#timing.shown { display: block; }
+#tm_avg { margin-left: 18dp; }
+#note {
+    position: absolute; left: 14dp; bottom: 14dp;
+    padding: 6dp 14dp;
+    font-family: "IBM Plex Mono"; font-size: 18dp; font-weight: 500;
+    display: none;
+}
+#note.shown { display: block; animation: 0.2s cubic-out fade-in; }
+
+/* ---- Yes / No: a slab from the left at the height of the question ---- */
+#confirm { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: none; }
+#confirm.shown { display: block; animation: 0.14s cubic-out fade-in; }
+#confirm.shown.closing { animation: 0.12s quadratic-in fade-out; }
+@keyframes pop-in {
+    from { opacity: 0; transform: translateX(-70dp); }
+    to   { opacity: 1; transform: translateX(0dp); }
+}
+#confirm_box {
+    position: absolute; left: 0; top: 50%;
+    width: 900dp; height: 280dp; margin-top: -140dp;
+    box-sizing: border-box;
+    padding: 44dp 60dp 0 120dp;
+}
+#confirm.shown #confirm_box { animation: 0.18s quintic-out pop-in; }
+#c_accent { position: absolute; left: 0; top: 0; width: 64dp; height: 100%; }
+#confirm_text {
+    font-family: "Chakra Petch"; font-weight: bold; font-style: italic;
+    font-size: 34dp; letter-spacing: 1dp;
+}
+#confirm_text .small { font-size: 19dp; }
+#confirm_note { font-family: "IBM Plex Mono"; font-size: 16dp; margin-top: 8dp; height: 24dp; }
+#confirm_btns { margin-top: 26dp; }
+.cbtn {
+    display: inline-block; width: 168dp; height: 52dp; line-height: 52dp; margin-right: 16dp; text-align: center;
+    font-family: "Chakra Petch"; font-weight: bold; font-style: italic; font-size: 25dp; letter-spacing: 1dp;
+    text-transform: uppercase;
+    border-width: 1dp;
+}
+
+/* ---- Start screen (0164). Behind the panel: #dim and #panel come after it in the file. ---- */
+#launcher { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: hidden; display: none; }
+#launcher.shown { display: block; animation: 0.22s cubic-out fade-in; }
+#l_bg, #l_black { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+#l_pic { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+/* The band: black from the left edge to 38 % of the width, cut at 12 degrees, with the lane's teal edge. */
+@keyframes band-in { from { transform: translateX(-140dp) skewX(-12deg); } to { transform: translateX(0dp) skewX(-12deg); } }
+#l_shade { position: absolute; left: -30%; width: 68%; top: -2%; height: 104%; transform: translateX(0dp) skewX(-12deg); animation: 0.22s quintic-out band-in; }
+#l_glow  { position: absolute; left: 38%; margin-left: 10dp; width: 8dp; top: -2%; height: 104%; transform: translateX(0dp) skewX(-12deg); animation: 0.22s quintic-out band-in; }
+#l_left { position: absolute; left: 96dp; top: 110dp; width: 640dp; transform: translateX(0dp); }
+@keyframes l-rise {
+    from { opacity: 0; transform: translateX(-48dp); }
+    to   { opacity: 1; transform: translateX(0dp); }
+}
+#l_brand { font-family: "Dela Gothic One"; font-weight: normal; font-size: 76dp; letter-spacing: 0;
+           margin-bottom: 4dp; animation: 0.16s quintic-out l-rise; }
+#l_brandbar { width: 120dp; height: 6dp; margin-bottom: 150dp; animation: 0.16s quintic-out l-rise; }
+#l_icon { display: none; }
+#l_menu { position: relative; }
+#l_ink { position: absolute; left: -96dp; top: 0; width: 620dp; height: 92dp; opacity: 0; z-index: 1; transform: translateY(0px); }
+#l_ink.live { opacity: 1; transition: transform 0.16s quintic-out; }
+.mitem { position: relative; z-index: 2;
+         font-family: "Chakra Petch"; font-weight: bold; font-style: italic; font-size: 64dp; letter-spacing: 1dp; text-transform: uppercase;
+         height: 92dp; line-height: 92dp; }
+/* The text in its own box: the item's entrance (l-rise) animates the item's transform, the focus this one's. */
+.mtxt { display: block; transform: translateX(0dp); transition: transform 0.14s quintic-out; }
+.mno { font-family: "IBM Plex Mono"; font-weight: 500; font-style: normal; font-size: 22dp; letter-spacing: 0; margin-right: 22dp; }
+#m0 { animation: 0.18s quintic-out l-rise; }
+#m1 { animation: 0.20s quintic-out l-rise; }
+#m2 { animation: 0.22s quintic-out l-rise; }
+.mitem.focus .mtxt { transform: translateX(14dp); }
+/* Plan 6h S1: whose menu opens (F or F 2nd), shown when both games are set up. LEFT/RIGHT or a click. */
+#l_game { margin-top: 30dp; animation: 0.24s quintic-out l-rise; }
+.gopt { display: inline-block; margin-right: 14dp; padding: 8dp 18dp; border-width: 2dp; font-family: "Chakra Petch"; font-weight: bold;
+        font-size: 22dp; line-height: 28dp; }
+.gopt .gsub { font-family: "IBM Plex Mono"; font-weight: normal; font-size: 15dp; }
+#l_disc { position: absolute; left: 96dp; bottom: 64dp; font-family: "IBM Plex Mono"; font-size: 18dp; line-height: 30dp; animation: 0.22s cubic-out fade-in; }
+#l_disc .btn { display: inline-block; margin-top: 10dp; padding: 4dp 16dp; border-width: 1dp; }
+#l_rver { position: absolute; right: 56dp; bottom: 48dp; padding: 4dp 12dp; font-family: "IBM Plex Mono"; font-size: 17dp; animation: 0.22s cubic-out fade-in; }
+#l_toast { position: absolute; right: 56dp; top: 56dp; padding: 14dp 24dp; border-left-width: 6dp; font-size: 20dp;
+           line-height: 30dp; opacity: 0; transform: translateX(40dp); transition: opacity transform 0.16s quintic-out; }
+#l_toast.shown { opacity: 1; transform: translateX(0dp); }
+
+/* PLAY (launch_t in port_menu.cpp, 0.82 s): the other items go, the band sweeps across the picture like a
+ * note down its lane and everything ends in black, the colour the game boots on. */
+#l_black { opacity: 0; }
+#launcher.launching .mitem { opacity: 0; transition: opacity 0.12s quadratic-in; }
+#launcher.launching .mitem.focus { opacity: 1; }
+#launcher.launching .mitem.focus .mtxt { transform: translateX(60dp); transition: transform 0.22s quintic-out; }
+#launcher.launching #l_left { opacity: 0; transition: opacity 0.16s 0.24s quadratic-in; }
+#launcher.launching #l_disc, #launcher.launching #l_game, #launcher.launching #l_rver, #launcher.launching #l_toast { opacity: 0; transition: opacity 0.12s quadratic-in; }
+#launcher.launching #l_shade { transform: translateX(1500dp) skewX(-12deg); transition: transform 0.5s 0.2s cubic-in; }
+#launcher.launching #l_glow { transform: translateX(1500dp) skewX(-12deg); transition: transform 0.5s 0.2s cubic-in; }
+#launcher.launching #l_black { opacity: 1; transition: opacity 0.3s 0.5s quadratic-in; }
+.gone { display: none; }

@@ -1,0 +1,704 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -571,6 +571,14 @@
+ void rsx_d3d12_dump_arm(void) { s_dump_armed_wait = 0; }
+ char g_rsx_title_base[128] = "ps3recomp";
+ static u32 s_dbg_last_draws = 0;
++
++/* Re:Fine N1 V2b (0180, docs/plan_nativo.md): REFINE_RENDERER=vulkan. The recording below is the same; the
++ * buffers it writes are the Vulkan executor's (rsx_vk_win.c), no D3D12 device is made, and render_frame hands
++ * each batch to the executor. */
++static int s_vk_on;
++#ifdef REFINE_VULKAN
++#include "rsx_vk_exec.h"
++#endif
+ static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
+ /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
+  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
+@@ -2352,6 +2360,19 @@
+         }
+     }
+     shader_dump("vs", hash, hlsl);
++#ifdef REFINE_VULKAN
++    if (s_vk_on) {   /* N1 V2b: the executor keeps the SPIR-V by hash; the slot carries no DXBC */
++        if (rsx_vk_exec_vs(hash, hlsl) != 0) return -1;
++        int vslot;
++        if (s_d3d.vp_vs_n < VP_VS_CACHE) vslot = s_d3d.vp_vs_n++;
++        else { memmove(&s_d3d.vp_vs[0], &s_d3d.vp_vs[1], sizeof(VPVSEntry) * (VP_VS_CACHE - 1)); vslot = VP_VS_CACHE - 1; }
++        s_d3d.vp_vs[vslot].hash = hash;
++        s_d3d.vp_vs[vslot].vs = NULL;
++        s_d3d.vp_vs[vslot].uses_c03 = (strstr(hlsl, "vp_c[0]") || strstr(hlsl, "vp_c[1]") ||
++                                       strstr(hlsl, "vp_c[2]") || strstr(hlsl, "vp_c[3]")) ? 1 : 0;
++        return vslot;
++    }
++#endif
+     ID3DBlob* vb = NULL; ID3DBlob* e = NULL;
+     const double t_vs = perf_now();
+     HRESULT hr = sc_compile(hlsl, strlen(hlsl), "guest_vp2", NULL, NULL,
+@@ -6542,8 +6563,39 @@
+             want, s_d3d.rw, s_d3d.rh, s_d3d.rs, (perf_now() - t0) * 1000.0, 10);
+ }
+ 
++#ifdef REFINE_VULKAN
++/* N1 V2b: the batch to the Vulkan executor, then the same end-of-frame resets as render_frame's. */
++static void render_frame_vk(void)
++{
++    rsx_vk_exec_wait();
++    ix_apply();              /* 0175: this batch's vertices into the executor's buffer */
++    { const LONG wh = InterlockedExchange(&s_d3d.want_wh, 0);
++      if (wh) rsx_vk_exec_resize((u32)wh >> 16, (u32)wh & 0xFFFFu); }
++    rsx_vk_frame f;
++    memset(&f, 0, sizeof f);
++    f.draws = s_d3d.draw_count < MAX_DRAWS ? s_d3d.draw_count : MAX_DRAWS;
++    f.vp_vb_bytes = s_d3d.vp_vb_offset;
++    f.vp_indices = s_d3d.vp_ib_offset;
++    f.parity = s_d3d.vp_parity;
++    f.present = s_present_this_frame;
++    f.clear[3] = 1.0f;
++    rsx_vk_exec_frame(&f);
++    s_dbg_last_draws = s_d3d.draw_count;
++    s_d3d.vb_offset  = 0;
++    s_d3d.vp_vb_offset = 0;
++    s_d3d.vp_ib_offset = 0;
++    for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++) s_d3d.draws[_i].indexed = 0;
++    s_ix_run_valid = 0;
++    s_d3d.draw_count = 0;
++    s_d3d.vp_parity ^= 1;
++}
++#endif
++
+ static void render_frame(void)
+ {
++#ifdef REFINE_VULKAN
++    if (s_vk_on) { render_frame_vk(); return; }
++#endif
+     double _rf0 = perf_on() ? perf_now() : 0.0;
+     /* Re:Fine 0167: the port's "Choose best for my PC" asks for the GPU timestamps for 5 s. They can only
+      * start between frames: EndQuery needs the heap that fp_init makes at the start of a frame. */
+@@ -9417,7 +9469,7 @@
+          * UNtextured cube to the fixed-function fallback, which never applies the
+          * VP's MVP transform, so the cube was drawn in object space and clipped
+          * off-screen. Untextured VP draws now render via the colour PSO. */
+-        if (s_d3d.vp_vb_mapped && s_d3d.vp_root_sig) {
++        if (s_d3d.vp_vb_mapped && (s_d3d.vp_root_sig || s_vk_on)) {
+             u32 rec = s_d3d.vp_vb_offset;
+             u32 emitted = upload_quads_vp(s_d3d.current_rsx_state, first, count);
+             if (emitted && s_d3d.draw_count < MAX_DRAWS) {
+@@ -9500,7 +9552,7 @@
+      * go down the fixed-function passthrough below instead. */
+     if ((primitive == RSX_PRIMITIVE_TRIANGLES || primitive == RSX_PRIMITIVE_TRIANGLE_STRIP
+          || primitive == RSX_PRIMITIVE_TRIANGLE_FAN) &&
+-        s_d3d.vp_vb_mapped && s_d3d.vp_root_sig &&
++        s_d3d.vp_vb_mapped && (s_d3d.vp_root_sig || s_vk_on) &&
+         s_d3d.current_rsx_state && s_d3d.current_rsx_state->vp_ucode_bytes >= 16) {
+         u32 rec = s_d3d.vp_vb_offset;
+         u32 emitted = (primitive == RSX_PRIMITIVE_TRIANGLES)
+@@ -9627,7 +9679,7 @@
+     }
+     if (!s_d3d.pipeline_ready) return;
+     if (count == 0 || count > MAX_VERTICES) return;
+-    if (!s_d3d.vp_vb_mapped || !s_d3d.vp_root_sig) return;
++    if (!s_d3d.vp_vb_mapped || !(s_d3d.vp_root_sig || s_vk_on)) return;
+ 
+     /* Expand through the VP path (indices resolved CPU-side): QUADS -> two
+      * triangles per quad, TRIANGLES straight through, STRIP/FAN -> triangle
+@@ -10050,6 +10102,29 @@
+         return -1;
+     }
+ 
++#ifdef REFINE_VULKAN
++    { const char* rr = getenv("REFINE_RENDERER"); s_vk_on = rr && !_stricmp(rr, "vulkan"); }
++    if (s_vk_on) {   /* N1 V2b: no D3D12 device; the recording writes the executor's buffers */
++        const u64 sizes[RSX_VK_NBUF] = {
++            (u64)MAX_VERTICES * VERTEX_STRIDE,        /* the same sizes as init_d3d12's upload buffers */
++            (u64)MAX_VERTICES * 256 * 2,
++            (u64)VP_MAX_INDICES * 4 * 2,
++            (u64)VP_CB_STRIDE * MAX_DRAWS * 2,
++            (u64)VP_FPCB_STRIDE * MAX_DRAWS * 2,
++        };
++        void* maps[RSX_VK_NBUF] = {0};
++        if (rsx_vk_exec_init(s_d3d.hwnd, width, height, sizes, maps) != 0) {
++            printf("[D3D12] ERROR: REFINE_RENDERER=vulkan and Vulkan did not start\n");
++            return -1;
++        }
++        s_d3d.vb_mapped = maps[RSX_VK_VB];
++        s_d3d.vp_vb_mapped = maps[RSX_VK_VP_VB];
++        s_d3d.vp_ib_mapped = maps[RSX_VK_VP_IB];
++        s_d3d.vp_cb_mapped = maps[RSX_VK_VP_CB];
++        s_d3d.vp_fpcb_mapped = maps[RSX_VK_VP_FPCB];
++        s_d3d.pipeline_ready = 1;
++    } else
++#endif
+     /* Initialize D3D12 */
+     if (init_d3d12(width, height) != 0) {
+         printf("[D3D12] ERROR: D3D12 initialization failed\n");
+@@ -10080,7 +10155,7 @@
+     s_d3d.last_fps_time = GetTickCount64();
+ 
+     printf("[D3D12] Backend ready: %ux%u\n", width, height);
+-    if (g_port_launcher) g_port_launcher();   /* Re:Fine 0164 */
++    if (g_port_launcher && !s_vk_on) g_port_launcher();   /* Re:Fine 0164; N1: the launcher draws with D3D12 */
+     return 0;
+ }
+ 
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -1,20 +1,20 @@
+ /*
+- * Re:Fine N1 (docs/plan_nativo.md): the Vulkan backend for Windows, stage V1.
++ * Re:Fine N1 (docs/plan_nativo.md): the Vulkan executor for Windows.
+  *
+- * Chosen at run time with REFINE_RENDERER=vulkan (src/main.cpp); Direct3D 12 stays the default until this one
+- * matches it. Built only with REFINE_VULKAN (the top CMakeLists.txt, with tools/fetch_vulkan.ps1's headers).
++ * The D3D12 backend (rsx_d3d12_backend.c) records every frame -- draw records, vertices, indices, the vertex- and
++ * fragment-program constants -- with all of F's fixes (the 01xx patches), into upload buffers it only writes
++ * through pointers. With REFINE_RENDERER=vulkan it makes no D3D12 device: those pointers are this file's
++ * host-visible Vulkan buffers, and its render_frame hands the frame here instead of to D3D12. So the recording is
++ * shared and only the execution is per API.
+  *
+- * V2a: every program a draw uses goes through the decompilers (the same HLSL as D3D12: rsx_d3d12_backend.c
+- * vp_get_vs and vp_get_fp_pso) and DXC to SPIR-V (rsx_vk_spirv.cpp), once per program; counted and logged.
++ * Stages: V1 (0178) device, swap chain, presents; V2a (0179) the programs to SPIR-V (rsx_vk_spirv.cpp);
++ * V2b (0180, this): the executor over the recording: device and swap chain on the backend's window, the upload
++ * buffers, the vertex programs to SPIR-V as vp_get_vs meets them, and each frame presented with what was
++ * recorded counted. Drawing the records is V2c.
+  *
+- * V1: the loader (vulkan-1.dll at run time, so the exe still starts on a PC without Vulkan), instance, device,
+- * a window of its own on its own thread (as 0157 does for D3D12), the swap chain and its recreation on a resize,
+- * and every guest flip presented with the colour of the guest's last clear. The guest's draws are counted and
+- * not drawn yet: that is V2 (pipelines from the decompilers' HLSL through DXC to SPIR-V).
+- *
+- * Synchronisation: FRAMES frames in flight, each with its own command buffer, fence and acquire semaphore; one
+- * "rendered" semaphore per swap chain image (a present may still wait on an image's semaphore when its frame slot
+- * comes round again). Everything here runs on frame_clock, the thread that drains the FIFO.
++ * Synchronisation: the backend writes the next frame's records while the GPU may still read the last one's; like
++ * D3D12 (wait_for_gpu at the start of render_frame) the executor waits for the previous submission before a frame
++ * starts, and the buffers keep the D3D12 backend's two parity halves.
+  */
+ #if defined(_WIN32) && defined(REFINE_VULKAN)
+ 
+@@ -29,15 +29,11 @@
+ #include <vulkan/vulkan.h>
+ 
+ #include "rsx_commands.h"
+-#include "rsx_fp_decompiler.h"
+-#include "rsx_vp_decompiler.h"
++#include "rsx_vk_exec.h"
+ 
+ #define FRAMES     2
+ #define MAX_IMAGES 8
+ 
+-/* ---------------------------------------------------------------------------
+- * Entry points, loaded from vulkan-1.dll
+- * -----------------------------------------------------------------------*/
+ static PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr_;
+ #define VKF(name) static PFN_##name name##_
+ VKF(vkCreateInstance); VKF(vkEnumerateInstanceExtensionProperties);
+@@ -46,12 +42,15 @@
+ VKF(vkEnumerateDeviceExtensionProperties); VKF(vkCreateWin32SurfaceKHR); VKF(vkDestroySurfaceKHR);
+ VKF(vkGetPhysicalDeviceSurfaceSupportKHR); VKF(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+ VKF(vkGetPhysicalDeviceSurfaceFormatsKHR); VKF(vkGetPhysicalDeviceSurfacePresentModesKHR);
++VKF(vkGetPhysicalDeviceMemoryProperties);
+ VKF(vkGetDeviceQueue); VKF(vkCreateSwapchainKHR); VKF(vkDestroySwapchainKHR); VKF(vkGetSwapchainImagesKHR);
+ VKF(vkAcquireNextImageKHR); VKF(vkQueuePresentKHR); VKF(vkCreateCommandPool); VKF(vkAllocateCommandBuffers);
+ VKF(vkCreateFence); VKF(vkCreateSemaphore); VKF(vkWaitForFences); VKF(vkResetFences); VKF(vkResetCommandBuffer);
+ VKF(vkBeginCommandBuffer); VKF(vkEndCommandBuffer); VKF(vkCmdPipelineBarrier); VKF(vkCmdClearColorImage);
+ VKF(vkQueueSubmit); VKF(vkDeviceWaitIdle); VKF(vkDestroySemaphore); VKF(vkDestroyFence);
+ VKF(vkDestroyCommandPool); VKF(vkDestroyDevice);
++VKF(vkCreateBuffer); VKF(vkGetBufferMemoryRequirements); VKF(vkAllocateMemory); VKF(vkBindBufferMemory);
++VKF(vkMapMemory); VKF(vkCreateShaderModule);
+ 
+ static struct {
+     HMODULE lib;
+@@ -72,64 +71,13 @@
+     VkFence fence[FRAMES];
+     VkSemaphore acquired[FRAMES];
+     uint32_t frame;
+-    int vsync, initialized, need_resize;
+-    float clear[4];
+-    unsigned long long presents, draws, clears;
++    int vsync, need_resize;
++    u32 win_w, win_h;
++    VkBuffer buf[RSX_VK_NBUF];
++    VkDeviceMemory mem[RSX_VK_NBUF];
++    unsigned long long presents, frames, draws, vbytes, ibytes;
+     char gpu_name[256];
+ } s_vk;
+-
+-/* The window (0157 for D3D12): its own thread, so a modal loop of Windows never stops frame_clock. */
+-static struct {
+-    HWND hwnd;
+-    HANDLE ready;
+-    u32 w, h;
+-    char title[128];
+-    volatile LONG closed, gone, want_wh;
+-} s_win;
+-
+-/* ---------------------------------------------------------------------------
+- * Window
+- * -----------------------------------------------------------------------*/
+-static LRESULT CALLBACK vk_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+-{
+-    switch (msg) {
+-    case WM_CLOSE:   InterlockedExchange(&s_win.closed, 1); return 0;   /* the title still saves: a request */
+-    case WM_DESTROY: PostQuitMessage(0); return 0;
+-    case WM_SIZE:
+-        if (wp != SIZE_MINIMIZED && LOWORD(lp) && HIWORD(lp))
+-            InterlockedExchange(&s_win.want_wh, (LONG)(((u32)LOWORD(lp) << 16) | HIWORD(lp)));
+-        break;
+-    case WM_SYSCOMMAND:
+-        if ((wp & 0xFFF0) == SC_KEYMENU && lp != ' ') return 0;          /* no menu bar: no menu mode, no beep */
+-        break;
+-    }
+-    return DefWindowProcA(hwnd, msg, wp, lp);
+-}
+-
+-static DWORD WINAPI vk_window_thread(LPVOID unused)
+-{
+-    (void)unused;
+-    WNDCLASSEXA wc = {0};
+-    wc.cbSize = sizeof wc;
+-    wc.style = CS_HREDRAW | CS_VREDRAW;
+-    wc.lpfnWndProc = vk_wndproc;
+-    wc.hInstance = GetModuleHandle(NULL);
+-    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+-    wc.lpszClassName = "refine_vulkan";
+-    RegisterClassExA(&wc);
+-    RECT wr = {0, 0, (LONG)s_win.w, (LONG)s_win.h};
+-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+-    SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED);
+-    s_win.hwnd = CreateWindowExA(0, "refine_vulkan", s_win.title, WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+-                                 CW_USEDEFAULT, CW_USEDEFAULT, wr.right - wr.left, wr.bottom - wr.top,
+-                                 NULL, NULL, GetModuleHandle(NULL), NULL);
+-    SetEvent(s_win.ready);
+-    if (!s_win.hwnd) return 1;
+-    MSG m;
+-    while (GetMessageA(&m, NULL, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageA(&m); }
+-    InterlockedExchange(&s_win.gone, 1);
+-    return 0;
+-}
+ 
+ /* ---------------------------------------------------------------------------
+  * Device
+@@ -152,7 +100,7 @@
+     return vkCreateInstance_ ? 0 : vk_fail("vkCreateInstance lookup", VK_ERROR_INITIALIZATION_FAILED);
+ }
+ 
+-static int vk_instance(void)
++static int vk_instance(HWND hwnd)
+ {
+     const char* ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME };
+     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+@@ -171,10 +119,11 @@
+     INST(vkEnumerateDeviceExtensionProperties); INST(vkCreateWin32SurfaceKHR); INST(vkDestroySurfaceKHR);
+     INST(vkGetPhysicalDeviceSurfaceSupportKHR); INST(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
+     INST(vkGetPhysicalDeviceSurfaceFormatsKHR); INST(vkGetPhysicalDeviceSurfacePresentModesKHR);
++    INST(vkGetPhysicalDeviceMemoryProperties);
+ #undef INST
+     VkWin32SurfaceCreateInfoKHR si = { VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR };
+     si.hinstance = GetModuleHandle(NULL);
+-    si.hwnd = s_win.hwnd;
++    si.hwnd = hwnd;
+     r = vkCreateWin32SurfaceKHR_(s_vk.inst, &si, NULL, &s_vk.surface);
+     return r == VK_SUCCESS ? 0 : vk_fail("vkCreateWin32SurfaceKHR", r);
+ }
+@@ -248,6 +197,8 @@
+     DEV(vkBeginCommandBuffer); DEV(vkEndCommandBuffer); DEV(vkCmdPipelineBarrier); DEV(vkCmdClearColorImage);
+     DEV(vkQueueSubmit); DEV(vkDeviceWaitIdle); DEV(vkDestroySemaphore); DEV(vkDestroyFence);
+     DEV(vkDestroyCommandPool); DEV(vkDestroyDevice);
++    DEV(vkCreateBuffer); DEV(vkGetBufferMemoryRequirements); DEV(vkAllocateMemory); DEV(vkBindBufferMemory);
++    DEV(vkMapMemory); DEV(vkCreateShaderModule);
+ #undef DEV
+     vkGetDeviceQueue_(s_vk.dev, s_vk.qfam, 0, &s_vk.queue);
+ 
+@@ -272,6 +223,33 @@
+     return 0;
+ }
+ 
++/* One persistently mapped host-visible buffer: the backend writes it with the CPU, the GPU reads it. */
++static int vk_host_buffer(int i, VkDeviceSize size, VkBufferUsageFlags usage, void** mapped)
++{
++    VkBufferCreateInfo bi = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
++    bi.size = size;
++    bi.usage = usage;
++    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++    VkResult r = vkCreateBuffer_(s_vk.dev, &bi, NULL, &s_vk.buf[i]);
++    if (r != VK_SUCCESS) return vk_fail("vkCreateBuffer", r);
++    VkMemoryRequirements req;
++    vkGetBufferMemoryRequirements_(s_vk.dev, s_vk.buf[i], &req);
++    VkPhysicalDeviceMemoryProperties mp;
++    vkGetPhysicalDeviceMemoryProperties_(s_vk.gpu, &mp);
++    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
++    uint32_t type = UINT32_MAX;
++    for (uint32_t t = 0; t < mp.memoryTypeCount; t++)
++        if ((req.memoryTypeBits & (1u << t)) && (mp.memoryTypes[t].propertyFlags & want) == want) { type = t; break; }
++    if (type == UINT32_MAX) return vk_fail("no host-visible coherent memory", VK_ERROR_OUT_OF_DEVICE_MEMORY);
++    VkMemoryAllocateInfo ma = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
++    ma.allocationSize = req.size;
++    ma.memoryTypeIndex = type;
++    if ((r = vkAllocateMemory_(s_vk.dev, &ma, NULL, &s_vk.mem[i])) != VK_SUCCESS) return vk_fail("vkAllocateMemory", r);
++    if ((r = vkBindBufferMemory_(s_vk.dev, s_vk.buf[i], s_vk.mem[i], 0)) != VK_SUCCESS) return vk_fail("vkBindBufferMemory", r);
++    if ((r = vkMapMemory_(s_vk.dev, s_vk.mem[i], 0, VK_WHOLE_SIZE, 0, mapped)) != VK_SUCCESS) return vk_fail("vkMapMemory", r);
++    return 0;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Swap chain
+  * -----------------------------------------------------------------------*/
+@@ -289,7 +267,7 @@
+     if (r != VK_SUCCESS) return vk_fail("surface capabilities", r);
+     if (caps.currentExtent.width == 0 || caps.currentExtent.height == 0) return 1;   /* minimised: later */
+     VkExtent2D ext = caps.currentExtent;
+-    if (ext.width == 0xFFFFFFFFu) { ext.width = s_win.w; ext.height = s_win.h; }
++    if (ext.width == 0xFFFFFFFFu) { ext.width = s_vk.win_w; ext.height = s_vk.win_h; }
+ 
+     uint32_t nf = 0;
+     vkGetPhysicalDeviceSurfaceFormatsKHR_(s_vk.gpu, s_vk.surface, &nf, NULL);
+@@ -350,184 +328,83 @@
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * V2a: the programs to SPIR-V
++ * The vertex programs (V2a), as vp_get_vs meets them, kept by its hash
+  * -----------------------------------------------------------------------*/
+ int rsx_vk_spirv(const char* hlsl, size_t len, int stage, void** out, size_t* out_len, char* err, size_t err_cap);
+-extern uint8_t* vm_base;
+-extern u32 cellGcmResolveLocated(int local, u32 offset);
+-
+-#define VK_PROG_MAX 4096
+-typedef struct { u64 key; int stage, ok; void* spv; size_t n; } VkProg;
+-static VkProg s_prog[VK_PROG_MAX];
+-static u32 s_nprog;
+-static const rsx_state* s_st;                  /* the state the last setter was handed */
+-static u32 s_cube_mask;                        /* units bound to a cube texture (SET_TEXTURE_FORMAT bit 2) */
+-static struct { u32 vs_ok, vs_bad, fs_ok, fs_bad, full; double ms; } s_sh;
+-
+-static u64 vk_fnv(const void* p, size_t n, u64 h)
+-{
+-    const u8* b = (const u8*)p;
+-    for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001B3ull; }
+-    return h;
+-}
+-
+-static VkProg* vk_prog_find(u64 key, int stage)
+-{
+-    for (u32 i = 0; i < s_nprog; i++) if (s_prog[i].key == key && s_prog[i].stage == stage) return &s_prog[i];
+-    return NULL;
+-}
+-
+-static double vk_now_ms(void)
+-{
+-    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f);
+-    return (double)c.QuadPart * 1000.0 / (double)f.QuadPart;
+-}
+-
+-/* hlsl to SPIR-V into a new entry; a failure is kept too, so it is tried once. */
+-static VkProg* vk_prog_add(u64 key, int stage, const char* hlsl)
+-{
+-    if (s_nprog >= VK_PROG_MAX) { s_sh.full++; return NULL; }
+-    VkProg* p = &s_prog[s_nprog++];
+-    p->key = key; p->stage = stage;
+-    char err[1024];
+-    const double t0 = vk_now_ms();
+-    p->ok = rsx_vk_spirv(hlsl, strlen(hlsl), stage, &p->spv, &p->n, err, sizeof err) == 0;
+-    s_sh.ms += vk_now_ms() - t0;
+-    if (p->ok) { if (stage) s_sh.fs_ok++; else s_sh.vs_ok++; return p; }
+-    if (stage) s_sh.fs_bad++; else s_sh.vs_bad++;
+-    {   static int told;
+-        if (told++ < 8) {
+-            char* nl = strchr(err, 10); if (nl) *nl = 0;
+-            fprintf(stderr, "[vk] %s program %016llX: no SPIR-V: %s%c", stage ? "fragment" : "vertex", (unsigned long long)key, err, 10);
+-        }
+-        const char* dir = getenv("REFINE_VK_SHADER_DUMP");   /* the HLSL that failed, to look at it */
+-        if (dir) {
+-            char path[512]; snprintf(path, sizeof path, "%s/%s_%016llX.hlsl", dir, stage ? "fs" : "vs", (unsigned long long)key);
+-            FILE* f = fopen(path, "wb"); if (f) { fwrite(hlsl, 1, strlen(hlsl), f); fclose(f); }
+-        }
+-    }
+-    return p;
+-}
+-
+-/* The draw's vertex program, as vp_get_vs (D3D12) reads it: from SET_TRANSFORM_PROGRAM_START, to its end bit. */
+-static void vk_draw_vs(const rsx_state* st)
+-{
+-    if (!st || st->vp_ucode_bytes < 16) return;
+-    u32 vstart = st->transform_program_start * 16u;
+-    if (vstart >= st->vp_ucode_bytes) vstart = 0;
+-    const u8* uc = st->vp_ucode + vstart;
+-    u32 len = st->vp_ucode_bytes - vstart;
+-    const u32 instrs = rsx_vp_program_size_instrs(uc, len);
+-    if (instrs) len = instrs * 16u;
+-    const u64 key = vk_fnv(uc, len, 0xCBF29CE484222325ull);
+-    if (vk_prog_find(key, 0)) return;
+-    static char hlsl[262144];
+-    if (rsx_vp_decompile(uc, len, hlsl, sizeof hlsl) <= 0) { vk_prog_add(key, 0, "/* decompile failed */"); return; }
+-    vk_prog_add(key, 0, hlsl);
+-}
+-
+-/* The draw's fragment program, as vp_get_fp_pso (D3D12) builds it: the buffered form (constants in b1), the
+- * SET_SHADER_CONTROL export bits, the cube units, the alpha test. */
+-static void vk_draw_fs(const rsx_state* st)
+-{
+-    if (!st || !st->shader_program || !vm_base) return;
+-    const u32 fa = st->shader_program;
+-    const u32 off = cellGcmResolveLocated((fa & 3u) == 1, fa & ~3u);
+-    if (off == 0xFFFFFFFFu) return;
+-    const u32 ctrl = st->shader_control & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT);
+-    const u32 f = 0x200u | (st->alpha_func & 0xFFu);
+-    const u32 afunc = st->alpha_test_enable && f != 0x207u ? f : 0;
+-    const u32 code = rsx_fp_code_hash(vm_base + off, 4096);
+-    u64 key = 0xCBF29CE484222325ull;
+-    key = vk_fnv(&code, 4, key); key = vk_fnv(&ctrl, 4, key); key = vk_fnv(&s_cube_mask, 4, key); key = vk_fnv(&afunc, 4, key);
+-    if (vk_prog_find(key, 1)) return;
+-    static char hlsl[RSX_FP_HLSL_BUFFER_SIZE];
+-    u32 nk = 0;
+-    int n = rsx_fp_decompile_buffered_ex(vm_base + off, 4096, ctrl, s_cube_mask, hlsl, sizeof hlsl, &nk);
+-    if (n > 0 && afunc && rsx_fp_apply_alpha_test_buffered(hlsl, sizeof hlsl, afunc) < 0) n = -3;
+-    if (n <= 0) { vk_prog_add(key, 1, "/* decompile failed */ float4 main() : SV_Target { return x; }"); return; }
+-    vk_prog_add(key, 1, hlsl);
++
++#define VK_VS_MAX 1024
++static struct { u32 hash; VkShaderModule mod; } s_vs[VK_VS_MAX];
++static u32 s_nvs, s_vs_bad;
++static double s_vs_ms;
++
++int rsx_vk_exec_vs(u32 hash, const char* hlsl)
++{
++    for (u32 i = 0; i < s_nvs; i++) if (s_vs[i].hash == hash) return 0;
++    if (s_nvs >= VK_VS_MAX || !s_vk.dev) return -1;
++    LARGE_INTEGER c0, c1, f; QueryPerformanceCounter(&c0);
++    void* spv = NULL; size_t n = 0; char err[512];
++    int rc = rsx_vk_spirv(hlsl, strlen(hlsl), 0, &spv, &n, err, sizeof err);
++    VkShaderModule mod = VK_NULL_HANDLE;
++    if (rc == 0) {
++        VkShaderModuleCreateInfo mi = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
++        mi.codeSize = n;
++        mi.pCode = (const uint32_t*)spv;
++        if (vkCreateShaderModule_(s_vk.dev, &mi, NULL, &mod) != VK_SUCCESS) { rc = -1; snprintf(err, sizeof err, "vkCreateShaderModule"); }
++    }
++    free(spv);
++    QueryPerformanceCounter(&c1); QueryPerformanceFrequency(&f);
++    s_vs_ms += (double)(c1.QuadPart - c0.QuadPart) * 1000.0 / (double)f.QuadPart;
++    if (rc != 0) {
++        s_vs_bad++;
++        static int told;
++        if (told++ < 8) { char* nl = strchr(err, 10); if (nl) *nl = 0;
++            fprintf(stderr, "[vk] vertex program %08X: no SPIR-V: %s%c", hash, err, 10); }
++        return -1;
++    }
++    s_vs[s_nvs].hash = hash; s_vs[s_nvs].mod = mod; s_nvs++;
++    return 0;
+ }
+ 
+ /* ---------------------------------------------------------------------------
+- * The guest's commands (V1: clears and the count of draws; V2a: their programs)
++ * Public entry points (rsx_d3d12_backend.c with REFINE_RENDERER=vulkan)
+  * -----------------------------------------------------------------------*/
+-static void vkb_noop(void* ud) { (void)ud; }
+-static int  vkb_init(void* ud, u32 w, u32 h) { (void)ud; (void)w; (void)h; return 0; }
+-static void vkb_present(void* ud, u32 buffer_id) { (void)ud; (void)buffer_id; }
+-static void vkb_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
+-{
+-    (void)ud; (void)depth; (void)stencil;
+-    s_vk.clears++;
+-    if (!(flags & 0xF0)) return;                       /* no colour channel cleared */
+-    /* NV4097_SET_COLOR_CLEAR_VALUE: A8R8G8B8. */
+-    s_vk.clear[0] = (float)((color >> 16) & 0xFF) / 255.0f;
+-    s_vk.clear[1] = (float)((color >> 8) & 0xFF) / 255.0f;
+-    s_vk.clear[2] = (float)(color & 0xFF) / 255.0f;
+-    s_vk.clear[3] = 1.0f;
+-}
+-static void vkb_state(void* ud, const rsx_state* st) { (void)ud; s_st = st; }
+-static void vkb_draw(void* ud, u32 prim, u32 first, u32 count)
+-{
+-    (void)ud; (void)prim; (void)first; (void)count;
+-    s_vk.draws++;
+-    vk_draw_vs(s_st);
+-    vk_draw_fs(s_st);
+-}
+-static void vkb_texture(void* ud, u32 unit, const rsx_texture_state* t)
+-{
+-    (void)ud;
+-    if (unit >= 16) return;
+-    if (t && t->offset && (t->format & 0x4u)) s_cube_mask |= 1u << unit; else s_cube_mask &= ~(1u << unit);
+-}
+-
+-static rsx_backend s_vk_backend;
+-
+-/* ---------------------------------------------------------------------------
+- * Public entry points (src/main.cpp)
+- * -----------------------------------------------------------------------*/
+-int rsx_vk_backend_init(u32 width, u32 height, const char* title)
++int rsx_vk_exec_init(void* hwnd, u32 w, u32 h, const u64 sizes[RSX_VK_NBUF], void* maps[RSX_VK_NBUF])
+ {
+     memset(&s_vk, 0, sizeof s_vk);
+-    s_vk.clear[2] = 0.1f; s_vk.clear[3] = 1.0f;                     /* the D3D12 backend's first colour */
+     { const char* v = getenv("D3D12_VSYNC"); s_vk.vsync = !(v && *v == '0'); }
+-    s_win.w = width; s_win.h = height;
+-    snprintf(s_win.title, sizeof s_win.title, "%s", title ? title : "ps3recomp (Vulkan)");
+-    s_win.ready = CreateEventA(NULL, TRUE, FALSE, NULL);
+-    HANDLE t = s_win.ready ? CreateThread(NULL, 0, vk_window_thread, NULL, 0, NULL) : NULL;
+-    if (!t) return -1;
+-    WaitForSingleObject(s_win.ready, INFINITE);
+-    CloseHandle(t);
+-    if (!s_win.hwnd) { fprintf(stderr, "[vk] window creation failed%c", 10); return -1; }
+-    if (vk_load() || vk_instance() || vk_device()) return -1;
++    s_vk.win_w = w; s_vk.win_h = h;
++    if (vk_load() || vk_instance((HWND)hwnd) || vk_device()) return -1;
+     if (vk_swap_create() < 0) return -1;
+-    fprintf(stderr, "[vk] Vulkan backend V1 on %s: guest flips presented with the guest's clear colour; draws counted, "
+-                    "not drawn yet (docs/plan_nativo.md)%c", s_vk.gpu_name, 10);
+-
+-    s_vk_backend.userdata = &s_vk;
+-    s_vk_backend.init = vkb_init;
+-    s_vk_backend.shutdown = vkb_noop;
+-    s_vk_backend.begin_frame = vkb_noop;
+-    s_vk_backend.end_frame = vkb_noop;
+-    s_vk_backend.present = vkb_present;
+-    s_vk_backend.clear = vkb_clear;
+-    s_vk_backend.set_render_target = vkb_state;
+-    s_vk_backend.set_viewport = vkb_state;
+-    s_vk_backend.set_blend = vkb_state;
+-    s_vk_backend.set_depth_stencil = vkb_state;
+-    s_vk_backend.set_shader = vkb_state;
+-    s_vk_backend.set_vertex_attribs = vkb_state;
+-    s_vk_backend.draw_arrays = vkb_draw;
+-    s_vk_backend.draw_indexed = vkb_draw;
+-    s_vk_backend.bind_texture = vkb_texture;
+-    rsx_set_backend(&s_vk_backend);
+-    s_vk.initialized = 1;
++    const VkBufferUsageFlags use[RSX_VK_NBUF] = {
++        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,                                      /* RSX_VK_VB (fixed-function) */
++        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, /* RSX_VK_VP_VB */
++        VK_BUFFER_USAGE_INDEX_BUFFER_BIT,                                       /* RSX_VK_VP_IB */
++        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,                                     /* RSX_VK_VP_CB */
++        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,                                     /* RSX_VK_VP_FPCB */
++    };
++    u64 total = 0;
++    for (int i = 0; i < RSX_VK_NBUF; i++) {
++        if (vk_host_buffer(i, sizes[i], use[i], &maps[i])) return -1;
++        total += sizes[i];
++    }
++    fprintf(stderr, "[vk] Vulkan executor on %s: the backend records into %llu MB of Vulkan upload buffers; "
++                    "frames presented, records counted, not drawn yet (V2c, docs/plan_nativo.md)%c",
++            s_vk.gpu_name, (unsigned long long)(total >> 20), 10);
+     return 0;
+ }
+ 
+-int rsx_vk_backend_pump_messages(void)
+-{
+-    return (s_win.closed || s_win.gone) ? -1 : 0;
++void rsx_vk_exec_resize(u32 w, u32 h)
++{
++    s_vk.win_w = w; s_vk.win_h = h;
++    s_vk.need_resize = 1;
++}
++
++/* Before the backend writes a frame: the last submission done (as D3D12's wait_for_gpu in render_frame). */
++void rsx_vk_exec_wait(void)
++{
++    if (!s_vk.dev) return;
++    const uint32_t last = (s_vk.frame + FRAMES - 1) % FRAMES;
++    vkWaitForFences_(s_vk.dev, 1, &s_vk.fence[last], VK_TRUE, UINT64_MAX);
+ }
+ 
+ static void vk_barrier(VkCommandBuffer c, VkImage img, VkImageLayout from, VkImageLayout to,
+@@ -544,12 +421,15 @@
+     vkCmdPipelineBarrier_(c, src_s, dst_s, 0, 0, NULL, 0, NULL, 1, &b);
+ }
+ 
+-void rsx_vk_backend_present(void)
+-{
+-    if (!s_vk.initialized) return;
+-    const LONG wh = InterlockedExchange(&s_win.want_wh, 0);
+-    if (wh || s_vk.need_resize || !s_vk.swap) {
+-        if (wh) { s_win.w = (u32)wh >> 16; s_win.h = (u32)wh & 0xFFFF; }
++void rsx_vk_exec_frame(const rsx_vk_frame* fr)
++{
++    if (!s_vk.dev) return;
++    s_vk.frames++;
++    s_vk.draws += fr->draws;
++    s_vk.vbytes += fr->vp_vb_bytes;
++    s_vk.ibytes += (u64)fr->vp_indices * 4u;
++    if (!fr->present) return;
++    if (s_vk.need_resize || !s_vk.swap) {
+         if (vk_swap_create() != 0) return;          /* minimised, or failed: no present this time */
+         s_vk.need_resize = 0;
+     }
+@@ -569,7 +449,7 @@
+     vk_barrier(c, s_vk.img[ii], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+     VkClearColorValue cc;
+-    memcpy(cc.float32, s_vk.clear, sizeof cc.float32);
++    memcpy(cc.float32, fr->clear, sizeof cc.float32);
+     VkImageSubresourceRange rr = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+     vkCmdClearColorImage_(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &rr);
+     vk_barrier(c, s_vk.img[ii], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+@@ -593,16 +473,16 @@
+     s_vk.frame = (f + 1) % FRAMES;
+     s_vk.presents++;
+ 
+-    static ULONGLONG t0; static unsigned long long p0, d0;
++    static ULONGLONG t0; static unsigned long long p0, fr0, d0, v0, i0;
+     const ULONGLONG now = GetTickCount64();
+-    if (!t0) { t0 = now; p0 = s_vk.presents; d0 = s_vk.draws; }
++    if (!t0) { t0 = now; p0 = s_vk.presents; fr0 = s_vk.frames; d0 = s_vk.draws; v0 = s_vk.vbytes; i0 = s_vk.ibytes; }
+     else if (now - t0 >= 5000) {
+-        fprintf(stderr, "[vk] %.1f presents/s, guest draws %.0f/s (not drawn yet), clear colour (%.2f %.2f %.2f)%c",
+-                (double)(s_vk.presents - p0) * 1000.0 / (double)(now - t0),
+-                (double)(s_vk.draws - d0) * 1000.0 / (double)(now - t0), s_vk.clear[0], s_vk.clear[1], s_vk.clear[2], 10);
+-        fprintf(stderr, "[vk] programs to SPIR-V so far: vertex %u ok / %u failed, fragment %u ok / %u failed, %.0f ms compiling%s%c",
+-                s_sh.vs_ok, s_sh.vs_bad, s_sh.fs_ok, s_sh.fs_bad, s_sh.ms, s_sh.full ? " (table full)" : "", 10);
+-        t0 = now; p0 = s_vk.presents; d0 = s_vk.draws;
++        const double sec = (double)(now - t0) / 1000.0, nf = (double)(s_vk.frames - fr0 ? s_vk.frames - fr0 : 1);
++        fprintf(stderr, "[vk] %.1f presents/s, %.1f batches/s; per batch: %.0f draw records, %.0f KB vertices, %.0f KB indices"
++                        " (recorded, not drawn yet); vertex programs to SPIR-V %u ok / %u failed, %.0f ms%c",
++                (double)(s_vk.presents - p0) / sec, nf / sec, (double)(s_vk.draws - d0) / nf,
++                (double)(s_vk.vbytes - v0) / nf / 1024.0, (double)(s_vk.ibytes - i0) / nf / 1024.0, s_nvs, s_vs_bad, s_vs_ms, 10);
++        t0 = now; p0 = s_vk.presents; fr0 = s_vk.frames; d0 = s_vk.draws; v0 = s_vk.vbytes; i0 = s_vk.ibytes;
+     }
+ }
+ 
+diff --git a/libs/video/rsx_vk_exec.h b/libs/video/rsx_vk_exec.h
+new file mode 100644
+--- /dev/null
++++ b/libs/video/rsx_vk_exec.h
+@@ -0,0 +1,36 @@
++/*
++ * Re:Fine N1 (docs/plan_nativo.md): the Vulkan executor's interface to the D3D12 backend's recording.
++ * See rsx_vk_win.c. Only with REFINE_VULKAN on Windows.
++ */
++#ifndef RSX_VK_EXEC_H
++#define RSX_VK_EXEC_H
++
++#include "rsx_commands.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* The upload buffers the backend records into, in this order. */
++enum { RSX_VK_VB = 0, RSX_VK_VP_VB, RSX_VK_VP_IB, RSX_VK_VP_CB, RSX_VK_VP_FPCB, RSX_VK_NBUF };
++
++typedef struct rsx_vk_frame {
++    u32 draws;          /* draw records of this batch */
++    u32 vp_vb_bytes;    /* VP vertex bytes written (vp_vb_offset) */
++    u32 vp_indices;     /* indices written (vp_ib_offset) */
++    u32 parity;         /* the half of each buffer this batch used */
++    int present;        /* this batch ends in a present */
++    float clear[4];     /* the backbuffer's clear colour */
++} rsx_vk_frame;
++
++/* 0, or -1 when there is no usable Vulkan (the caller then fails like a D3D12 init would). */
++int  rsx_vk_exec_init(void* hwnd, u32 w, u32 h, const u64 sizes[RSX_VK_NBUF], void* maps[RSX_VK_NBUF]);
++int  rsx_vk_exec_vs(u32 hash, const char* hlsl);
++void rsx_vk_exec_wait(void);
++void rsx_vk_exec_frame(const rsx_vk_frame* f);
++void rsx_vk_exec_resize(u32 w, u32 h);
++
++#ifdef __cplusplus
++}
++#endif
++#endif

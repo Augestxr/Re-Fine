@@ -1,0 +1,107 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -5516,6 +5516,51 @@ static void guest_fb_present(u32 fi)
+ }
+ 
+ 
++/* Re:Fine 0164: one frame of the start screen. The title has not drawn anything yet (this runs on its
++ * thread, inside cellGcmInit), so the GPU is idle, nothing else records on the list, and the swap
++ * buffer is where the swap chain leaves it. */
++void (*g_port_launcher)(void);
++void rsx_d3d12_launcher_frame(void)
++{
++    if (!s_d3d.swap_chain) return;
++    wait_for_gpu();
++    swap_chain_resize();
++    const u32 fi = s_d3d.frame_index;
++    s_d3d.cmd_allocators[fi]->lpVtbl->Reset(s_d3d.cmd_allocators[fi]);
++    s_d3d.cmd_list->lpVtbl->Reset(s_d3d.cmd_list, s_d3d.cmd_allocators[fi], NULL);
++    ID3D12GraphicsCommandList* cl = s_d3d.cmd_list;
++    D3D12_RESOURCE_BARRIER b = {0};
++    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    b.Transition.pResource   = s_d3d.swap_buffers[fi];
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
++    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    cl->lpVtbl->ResourceBarrier(cl, 1, &b);
++    D3D12_CPU_DESCRIPTOR_HANDLE rtv;
++    s_d3d.swap_rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.swap_rtv_heap, &rtv);
++    rtv.ptr += fi * s_d3d.rtv_descriptor_size;
++    cl->lpVtbl->OMSetRenderTargets(cl, 1, &rtv, FALSE, NULL);
++    static const float dark[4] = {0.043f, 0.047f, 0.063f, 1.0f};
++    cl->lpVtbl->ClearRenderTargetView(cl, rtv, dark, 0, NULL);
++    D3D12_VIEWPORT vp = {0.0f, 0.0f, (float)s_d3d.win_w, (float)s_d3d.win_h, 0.0f, 1.0f};
++    D3D12_RECT sc = {0, 0, (LONG)s_d3d.win_w, (LONG)s_d3d.win_h};
++    cl->lpVtbl->RSSetViewports(cl, 1, &vp);
++    cl->lpVtbl->RSSetScissorRects(cl, 1, &sc);
++    if (g_port_overlay_active && g_port_overlay_draw) {
++        port_overlay_frame of = { s_d3d.device, cl, (uint64_t)rtv.ptr, s_d3d.win_w, s_d3d.win_h,
++                                  fi, FRAME_COUNT, (uint32_t)DXGI_FORMAT_R8G8B8A8_UNORM };
++        g_port_overlay_draw(&of);
++    }
++    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
++    cl->lpVtbl->ResourceBarrier(cl, 1, &b);
++    cl->lpVtbl->Close(cl);
++    ID3D12CommandList* lists[] = {(ID3D12CommandList*)cl};
++    s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, lists);
++    s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
++    move_to_next_frame();
++}
++
+ /* Re:Fine 0150, diagnostic only: FRAME_PROF. Running totals in seconds of the phases of
+  * render_frame, read by src/main.cpp on this same thread. gpu is the time between
+  * two timestamps at the ends of the command list. */
+@@ -9226,6 +9271,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+     s_d3d.last_fps_time = GetTickCount64();
+ 
+     printf("[D3D12] Backend ready: %ux%u\n", width, height);
++    if (g_port_launcher) g_port_launcher();   /* Re:Fine 0164 */
+     return 0;
+ }
+ 
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -48,6 +48,14 @@ extern char g_port_pad_name[128];
+ /* Output gain, 0-1, applied by cellAudio to what it hands to WASAPI. */
+ extern volatile float g_port_master_volume;
+ 
++/* Re:Fine 0164. The start screen. Guest thread, once, at the end of the backend's init (the window
++ * and the device exist; the title has drawn nothing yet). The port's hook may block: it presents its
++ * own frames with rsx_d3d12_launcher_frame() until the player chooses PLAY, then returns. */
++extern void (*g_port_launcher)(void);
++/* One frame of the overlay (g_port_overlay_draw) over a dark background, presented. Only from the
++ * g_port_launcher hook. */
++void rsx_d3d12_launcher_frame(void);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/libs/system/cellGame.c b/libs/system/cellGame.c
+--- a/libs/system/cellGame.c
++++ b/libs/system/cellGame.c
+@@ -40,6 +40,10 @@ static char s_version[16]   = "01.00";
+ static char s_system_ver[16] = "00.0000";
+ static char s_app_ver[16]   = "01.00";
+ 
++/* Re:Fine 0164: what the start screen shows (the values main.cpp read from PARAM.SFO). */
++const char* cellGame_title_id_str(void) { return s_title_id; }
++const char* cellGame_app_ver_str(void)  { return s_app_ver; }
++
+ /* Content info / usrdir paths.
+  *
+  * This is the HOST directory the guest path /dev_hdd0/game maps to, and it has
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -667,6 +667,8 @@ static unsigned int gcm_guest_alloc(unsigned int size, unsigned int align)
+     bump += (size + 15u) & ~15u;
+     return a;
+ }
++/* Re:Fine 0164: the same scratch region for the port (the start screen's pad report), never freed. */
++extern "C" unsigned int ppu_scratch_alloc(unsigned int size, unsigned int align) { return gcm_guest_alloc(size, align); }
+ static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(addr, val); }
+ 
+ /* FIFO command-buffer-full callback. cellGcmSetupContext points the guest

@@ -1,0 +1,39 @@
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -560,6 +560,10 @@ typedef struct {
+ } D3D12State;
+ 
+ static D3D12State s_d3d;
++
++/* Re:Fine 6d.11 (diagnostic): see CELLMARK_DUMP_ARMED. */
++static volatile int s_dump_armed_wait;
++void rsx_d3d12_dump_arm(void) { s_dump_armed_wait = 0; }
+ char g_rsx_title_base[128] = "ps3recomp";
+ static u32 s_dbg_last_draws = 0;
+ static u64 s_req_verts = 0, s_req_draws = 0, s_drop_draws = 0;
+@@ -6734,12 +6738,13 @@ static void render_frame(void)
+       /* draw_count is already reset by here; s_dbg_last_draws holds the
+        * count this frame actually rendered. */
+       if (mind > 0 && s_dbg_last_draws < (u32)mind) goto skip_dump_consider; }
++    if (s_dump_armed_wait) goto skip_dump_consider;
+     if (s_d3d.dump_skip_left > 0 && s_d3d.dump_frames_left > 0) s_d3d.dump_skip_left--;
+ skip_dump_consider: ;
+     guest_fb_present(fi);
+     composite_present(fi);
+     int dumping = (s_d3d.dump_frames_left > 0 && s_d3d.readback_buf
+-                   && s_d3d.dump_skip_left == 0);
++                   && s_d3d.dump_skip_left == 0 && !s_dump_armed_wait);
+     { static int mind2 = -1;
+       if (mind2 < 0) { const char* e = getenv("CELLMARK_DUMP_MINDRAWS");
+                        mind2 = e ? atoi(e) : 0; }
+@@ -8960,6 +8965,9 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+          * only appears once the sim SPUs have advanced the scene. */
+         { const char* sv = getenv("CELLMARK_DUMP_SKIP");
+           s_d3d.dump_skip_left = sv ? atoi(sv) : 0; }
++        /* Re:Fine 6d.11: CELLMARK_DUMP_ARMED=1 waits for rsx_d3d12_dump_arm() from the
++         * host (at a song second, say) before the CELLMARK_DUMP_SKIP count starts. */
++        if (dv && getenv("CELLMARK_DUMP_ARMED")) s_dump_armed_wait = 1;
+     }
+ 
+     /* Create window */

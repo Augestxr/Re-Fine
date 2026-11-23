@@ -1,0 +1,120 @@
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -128,7 +128,7 @@ static struct {
+     VkSurf shared_ds[8];          /* the depth of passes without a depth surface, by size */
+     u32 nshared;
+     int first_frame_done;
+-    unsigned long long presents, frames, draws, vbytes, ibytes, drawn, skipped_nopipe, skipped_cube, clears;
++    unsigned long long presents, frames, draws, vbytes, ibytes, drawn, skipped_nopipe, skipped_cube, clears, ds_sampled;
+     char gpu_name[256];
+ } s_vk;
+ 
+@@ -744,6 +744,46 @@ static int vk_layouts(void)
+     return 0;
+ }
+ 
++/* Re:Fine 0184: the sampler of a draw's unit, one per distinct guest state (the D3D12 backend's vp_sampler and
++ * rsx_sampler_desc): wrap modes from TEXTURE_ADDRESS, min/mag from TEXTURE_FILTER, the border as the nearest of
++ * Vulkan's three fixed colours. A unit the guest gave no state: point/clamp for unit 0, linear/wrap for the rest.
++ * Not done: anisotropy (the device feature is not enabled) and the LOD bias (textures have one level here). */
++#define VK_SAMP_MAX 256
++static struct { u32 k[3]; VkSampler s; } s_samp[VK_SAMP_MAX];
++static u32 s_nsamp;
++static VkSamplerAddressMode vk_wrap(u32 w)
++{
++    switch (w & 0xFu) {
++    case 2: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
++    case 3: case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
++    case 4: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
++    case 6: case 7: case 8: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;   /* mirror once: needs an extension */
++    default: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
++    }
++}
++static VkSampler vk_sampler(const rsx_vk_tex* t, u32 u)
++{
++    u32 k[3];
++    if (t->set) { k[0] = t->addr & 0x000F0F0Fu; k[1] = t->filter & 0x07070000u; k[2] = t->border; }
++    else { k[0] = u == 0 ? 0x00030303u : 0x00010101u; k[1] = u == 0 ? 0x01010000u : 0x02020000u; k[2] = 0; }
++    for (u32 i = 0; i < s_nsamp; i++) if (!memcmp(s_samp[i].k, k, sizeof k)) return s_samp[i].s;
++    if (s_nsamp >= VK_SAMP_MAX) return s_vk.samp_linear;
++    const u32 minf = (k[1] >> 16) & 7u, magf = (k[1] >> 24) & 7u;
++    VkSamplerCreateInfo si = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
++    si.minFilter = (minf == 2 || minf == 4 || minf == 6 || minf == 7) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++    si.magFilter = (magf == 2 || magf == 4) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++    si.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
++    si.addressModeU = vk_wrap(k[0]); si.addressModeV = vk_wrap(k[0] >> 8); si.addressModeW = vk_wrap(k[0] >> 16);
++    {   const u32 a = k[2] >> 24, lum = ((k[2] >> 16) & 0xFFu) + ((k[2] >> 8) & 0xFFu) + (k[2] & 0xFFu);
++        si.borderColor = a < 128 ? VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK
++                       : lum >= 384 ? VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE : VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK; }
++    si.maxLod = VK_LOD_CLAMP_NONE;
++    VkSampler s = VK_NULL_HANDLE;
++    if (vkCreateSampler_(s_vk.dev, &si, NULL, &s) != VK_SUCCESS) return s_vk.samp_linear;
++    memcpy(s_samp[s_nsamp].k, k, sizeof k); s_samp[s_nsamp].s = s; s_nsamp++;
++    return s;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Surfaces
+  * -----------------------------------------------------------------------*/
+@@ -1133,11 +1173,14 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+             texof[d][u] = NULL;
+             if (!r->is_vp || r->is_clear || !((r->tex_mask >> u) & 1u) || !r->tex[u].set) continue;
+             if (vk_rt_find(r->tex[u].raw)) continue;
++            for (u32 i = 0; i < s_vk.nds; i++) if (s_vk.ds[i].off == r->tex[u].raw) { s_vk.ds_sampled++; break; }   /* not done: reads guest memory */
+             texof[d][u] = vk_tex_get(c, f, &r->tex[u], r->tex[u].cube && ((r->cube_mask >> u) & 1u));
+         }
+     }
+     vk_full_barrier(c);
+ 
++    static int s_samp_on = -1;   /* REFINE_VK_SAMPLERS=0: linear clamp for every unit, as before 0184 */
++    if (s_samp_on < 0) { const char* e = getenv("REFINE_VK_SAMPLERS"); s_samp_on = !(e && *e == '0'); }
+     VkPass cur; memset(&cur, 0, sizeof cur);
+     int in_pass = 0;
+     VkPipeline bound = VK_NULL_HANDLE;
+@@ -1225,7 +1268,7 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+                 else if (!s && d < VK_MAX_SETS && texof[d][u] && !texof[d][u]->cube) src = &texof[d][u]->s;
+             }
+             im[u].sampler = VK_NULL_HANDLE; im[u].imageView = src->view; im[u].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+-            sm[u].sampler = s_vk.samp_linear; sm[u].imageView = VK_NULL_HANDLE; sm[u].imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++            sm[u].sampler = s_samp_on ? vk_sampler(&r->tex[u], u) : s_vk.samp_linear; sm[u].imageView = VK_NULL_HANDLE; sm[u].imageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+         }
+         VkWriteDescriptorSet w[4];
+         memset(w, 0, sizeof w);
+@@ -1298,11 +1341,11 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         const double sec = (double)(now - t0) / 1000.0, nf = (double)(s_vk.frames - fr0 ? s_vk.frames - fr0 : 1);
+         fprintf(stderr, "[vk] %.1f presents/s; per batch %.0f records, %.0f drawn; surfaces %u, depth %u; programs vs %u (%u failed) "
+                         "fs %u (%d failed, %llu per-unit skipped); pipelines %u (%u failed, %.0f ms); skipped draws %llu; "
+-                        "textures %u, %llu uploads (%.1f MB), staging full %llu%c",
++                        "textures %u, %llu uploads (%.1f MB), staging full %llu; depth surfaces sampled %llu%c",
+                 (double)(s_vk.presents - p0) / sec, (double)(s_vk.draws - d0) / nf, (double)(s_vk.drawn - dr0) / nf,
+                 s_vk.nrt, s_vk.nds, s_nvs, s_vs_bad, s_nfs, s_fs_bad, (unsigned long long)s_vk.skipped_cube, s_npipe, s_pipe_bad,
+                 s_pipe_ms, (unsigned long long)s_vk.skipped_nopipe, s_ntex, (unsigned long long)s_vk.tex_uploads,
+-                (double)s_vk.tex_bytes / 1048576.0, (unsigned long long)s_vk.tex_full, 10);
++                (double)s_vk.tex_bytes / 1048576.0, (unsigned long long)s_vk.tex_full, (unsigned long long)s_vk.ds_sampled, 10);
+         t0 = now; p0 = s_vk.presents; fr0 = s_vk.frames; d0 = s_vk.draws; dr0 = s_vk.drawn;
+     }
+ }
+diff --git a/libs/video/rsx_vk_exec.h b/libs/video/rsx_vk_exec.h
+--- a/libs/video/rsx_vk_exec.h
++++ b/libs/video/rsx_vk_exec.h
+@@ -16,7 +16,7 @@ enum { RSX_VK_VB = 0, RSX_VK_VP_VB, RSX_VK_VP_IB, RSX_VK_VP_CB, RSX_VK_VP_FPCB,
+ 
+ /* One texture unit as the draw had it bound (D3D12DrawTex's fields the executor needs). */
+ typedef struct rsx_vk_tex {
+-    u32 raw, off, w, h, fmt, cube, set, filter, addr, mips;
++    u32 raw, off, w, h, fmt, cube, set, filter, addr, mips, ctrl0, border;
+     u32 map;   /* the D3D12 SRV component mapping the backend derives (rsx_remap_to_d3d; 0x1000 for B8) */
+ } rsx_vk_tex;
+ 
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -6604,6 +6604,7 @@ static void render_frame_vk(void)
+             o->tex[u].raw = t->raw; o->tex[u].off = t->off; o->tex[u].w = t->w; o->tex[u].h = t->h;
+             o->tex[u].fmt = t->fmt; o->tex[u].cube = (u32)t->cube; o->tex[u].set = (u32)t->set;
+             o->tex[u].filter = t->filter; o->tex[u].addr = t->addr; o->tex[u].mips = t->mips;
++            o->tex[u].ctrl0 = t->ctrl0; o->tex[u].border = t->border;
+             { const u32 bf = t->fmt & 0x9Fu;   /* as the D3D12 path maps the SRV (render_frame) */
+               o->tex[u].map = (bf == 0x81) ? 0x1000u : (t->set ? rsx_remap_to_d3d(t->ctrl1, bf) : 0x1688u); }
+         }

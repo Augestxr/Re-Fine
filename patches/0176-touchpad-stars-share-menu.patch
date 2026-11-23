@@ -1,0 +1,98 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -93,6 +93,8 @@
+ void (*g_port_overlay_watch)(unsigned port, uint16_t mask);
+ volatile long g_port_overlay_inject;
+ volatile long g_port_overlay_touchpad;
++/* Re:Fine 0176 (port_overlay.h): a swipe on a PS4/PS5 touchpad is a stick flick (F's stars). On by default. */
++volatile long g_port_touch_stars = 1;
+ volatile long g_port_rumble_off;
+ char g_port_pad_name[128];
+ int (*g_port_overlay_pad)(unsigned port, uint16_t mask, uint8_t lx, uint8_t ly);
+@@ -975,6 +977,39 @@
+ }
+ 
+ /* One pad into a state; the rest of the struct is a release. */
++/* Re:Fine 0176: a swipe on the touchpad of a PS4 or PS5 pad is a flick of the left stick that way, for as long
++ * as F needs to see one (F's stars are a flick of either stick, its Tutorial). One finger; a swipe is
++ * TOUCH_FLICK_DIST of the pad's width (the height counted in the same millimetres: the pad is about 52 x 23 mm),
++ * and the finger may go on: each further TOUCH_FLICK_DIST is another flick, after the stick was back in the
++ * centre for TOUCH_FLICK_GAP ms. */
++#define TOUCH_FLICK_DIST 0.09f
++#define TOUCH_FLICK_MS   50
++#define TOUCH_FLICK_GAP  40
++static void pad_touch_flick(SDL_Gamepad* gp, PadHostState* hs, int port)
++{
++    static struct { int down; float x0, y0, fx, fy; unsigned long long until, next; } t[PAD_MAX_HOST_PORTS];
++    if (!g_port_touch_stars || SDL_GetNumGamepadTouchpads(gp) < 1) { t[port].down = 0; t[port].until = 0; return; }
++    bool down = false; float x = 0, y = 0, pr = 0;
++    if (!SDL_GetGamepadTouchpadFinger(gp, 0, 0, &down, &x, &y, &pr)) down = false;
++    const unsigned long long now = pad_now_ms();
++    if (!down) t[port].down = 0;
++    else if (!t[port].down) { t[port].down = 1; t[port].x0 = x; t[port].y0 = y; }
++    else {
++        const float dx = x - t[port].x0, dy = (y - t[port].y0) * 0.45f;
++        const float d = sqrtf(dx * dx + dy * dy);
++        if (d >= TOUCH_FLICK_DIST && now >= t[port].next) {
++            t[port].fx = dx / d; t[port].fy = dy / d;
++            t[port].until = now + TOUCH_FLICK_MS; t[port].next = now + TOUCH_FLICK_MS + TOUCH_FLICK_GAP;
++            t[port].x0 = x; t[port].y0 = y;
++            { static int n; if (n++ < 8) fprintf(stderr, "[cellPad] touchpad swipe on port %d: flick (%.2f, %.2f)%c", port, t[port].fx, t[port].fy, 10); }
++        }
++    }
++    if (now < t[port].until) {
++        hs->analog_lx = (u8)(127.5f + t[port].fx * 127.5f);
++        hs->analog_ly = (u8)(127.5f + t[port].fy * 127.5f);
++    }
++}
++
+ static void pad_sdl3_read(SDL_Gamepad* gp, PadHostState* hs, int port)
+ {
+     /* Re:Fine 0171: a source (SDL button, or a trigger past PAD_TRIGGER_THRESHOLD) feeds the PS3 button
+@@ -997,13 +1032,24 @@
+         if (SDL_GetGamepadButton(gp, (SDL_GamepadButton)b)) raw |= 1u << b;
+     if (lt > PAD_TRIGGER_THRESHOLD) raw |= 1u << PORT_SRC_LT;
+     if (rt > PAD_TRIGGER_THRESHOLD) raw |= 1u << PORT_SRC_RT;
++    /* Re:Fine 0176: on a PS4 or PS5 pad Share (Create) opens the port's menu and the touchpad's click is the
++     * PS3's SELECT (the author, 2026-11-11): the two sources trade places before anything reads them. */
++    {
++        const SDL_GamepadType ty = SDL_GetGamepadType(gp);
++        if (ty == SDL_GAMEPAD_TYPE_PS4 || ty == SDL_GAMEPAD_TYPE_PS5) {
++            const unsigned back = (raw >> SDL_GAMEPAD_BUTTON_BACK) & 1u, touch = (raw >> SDL_GAMEPAD_BUTTON_TOUCHPAD) & 1u;
++            raw &= ~((1u << SDL_GAMEPAD_BUTTON_BACK) | (1u << SDL_GAMEPAD_BUTTON_TOUCHPAD));
++            raw |= touch << SDL_GAMEPAD_BUTTON_BACK | back << SDL_GAMEPAD_BUTTON_TOUCHPAD;
++        }
++    }
+     if (port == 0) s_raw_sources = (long)raw;
+     const PadPadBinds* pb = __atomic_load_n(&s_pad_binds, __ATOMIC_ACQUIRE);
+     if (!pb) pb = &def;
+     u16 btns = 0;
+     for (int a = 0; a < PORT_BIND_PAD_COUNT; a++)
+         if (pb->src[a] >= 0 && pb->src[a] < 32 && ((raw >> pb->src[a]) & 1)) btns |= s_bind_btn[a];
+-    /* Re:Fine 0159: the touchpad's click is no PS3 button; it opens the port's quick bar. */
++    /* Re:Fine 0159: the touchpad's click is no PS3 button; it opens the port's quick bar (0176: on a PS4/PS5
++     * pad this source is Share). */
+     {
+         static int s_touch[PAD_MAX_HOST_PORTS];
+         const int t = (raw >> SDL_GAMEPAD_BUTTON_TOUCHPAD) & 1;
+@@ -1030,6 +1076,7 @@
+                    SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_LEFTY), &hs->analog_lx, &hs->analog_ly);
+     pad_sdl3_stick(&s_stick[port][1], SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTX),
+                    SDL_GetGamepadAxis(gp, SDL_GAMEPAD_AXIS_RIGHTY), &hs->analog_rx, &hs->analog_ry);
++    pad_touch_flick(gp, hs, port);   /* Re:Fine 0176 */
+ 
+     /* Pressure: SDL has digital buttons, so 0 or 255 */
+     hs->press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -94,6 +94,8 @@
+ /* Re:Fine 0173. Nonzero for a frame the game's logic does not step (the menus over 30 fps, src/main.cpp):
+  * cellPadGetData hands the game its last packet again, so a press is first seen on a step. */
+ extern volatile long g_port_pad_hold;
++/* Re:Fine 0176: a swipe on a PS4/PS5 touchpad is a flick of the left stick (F's stars); 0 turns it off. */
++extern volatile long g_port_touch_stars;
+ /* Re:Fine 0175, set by the port at the start of each guest frame (src/main.cpp) for the D3D12 backend: draw
+  * this frame's menus between their last two states. The game's clock: g_port_draw_ticks ticks so far and
+  * g_port_draw_alpha (0..1) since the last; g_port_draw_tick = this frame ran a tick; g_port_draw_seq counts

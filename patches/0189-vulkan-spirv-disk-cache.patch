@@ -1,0 +1,114 @@
+diff --git a/libs/video/rsx_vk_spirv.cpp b/libs/video/rsx_vk_spirv.cpp
+--- a/libs/video/rsx_vk_spirv.cpp
++++ b/libs/video/rsx_vk_spirv.cpp
+@@ -21,6 +21,59 @@
+ #include <unknwn.h>   /* IUnknown: WIN32_LEAN_AND_MEAN leaves the COM headers out */
+ #include "dxcapi.h"
+ 
++/* Re:Fine 0189: the SPIR-V of every program on disk, as the D3D12 backend keeps its bytecode (0123,
++ * rsx_shader_cache.h): %LOCALAPPDATA%\ReFine\shadercache, REFINE_SHADER_CACHE=<dir> moves it, =off disables it.
++ * DXC takes tens to hundreds of milliseconds per program and a song brings new ones in the middle of play: without
++ * this every run had those stalls again (250 ms in Cat Food, run n12_fast1). The key is the SHA-256 of the stage,
++ * the options and the HLSL; the compiler's build is in the file's header, so a new dxcompiler.dll misses. */
++#include "rsx_shader_cache.h"
++#include <bcrypt.h>
++#pragma comment(lib, "bcrypt.lib")
++
++static wchar_t s_spc_dir[MAX_PATH];
++static uint64_t s_spc_compiler;
++static volatile LONG s_spc_hits, s_spc_compiles;
++static double s_spc_ms;
++static const char s_spc_options[] = "spirv1 -HV 2018 vulkan1.2 dx-layout b0 t16 s32 O3";   /* change it with the arguments below */
++
++static void spc_init(HMODULE dxc)
++{
++    wchar_t env[MAX_PATH];
++    const DWORD n = GetEnvironmentVariableW(L"REFINE_SHADER_CACHE", env, MAX_PATH);
++    if (n && n < MAX_PATH) {
++        if (_wcsicmp(env, L"off") == 0) return;
++        wcscpy(s_spc_dir, env);
++        CreateDirectoryW(s_spc_dir, NULL);
++    } else {
++        const DWORD m = GetEnvironmentVariableW(L"LOCALAPPDATA", env, MAX_PATH);
++        if (!m || m >= MAX_PATH - 32) return;
++        swprintf(s_spc_dir, MAX_PATH, L"%ls\\ReFine", env);
++        CreateDirectoryW(s_spc_dir, NULL);
++        wcscat(s_spc_dir, L"\\shadercache");
++        CreateDirectoryW(s_spc_dir, NULL);
++    }
++    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)dxc;
++    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)((const unsigned char*)dxc + dos->e_lfanew);
++    s_spc_compiler = ((uint64_t)nt->FileHeader.TimeDateStamp << 32) | nt->OptionalHeader.SizeOfImage;
++    if (!s_spc_compiler) s_spc_dir[0] = 0;
++}
++
++static int spc_key(const char* hlsl, size_t len, int stage, unsigned char key[32])
++{
++    BCRYPT_ALG_HANDLE alg = NULL; BCRYPT_HASH_HANDLE h = NULL; int ok = 0;
++    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0) return 0;
++    if (BCryptCreateHash(alg, &h, NULL, 0, NULL, 0, 0) == 0) {
++        const unsigned sizes[2] = { (unsigned)len, (unsigned)stage };
++        ok = BCryptHashData(h, (PUCHAR)sizes, sizeof sizes, 0) == 0 &&
++             BCryptHashData(h, (PUCHAR)s_spc_options, sizeof s_spc_options, 0) == 0 &&
++             BCryptHashData(h, (PUCHAR)hlsl, (ULONG)len, 0) == 0 &&
++             BCryptFinishHash(h, key, 32, 0) == 0;
++        BCryptDestroyHash(h);
++    }
++    BCryptCloseAlgorithmProvider(alg, 0);
++    return ok;
++}
++
+ static DxcCreateInstanceProc s_create;
+ static IDxcCompiler3* s_compiler;
+ static IDxcUtils* s_utils;
+@@ -38,6 +91,7 @@ static int spirv_init(void)
+         fprintf(stderr, "[vk] dxcompiler.dll did not start: no SPIR-V\n");
+         return -1;
+     }
++    spc_init(m);
+     s_state = 1;
+     return 1;
+ }
+@@ -48,6 +102,20 @@ extern "C" int rsx_vk_spirv(const char* hlsl, size_t len, int stage, void** out,
+     *out = NULL; *out_len = 0;
+     if (err_cap) err[0] = 0;
+     if (spirv_init() < 0) { if (err_cap) snprintf(err, err_cap, "no dxcompiler.dll"); return -1; }
++    wchar_t path[MAX_PATH + 80]; unsigned char key[32];
++    const int cached = s_spc_dir[0] && spc_key(hlsl, len, stage, key);
++    if (cached) {
++        wchar_t hex[65];
++        for (int i = 0; i < 32; i++) swprintf(hex + i * 2, 3, L"%02x", key[i]);
++        swprintf(path, sizeof path / sizeof path[0], L"%ls\\%ls.spv", s_spc_dir, hex);
++        void* data = NULL; uint32_t size = 0;
++        if (rsx_sc_load(path, key, s_spc_compiler, &data, &size) == RSX_SC_HIT) {
++            *out = data; *out_len = size;
++            InterlockedIncrement(&s_spc_hits);
++            return 0;
++        }
++    }
++    LARGE_INTEGER q0, q1, qf; QueryPerformanceCounter(&q0);
+     const wchar_t* args[] = {
+         L"-E", L"main", L"-T", stage ? L"ps_6_0" : L"vs_6_0", L"-HV", L"2018",
+         L"-spirv", L"-fspv-target-env=vulkan1.2", L"-fvk-use-dx-layout",
+@@ -67,6 +135,7 @@ extern "C" int rsx_vk_spirv(const char* hlsl, size_t len, int stage, void** out,
+             const size_t n = code->GetBufferSize();
+             void* p = malloc(n ? n : 1);
+             if (p) { memcpy(p, code->GetBufferPointer(), n); *out = p; *out_len = n; rc = 0; }
++            if (rc == 0 && cached && n) rsx_sc_store(path, key, s_spc_compiler, p, (uint32_t)n);
+             code->Release();
+         }
+     } else if (err_cap) {
+@@ -77,6 +146,13 @@ extern "C" int rsx_vk_spirv(const char* hlsl, size_t len, int stage, void** out,
+         } else snprintf(err, err_cap, "failed, no message");
+     }
+     res->Release();
++    QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&qf);
++    const double ms = (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)qf.QuadPart;
++    s_spc_ms += ms;
++    const LONG nc = InterlockedIncrement(&s_spc_compiles);
++    if (nc <= 4 || nc % 16 == 0 || ms > 100.0)
++        fprintf(stderr, "[vk] SPIR-V: %ld compiled (%.0f ms in all, this one %.0f ms), %ld from the disk cache%c",
++                nc, s_spc_ms, ms, s_spc_hits, 10);
+     return rc;
+ }
+ 

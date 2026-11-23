@@ -1,0 +1,206 @@
+diff --git a/libs/video/rsx_vk_win.c b/libs/video/rsx_vk_win.c
+--- a/libs/video/rsx_vk_win.c
++++ b/libs/video/rsx_vk_win.c
+@@ -81,6 +81,7 @@ typedef struct {
+     VkDeviceMemory mem;
+     VkImageView view;
+     int depth, cleared;
++    unsigned long long use;       /* 0188: colour surfaces, the last time one was asked for (vk_rt_get) */
+ } VkSurf;
+ 
+ #define VK_MAX_RT 96
+@@ -132,6 +133,8 @@ static struct {
+     u32 nshared;
+     int first_frame_done;
+     unsigned long long presents, frames, draws, vbytes, ibytes, drawn, skipped_nopipe, skipped_cube, clears, ds_sampled;
++    double t_wait, t_tex, t_draw, t_end, t_hash, t_a, t_b, t_c;   /* 0188: where a frame's time goes on this thread, ms summed */
++    unsigned long long hash_bytes;
+     char gpu_name[256];
+ } s_vk;
+ 
+@@ -831,23 +834,34 @@ static VkSurf* vk_rt_get(VkCommandBuffer c, u32 off, u32 w, u32 h, u32 fmt, floa
+ {
+     if (!w || !h) return NULL;
+     const VkFormat vf = vk_surface_format(fmt);
++    /* 0188: one image per offset, size and format. The game draws to one offset at two sizes within a frame
++     * (01F80000: 256x144 and 512x144 in a song); with one image per offset it was destroyed and made again,
++     * waiting for the GPU, on every batch: 2 ms each. vk_rt_find gives the one asked for last. */
++    static unsigned long long clock;
+     VkSurf* s = NULL;
+-    for (u32 i = 0; i < s_vk.nrt; i++) if (s_vk.rt[i].off == off) { s = &s_vk.rt[i]; break; }
+-    if (s && s->w == w && s->h == h && s->vf == vf) return s;
+-    if (s) { vkDeviceWaitIdle_(s_vk.dev); vk_image_free(s); }
+-    else { if (s_vk.nrt >= VK_MAX_RT) return NULL; s = &s_vk.rt[s_vk.nrt++]; }
++    for (u32 i = 0; i < s_vk.nrt; i++)
++        if (s_vk.rt[i].off == off && s_vk.rt[i].w == w && s_vk.rt[i].h == h && s_vk.rt[i].vf == vf && s_vk.rt[i].img &&
++            s_vk.rt[i].pw == vk_rs_dim(w, rs) && s_vk.rt[i].ph == vk_rs_dim(h, rs)) { s_vk.rt[i].use = ++clock; return &s_vk.rt[i]; }
++    if (s_vk.nrt < VK_MAX_RT) s = &s_vk.rt[s_vk.nrt++];
++    else {   /* full: the one asked for longest ago */
++        s = &s_vk.rt[0];
++        for (u32 i = 1; i < s_vk.nrt; i++) if (s_vk.rt[i].use < s->use) s = &s_vk.rt[i];
++        vkDeviceWaitIdle_(s_vk.dev); vk_image_free(s);
++    }
+     memset(s, 0, sizeof *s);
+     s->off = off; s->w = w; s->h = h; s->fmt = fmt;
+     if (vk_image(s, vk_rs_dim(w, rs), vk_rs_dim(h, rs), vf, 0)) { s->off = 0xFFFFFFFFu; return NULL; }
+     vk_to_general(c, s);
++    s->use = ++clock;
+     return s;
+ }
+ 
+ static VkSurf* vk_rt_find(u32 off)
+ {
+     if (!off) return NULL;
+-    for (u32 i = 0; i < s_vk.nrt; i++) if (s_vk.rt[i].off == off && s_vk.rt[i].img) return &s_vk.rt[i];
+-    return NULL;
++    VkSurf* b = NULL;
++    for (u32 i = 0; i < s_vk.nrt; i++) if (s_vk.rt[i].off == off && s_vk.rt[i].img && (!b || s_vk.rt[i].use > b->use)) b = &s_vk.rt[i];
++    return b;
+ }
+ 
+ static VkSurf* vk_ds_get(VkCommandBuffer c, u32 off, u32 pw, u32 ph)
+@@ -924,6 +938,21 @@ static u64 vk_hash_bytes(const u8* p, u32 n)
+     return a ^ (b * 0xFF51AFD7ED558CCDull) ^ n;
+ }
+ 
++/* 0188: has a texture changed? Checked once per batch for every texture bound, so it must be cheap: about a
++ * thousand words spread over the bytes, as the D3D12 backend's tex_csum (hashing every byte was 2 ms a batch in a
++ * song, 17-20 MB). REFINE_VK_FULLHASH=1: every byte, as before. */
++static u64 vk_tex_sum(const u8* p, u32 n)
++{
++    static int full = -1;
++    if (full < 0) { const char* e = getenv("REFINE_VK_FULLHASH"); full = e && *e == '1'; }
++    if (full || n <= 8192u) return vk_hash_bytes(p, n);
++    u64 h = 0xCBF29CE484222325ull ^ n;
++    const u32 step = (n / 1024u) & ~7u;
++    for (u32 i = 0; i + 8 <= n; i += step) { u64 w; memcpy(&w, p + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
++    { u64 w; memcpy(&w, p + n - 8, 8); h = (h ^ w) * 0x100000001B3ull; }
++    return h;
++}
++
+ static int vk_stage_init(void)
+ {
+     for (int f = 0; f < FRAMES; f++) {
+@@ -994,13 +1023,20 @@ static VkTex* vk_tex_get(VkCommandBuffer c, uint32_t f, const rsx_vk_tex* t, u32
+     }
+     const u32 src_bytes = stride * (faces - 1u) + tl.face_bytes;
+     VkTex* e = NULL;
+-    for (u32 i = 0; i < s_ntex; i++)
++    static VkTex* memo[1024];   /* 0188: by offset; checked in full below */
++    VkTex** mslot = &memo[((t->off >> 6) ^ (t->off >> 17) ^ cube) & 1023u];
++    if (*mslot && (*mslot)->s.img && (*mslot)->off == t->off && (*mslot)->w == t->w && (*mslot)->h == t->h && (*mslot)->fmt == t->fmt &&
++        (*mslot)->map == t->map && (*mslot)->cube == cube) e = *mslot;
++    else for (u32 i = 0; i < s_ntex; i++)
+         if (s_tex[i].off == t->off && s_tex[i].w == t->w && s_tex[i].h == t->h && s_tex[i].fmt == t->fmt && s_tex[i].map == t->map && s_tex[i].cube == cube) { e = &s_tex[i]; break; }
++    if (e) *mslot = e;
+     /* Re:Fine 0182: looked at once per batch. The same texture is bound by many draws of a frame, and hashing
+      * its guest bytes again for each one was most of the executor's time (the batch is recorded: the guest
+      * memory it reads does not change while it runs). */
+     if (e && e->s.img && e->last == s_batch) return e;
+-    const u64 cs = vk_hash_bytes(vm_base + t->off, src_bytes);
++    const double th0 = vk_ms();
++    const u64 cs = vk_tex_sum(vm_base + t->off, src_bytes);
++    s_vk.t_hash += vk_ms() - th0; s_vk.hash_bytes += src_bytes;
+     if (e && e->s.img && e->csum == cs) { e->last = s_batch; return e; }
+     const u32 rows = tl.compressed ? tl.rows : t->h;
+     const u64 face_dst = (u64)tl.dst_row_bytes * rows;
+@@ -1172,6 +1208,7 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         else s_vk.need_resize = 0;
+     }
+     const uint32_t f = s_vk.frame;
++    const double tp0 = vk_ms();
+     vkWaitForFences_(s_vk.dev, 1, &s_vk.fence[f], VK_TRUE, UINT64_MAX);
+     uint32_t ii = 0;
+     if (present) {
+@@ -1181,12 +1218,14 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+     }
+     vkResetFences_(s_vk.dev, 1, &s_vk.fence[f]);
+     vkResetDescriptorPool_(s_vk.dev, s_vk.dpool[f], 0);
++    const double tp1 = vk_ms();
+ 
+     VkCommandBuffer c = s_vk.cmd[f];
+     vkResetCommandBuffer_(c, 0);
+     VkCommandBufferBeginInfo bi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+     vkBeginCommandBuffer_(c, &bi);
++    const double tpa = vk_ms();
+ 
+     if (!s_vk.first_frame_done) {   /* the stand-in texel, once */
+         vk_to_general(c, &s_vk.white);
+@@ -1201,7 +1240,8 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+     }
+     /* The display target, at the backend's host size; cleared every batch, as the D3D12 backbuffer is. */
+     if (!s_vk.display.img || s_vk.display.pw != fr->rw || s_vk.display.ph != fr->rh) {
+-        if (s_vk.display.img) { vkDeviceWaitIdle_(s_vk.dev); vk_image_free(&s_vk.display); }
++        if (s_vk.display.img) { static unsigned n; if (n++ < 12 || n % 5000 == 0) fprintf(stderr, "[vk] display remade (%u): %ux%u -> %ux%u%c", n, s_vk.display.pw, s_vk.display.ph, fr->rw, fr->rh, 10);
++            vkDeviceWaitIdle_(s_vk.dev); vk_image_free(&s_vk.display); }
+         if (vk_image(&s_vk.display, fr->rw, fr->rh, VK_FORMAT_R8G8B8A8_UNORM, 0) == 0) vk_to_general(c, &s_vk.display);
+         s_vk.display.w = fr->width; s_vk.display.h = fr->height;
+     }
+@@ -1216,6 +1256,7 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         if (r->rt_off && !r->no_color) vk_rt_get(c, r->rt_off, r->rt_w, r->rt_h, r->rt_fmt, fr->rs);
+         for (int m = 0; m < 3; m++) if (r->rt_mrt[m] && !r->no_color) vk_rt_get(c, r->rt_mrt[m], r->rt_w, r->rt_h, r->rt_fmt, fr->rs);
+     }
++    const double tpb = vk_ms();
+     /* V2c2: the guest textures every draw samples, uploaded before any draw (a surface wins over memory) */
+     static VkTex* texof[VK_MAX_SETS][16];
+     s_batch++;
+@@ -1237,6 +1278,7 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+ 
+     static int s_samp_on = -1;   /* REFINE_VK_SAMPLERS=0: linear clamp for every unit, as before 0184 */
+     if (s_samp_on < 0) { const char* e = getenv("REFINE_VK_SAMPLERS"); s_samp_on = !(e && *e == '0'); }
++    const double tp2 = vk_ms();
+     VkPass cur; memset(&cur, 0, sizeof cur);
+     int in_pass = 0;
+     VkPipeline bound = VK_NULL_HANDLE;
+@@ -1355,6 +1397,7 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+     }
+     if (in_pass) vkCmdEndRendering_(c);
+     s_vk.drawn += drawn;
++    const double tp3 = vk_ms();
+ 
+     if (present) {
+         vk_full_barrier(c);
+@@ -1400,6 +1443,9 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+         s_vk.presents++;
+     }
+     s_vk.frame = (f + 1) % FRAMES;
++    {   const double tp4 = vk_ms();
++        s_vk.t_a += tpa - tp1; s_vk.t_b += tpb - tpa; s_vk.t_c += tp2 - tpb;
++        s_vk.t_wait += tp1 - tp0; s_vk.t_tex += tp2 - tp1; s_vk.t_draw += tp3 - tp2; s_vk.t_end += tp4 - tp3; }
+ 
+     static ULONGLONG t0; static unsigned long long p0, fr0, d0, dr0;
+     const ULONGLONG now = GetTickCount64();
+@@ -1413,6 +1459,9 @@ void rsx_vk_exec_frame(const rsx_vk_frame* fr)
+                 s_vk.nrt, s_vk.nds, s_nvs, s_vs_bad, s_nfs, s_fs_bad, (unsigned long long)s_vk.skipped_cube, s_npipe, s_pipe_bad,
+                 s_pipe_ms, (unsigned long long)s_vk.skipped_nopipe, s_ntex, (unsigned long long)s_vk.tex_uploads,
+                 (double)s_vk.tex_bytes / 1048576.0, (unsigned long long)s_vk.tex_full, (unsigned long long)s_vk.ds_sampled, 10);
++        fprintf(stderr, "[vk-time] per batch ms: wait %.2f, textures %.2f [begin %.2f, surfaces %.2f, units %.2f] (hash %.2f, %.1f MB), draws %.2f, end+present %.2f%c",
++                s_vk.t_wait / nf, s_vk.t_tex / nf, s_vk.t_a / nf, s_vk.t_b / nf, s_vk.t_c / nf, s_vk.t_hash / nf, (double)s_vk.hash_bytes / nf / 1048576.0, s_vk.t_draw / nf, s_vk.t_end / nf, 10);
++        s_vk.t_wait = s_vk.t_tex = s_vk.t_draw = s_vk.t_end = s_vk.t_hash = s_vk.t_a = s_vk.t_b = s_vk.t_c = 0; s_vk.hash_bytes = 0;
+         t0 = now; p0 = s_vk.presents; fr0 = s_vk.frames; d0 = s_vk.draws; dr0 = s_vk.drawn;
+     }
+ }
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -6620,6 +6620,10 @@ static void render_frame_vk(void)
+         o->ib_first = dr->ib_first; o->index_count = dr->index_count;
+         o->vs_hash = (dr->vs_idx >= 0 && dr->vs_idx < s_d3d.vp_vs_n) ? s_d3d.vp_vs[dr->vs_idx].hash : 0;
+         o->fp_addr = dr->fp_addr; o->fp_ctrl = dr->fp_ctrl;
++        /* 0188: only the units the fragment program samples, as the D3D12 path (a unit left bound by an earlier
++         * phase cost the executor a look at its texture every batch) */
++        const u32 fpu = dr->is_clear ? 0u : dr_fp_units(dr);
++        s_d3d.draws[d].fp_units = fpu;
+         o->cube_mask = dr->is_clear ? 0 : dr_cube_mask(dr); o->alpha_func = dr->is_clear ? 0 : dr_alpha_func(dr);
+         o->blend = (u32)dr->blend; o->blend_key = dr->blend_key; o->cull = dr->cull; o->cmask = dr->cmask;
+         o->stencil_ref = dr->stencil_ref; o->zs_key = dr->zs_key;
+@@ -6627,7 +6631,7 @@ static void render_frame_vk(void)
+         o->rt_w = dr->rt_w; o->rt_h = dr->rt_h; o->rt_fmt = dr->rt_fmt; o->zeta_off = dr->zeta_off;
+         o->vp_x = dr->vp_x; o->vp_y = dr->vp_y; o->vp_w = dr->vp_w; o->vp_h = dr->vp_h;
+         o->cb_slot = dr->cb_slot;
+-        o->tex_mask = dr->tex_mask & 0xFFFFu;
++        o->tex_mask = dr->tex_mask & fpu & 0xFFFFu;
+         for (u32 u = 0; u < 16; u++) {
+             const D3D12DrawTex* t = &dr->tex[u];
+             o->tex[u].raw = t->raw; o->tex[u].off = t->off; o->tex[u].w = t->w; o->tex[u].h = t->h;

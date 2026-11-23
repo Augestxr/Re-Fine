@@ -1,0 +1,15 @@
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+index 1040efd..efac69b 100644
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -64,6 +64,10 @@ static void adopt_gamedata_root(void)
+     const char* env = getenv("PS3_GAMEDATA_ROOT");
+     if (env && *env)
+         snprintf(s_save_root, sizeof(s_save_root), "%s/dev_hdd0/home/00000001/savedata", env);
++    /* Re:Fine: /dev_hdd0 is $PS3_HDD0_ROOT for sys_fs and cellGame; saves belong on the
++     * same drive, under home/<user>/savedata as on the console and in RPCS3. */
++    else if ((env = getenv("PS3_HDD0_ROOT")) != NULL && *env)
++        snprintf(s_save_root, sizeof(s_save_root), "%s/home/00000001/savedata", env);
+ }
+ 
+ /* Ensure directory (and parents) exist */

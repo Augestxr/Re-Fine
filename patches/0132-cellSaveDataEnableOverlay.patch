@@ -1,0 +1,27 @@
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+index 1fb1b12..8245a49 100644
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -1587,10 +1587,22 @@ void ps3_savedata_list_auto_load(ppu_context* ctx)
+         (u32)ctx->gpr[10], (void*)(uintptr_t)savedata_arg9(ctx));
+ }
+ 
++/* cellSaveDataEnableOverlay(enable) returns void and leaves r3 alone, which is why it is a ctx handler: the generic
++ * table writes a return value to r3. RPCS3 (cellSaveData.cpp, oracle, no code copied) only stores the flag, and no
++ * operation of its reads it back; here there is no system overlay to turn on or off either. */
++static int s_savedata_overlay;
++
++static void hle_cellSaveDataEnableOverlay(ppu_context* ctx)
++{
++    s_savedata_overlay = (s32)ctx->gpr[3] != 0;
++}
++
+ void cellSaveData_register_ctx_handlers(void)
+ {
+     /* Overrides the generated 8-arg registration: ctx handlers are dispatched
+      * before the generic table. */
++    ps3_hle_register_ctx(0xE7FA820Bu, "cellSaveDataEnableOverlay",
++                         hle_cellSaveDataEnableOverlay);
+     ps3_hle_register_ctx(0xCDC6AEFDu, "cellSaveDataUserAutoLoad",
+                          hle_cellSaveDataUserAutoLoad);
+     ps3_hle_register_ctx(0x52AAC4FAu, "cellSaveDataUserAutoSave",

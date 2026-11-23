@@ -1,0 +1,68 @@
+# speed_route.txt - el recorrido de tools\speed_test.ps1 (pasos de src/evt.cpp). Cada pulsacion va atada a un
+# evento del juego mas una espera fija, nunca al reloj de la corrida.
+wait task+ 9TaskMovie
+sleep 1000
+until task+_12TaskAdvTitle s 2000
+mark title
+sleep 3000
+press s 100
+sleep 3000
+press n 100
+sleep 3000
+press n 100
+sleep 3000
+press n 100
+mark main_menu
+wait task+ 7SelMain
+wait task+ 10InfoWindow
+sleep 3000
+press n 100
+wait task- 10InfoWindow
+sleep 2000
+press n 100
+mark mode_select
+wait task+ 11SelFreeplay
+sleep 3000
+press n 100
+mark song_list
+wait task+ 5SelPv
+wait task+ 10InfoWindow
+sleep 3000
+press n 100
+wait task- 10InfoWindow
+sleep 2000
+press d 100
+sleep 1500
+press u 100
+sleep 1500
+until TaskPvGame n 2500
+mark song_load
+wait task+ 8SelStart
+sleep 2000
+press n 100
+mark song
+wait task- 8SelStart
+wait task+ 11StageResult 90
+mark results
+sleep 3000
+until task+_8SelStart n 2500
+mark retry_menu
+sleep 2000
+press b 100
+mark back_to_list
+wait task+ 5SelPv
+sleep 4000
+press b 100
+mark back_to_mode
+sleep 5000
+press b 100
+mark back_to_main
+sleep 6000
+press d 100
+sleep 1500
+press n 100
+mark main_second
+sleep 10000
+press b 100
+sleep 5000
+close

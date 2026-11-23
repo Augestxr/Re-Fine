@@ -1,0 +1,45 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -129,6 +129,9 @@
+ }
+ unsigned pad_raw_sources(void) { return (unsigned)s_raw_sources; }
+ 
++/* Re:Fine 0173 (port_overlay.h): set by the port for the frames the game does not step. */
++volatile long g_port_pad_hold;
++
+ /* Re:Fine 0172: one short vibration asked by the port (port_overlay.h), sent by the SDL thread to port 0.
+  * Packed in one 64-bit word with a sequence number, so a pulse is never read half written. */
+ static volatile long long s_pulse;   /* seq << 48 | ms << 32 | hi << 16 | lo */
+@@ -1855,6 +1858,18 @@
+      * attack firing once.
+      *
+      * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
++    /* Re:Fine 0173: in a frame the game does not step (its logic runs on 30 Hz ticks, port_overlay.h),
++     * it reads the packet of its last read again. It works out "pressed now" by comparing each read
++     * with the one before, every frame, and uses it only when its logic runs: a press first seen in a
++     * frame between ticks would be gone by the tick. Held, it is first seen on the tick, as at 30 fps. */
++    {
++        static CellPadData s_last_pkt[CELL_PAD_MAX_PORT_NUM];
++        static int s_have_pkt[CELL_PAD_MAX_PORT_NUM];
++        if (port_no < CELL_PAD_MAX_PORT_NUM) {
++            if (g_port_pad_hold && s_have_pkt[port_no]) *data = s_last_pkt[port_no];
++            else { s_last_pkt[port_no] = *data; s_have_pkt[port_no] = 1; }
++        }
++    }
+     {
+         unsigned int ea = (unsigned int)(uintptr_t)data_guest;
+         vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
+diff --git a/libs/video/port_overlay.h b/libs/video/port_overlay.h
+--- a/libs/video/port_overlay.h
++++ b/libs/video/port_overlay.h
+@@ -91,6 +91,9 @@
+  * active outputs and returns how many there are. */
+ void port_audio_set_device(const char* want);
+ int port_audio_outputs(char* names, int stride, int max);
++/* Re:Fine 0173. Nonzero for a frame the game's logic does not step (the menus over 30 fps, src/main.cpp):
++ * cellPadGetData hands the game its last packet again, so a press is first seen on a step. */
++extern volatile long g_port_pad_hold;
+ 
+ #ifdef __cplusplus
+ }

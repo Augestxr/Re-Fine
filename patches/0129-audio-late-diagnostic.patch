@@ -1,0 +1,47 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index a8bb9059..88872745 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -499,6 +499,42 @@ static void audio_mix_one_block(void)
+         u32 block_offset = block_idx * CELL_AUDIO_BLOCK_SAMPLES * nch;
+         float* src = port->buffer + block_offset;
+ 
++        /* Re:Fine 0129, diagnostic: AUDIO_LATE=1 says, for each block the writer
++         * missed, how far ahead of the mixer it was running, and catches its
++         * block landing in a slot already read. */
++        { static int s_al = -1; if (s_al < 0) s_al = getenv("AUDIO_LATE") ? 1 : 0;
++          if (s_al) {
++            const u32 bn = CELL_AUDIO_BLOCK_SAMPLES * nch;
++            static u32 lead_hist[CELL_AUDIO_PORT_MAX][18];
++            static long long last[CELL_AUDIO_PORT_MAX]; static u64 cnt[CELL_AUDIO_PORT_MAX];
++            static int was_zero[CELL_AUDIO_PORT_MAX];
++            LARGE_INTEGER q, f; QueryPerformanceCounter(&q); QueryPerformanceFrequency(&f);
++            u32 lead = 0;
++            for (; lead < nblock; lead++) {
++                const float* bp = port->buffer + ((block_idx + lead) % nblock) * bn;
++                int nz = 0;
++                for (u32 k = 0; k < bn; k++) if (((const u32*)bp)[k]) { nz = 1; break; }
++                if (!nz) break;
++            }
++            const float* prev = port->buffer + ((block_idx + nblock - 1) % nblock) * bn;
++            int late = 0;
++            for (u32 k = 0; k < bn; k++) if (((const u32*)prev)[k]) { late = 1; break; }
++            lead_hist[p][lead < 17 ? lead : 17]++;
++            const double dt = last[p] ? (q.QuadPart - last[p]) * 1000.0 / f.QuadPart : 0.0;
++            last[p] = q.QuadPart;
++            if ((lead == 0 && !was_zero[p]) || late)
++                fprintf(stderr, "[AUDIO_LATE] port=%d block#%llu t=%.3f lead=%u late_write=%d since_last_mix=%.2f ms nblock=%u%c",
++                        p, (unsigned long long)port->read_index, q.QuadPart / (double)f.QuadPart,
++                        lead, late, dt, nblock, 10);
++            was_zero[p] = lead == 0;
++            if (!(++cnt[p] % 1875u)) {
++                fprintf(stderr, "[AUDIO_LATE] port=%d lead histogram:", p);
++                for (int k = 0; k < 18; k++) fprintf(stderr, " %u", lead_hist[p][k]);
++                fprintf(stderr, "%c", 10);
++                memset(lead_hist[p], 0, sizeof lead_hist[p]);
++            }
++          } }
++
+         /* AUDIO_PEAK diag: which blocks of this port's WHOLE ring hold data,
+          * vs which block the read cursor is on -- distinguishes "writer never
+          * writes" from "writer and reader cycle out of phase". */
