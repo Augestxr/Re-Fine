@@ -123,12 +123,13 @@ The installer is described in [docs/INSTALLER.md](docs/INSTALLER.md).
 | [`third_party/`](third_party/) | bundled libraries with their licenses |
 | [`docs/`](docs/) | how to build, the installer, and notes on video decoding |
 
-## 🤖 about artificial intelligence
+## 🤖 about artificial intelligence 
 
-So yes, artificial intelligence helped build this port, and its author does not care in the slightest
-what anyone thinks about that. Honestly, the people who criticize it should maybe try making projects of
-their own, because they never contribute anything to the community and only criticize. Anyone can
-complain; building something is the hard part. You are welcome to prove otherwise with code.
+So yeah, of course artificial intelligence helped build this port, and i dont really care in the slightest
+what anyone thinks about that. Fr, the people who criticize it should maybe try making projects of
+their own if theyre so smart, because they never contribute anything to the community rather than just criticising and doing song mods to mm+ but anyone could do that.
+Anyone can complain and keep crying while i complete this project alr?. You are welcome to prove otherwise with code tho, but i know yall could never ❤ xx. 
+And no. You are not cool, mysterious, nonchalant and dont even mention BETTER for refusing to play ports like this, you are just cringe and should retire.
 
 ## 🙏 Credits and license
 
