@@ -1,5 +1,11 @@
 <div align="center">
 
+<!-- HUECO DE ARTE: banner de cabecera (unos 1280x400). Solo arte propio: nada del juego, ni capturas ni logos oficiales.
+     Sube la imagen arrastrándola al editor web de GitHub (da una URL de user-attachments; el hook
+     pre-commit rechaza .png/.jpg en el repo) y quita el comentario:
+<img src="BANNER_URL" alt="Re:Fine" width="100%">
+-->
+
 # Re:Fine
 
 **Port nativo para PC de *Hatsune Miku: Project DIVA F* (PS3), hecho por recompilación estática.**
@@ -33,6 +39,10 @@ como los programas de los SPU. El resultado se enlaza con un runtime que hace la
 **No es un emulador** ni **un remake**: lo que corre es el código original de SEGA, en tu PC, compilado
 a partir de tu propia copia. Este repositorio solo tiene las herramientas, los parches y el runtime que
 lo hacen posible.
+
+<!-- HUECO DE ARTE: separador o ilustración (unos 1280x200). Solo arte propio. Quita el comentario cuando esté:
+<p align="center"><img src="DIVIDER_URL" alt="" width="100%"></p>
+-->
 
 ## ✨ Qué ofrece
 
@@ -99,6 +109,10 @@ El instalador se explica en [docs/INSTALLER.md](docs/INSTALLER.md).
 - **Probado en pocos PC.** Sin probar en PC con poca RAM ni con rutas de instalación con caracteres no
   ASCII. Las máquinas sin un driver de Vulkan reciente pasan a D3D12.
 
+<!-- HUECO DE ARTE: segundo separador (unos 1280x200). Solo arte propio. Quita el comentario cuando esté:
+<p align="center"><img src="DIVIDER2_URL" alt="" width="100%"></p>
+-->
+
 ## 🗂️ Estructura del repositorio
 
 | Ruta | Qué es |
@@ -134,3 +148,7 @@ Nuestro código va con la [licencia MIT](LICENSE). El código de terceros y sus 
   incluye ni se enlaza, y aquí no hay código copiado de RPCS3.
 
 Gracias a los proyectos ps3recomp, ico-recomp y RPCS3, y a todos los que mantienen vivo este juego. 💙
+
+<!-- HUECO DE ARTE: banner de cierre (unos 1280x240). Solo arte propio. Quita el comentario cuando esté:
+<p align="center"><img src="FOOTER_URL" alt="" width="100%"></p>
+-->
